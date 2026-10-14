@@ -266,21 +266,43 @@ pub fn write(fd: i32, buf: usize, len: usize) -> SysResult {
     write_from(&of, buf, len.min(MAX_RW))
 }
 
-/// Read an iovec array: (base, len) pairs.
+/// Read and check a user iovec array as Linux `lib/iov_iter.c`
+/// `__import_iovec`: more than `UIO_MAXIOV` (1024) entries → EINVAL; the
+/// array outside the user half or unreadable → EFAULT; an `iov_len` that
+/// is negative as an `ssize_t` → EINVAL (checked while copying, entry by
+/// entry); then every segment must pass `access_ok` with its full length
+/// (EFAULT; a single segment is clamped to `MAX_RW_COUNT` first, as
+/// `import_ubuf`), and lengths are clamped so the total stays within
+/// `MAX_RW_COUNT`. Returns (base, len) pairs.
 pub(super) fn read_iov(iov: usize, cnt: usize) -> Result<Vec<(usize, usize)>, Errno> {
     if cnt > UIO_MAXIOV {
         return Err(Errno(EINVAL));
     }
+    if !access_ok(iov, cnt * size_of::<Iovec>()) {
+        return Err(Errno(EFAULT));
+    }
     let mut v = Vec::with_capacity(cnt);
-    let mut total = 0usize;
     for i in 0..cnt {
         let e: Iovec = with_space(|s| s.read_val(iov + i * size_of::<Iovec>()))?;
         if e.iov_len > isize::MAX as u64 {
             return Err(Errno(EINVAL));
         }
-        let len = (e.iov_len as usize).min(MAX_RW - total);
-        total += len;
-        v.push((e.iov_base as usize, len));
+        v.push((e.iov_base as usize, e.iov_len as usize));
+    }
+    if let [(base, len)] = v.as_mut_slice() {
+        *len = (*len).min(MAX_RW);
+        if !access_ok(*base, *len) {
+            return Err(Errno(EFAULT));
+        }
+        return Ok(v);
+    }
+    let mut total = 0usize;
+    for (base, len) in v.iter_mut() {
+        if !access_ok(*base, *len) {
+            return Err(Errno(EFAULT));
+        }
+        *len = (*len).min(MAX_RW - total);
+        total += *len;
     }
     Ok(v)
 }
