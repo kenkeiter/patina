@@ -54,12 +54,15 @@ const (
 func (*QEMU) KernelParams(cfg *Config) ([]string, error) {
 	switch cfg.Net.Mode {
 	case "", "none":
-		return nil, nil
+		return TapKernelParams(cfg)
 	case "user":
+		if cfg.Net.IP != "" {
+			return nil, errors.New("--ip only applies to a tap device (--net user has fixed addressing)")
+		}
 		// ip=client:server:gw:mask:host:dev:autoconf:dns0
 		return []string{fmt.Sprintf("ip=%s::%s:255.255.255.0:patina:eth0:off:%s", userGuestIP, userGateway, userDNS)}, nil
 	default:
-		return []string{"ip=dhcp"}, nil
+		return TapKernelParams(cfg)
 	}
 }
 

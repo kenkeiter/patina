@@ -19,6 +19,7 @@ import (
 type NetConfig struct {
 	Mode    string   // "" / "none", "user" (QEMU slirp), or a tap device name
 	Publish []string // "hostport:guestport" TCP forwards (user mode)
+	IP      string   // static guest address for a tap device (see TapKernelParams); "" = DHCP
 }
 
 // Config describes a VM to start.
@@ -31,6 +32,7 @@ type Config struct {
 	CPUs    int
 	RunDir  string // private scratch dir for this VM (sockets, logs)
 	Accel   string // "" = auto; QEMU: hvf | kvm | tcg
+	Bin     string // VMM binary override (Firecracker, Cloud Hypervisor); "" = look up in PATH
 	Net     NetConfig
 
 	Serial io.Writer // guest console output
@@ -103,7 +105,7 @@ func init() {
 	// uds_path -> ctl.KindFirecracker endpoint), Cloud Hypervisor (--api-socket,
 	// --vsock cid=,socket= -> same handshake), Apple VZ (cgo/ObjC shim,
 	// VZVirtioSocketDevice.connect(toPort: 4242), console hvc0).
-	register(unimplemented{name: target.Firecracker, console: "ttyS0"})
-	register(unimplemented{name: target.CloudHypervisor, console: "ttyS0"})
+	register(&Firecracker{})
+	register(&CloudHypervisor{})
 	register(unimplemented{name: target.VZ, console: "hvc0"})
 }

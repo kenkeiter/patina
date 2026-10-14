@@ -33,6 +33,7 @@ const (
 type Options struct {
 	Image   string
 	VMM     string // default: the image's target VMM
+	VMMBin  string // VMM binary override (default: looked up in PATH)
 	Name    string // run-state name; default <image name>-<pid>
 	MemMB   int
 	CPUs    int
@@ -104,7 +105,7 @@ func Run(o Options) (int, error) {
 	sentinel := &sentinelWriter{w: o.Stdout}
 	cfg := &vmm.Config{
 		Arch: m.Arch, Kernel: kernel, Initrd: initrd,
-		MemMB: o.MemMB, CPUs: o.CPUs, RunDir: dir, Accel: o.Accel, Net: o.Net,
+		MemMB: o.MemMB, CPUs: o.CPUs, RunDir: dir, Accel: o.Accel, Net: o.Net, Bin: o.VMMBin,
 		Serial: sentinel, Stderr: o.Stderr, Log: logw,
 	}
 	params, err := drv.KernelParams(cfg)

@@ -131,6 +131,7 @@ func cmdImage(args []string, stdout, stderr io.Writer) (int, error) {
 func cmdRun(args []string, stdout, stderr io.Writer) (int, error) {
 	fs := newFlagSet("run", stderr, "patina run <image.patina> [flags] [-- args...]")
 	vmmName := fs.String("vmm", "", "VMM to run on (default: the image's target VMM)")
+	vmmBin := fs.String("vmm-bin", "", "firecracker / cloud-hypervisor binary `path` (default: from PATH)")
 	mem := fs.Int("mem", 512, "guest memory in `MiB`")
 	cpus := fs.Int("cpus", 2, "guest vCPUs")
 	strace := fs.Bool("strace", false, "trace guest syscalls to the console (patina.strace=1)")
@@ -139,6 +140,7 @@ func cmdRun(args []string, stdout, stderr io.Writer) (int, error) {
 	name := fs.String("name", "", "VM name for `patina ctl` (default <image>-<pid>)")
 	accel := fs.String("accel", "", "QEMU accelerator: hvf, kvm or tcg (default: auto)")
 	netMode := fs.String("net", "", "guest network: none, user (QEMU slirp), or a tap device name")
+	ip := fs.String("ip", "", "static guest address with a tap device: `ADDR/PREFIX[,GATEWAY[,DNS]]` or a raw Linux ip= value (default: ip=dhcp)")
 	verbose := fs.Bool("v", false, "log VMM argv and control events to stderr")
 	var env, publish listFlag
 	fs.Var(&env, "env", "guest environment `KEY=VALUE` (repeatable)")
@@ -159,9 +161,9 @@ func cmdRun(args []string, stdout, stderr io.Writer) (int, error) {
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigs)
 	return run.Run(run.Options{
-		Image: pos[0], VMM: *vmmName, Name: *name, MemMB: *mem, CPUs: *cpus, Strace: *strace,
+		Image: pos[0], VMM: *vmmName, VMMBin: *vmmBin, Name: *name, MemMB: *mem, CPUs: *cpus, Strace: *strace,
 		Timeout: *timeout, Grace: *grace, Env: env, Args: pass, Accel: *accel,
-		Net:     vmm.NetConfig{Mode: *netMode, Publish: publish},
+		Net:     vmm.NetConfig{Mode: *netMode, Publish: publish, IP: *ip},
 		Verbose: *verbose, Stdout: stdout, Stderr: stderr, Signals: sigs,
 	})
 }

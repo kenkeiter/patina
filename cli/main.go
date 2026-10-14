@@ -38,6 +38,7 @@ Usage:
   patina build <pkg> --target <vmm>-<arch> -o <out.patina> [--files src:dst ...] [--kernel path]
   patina image inspect <image.patina>
   patina run <image.patina> [--vmm qemu] [--mem 512] [--cpus 2] [--strace] [--timeout d] [-- args...]
+             [--vmm-bin path] [--net user|<tap> [--ip addr/prefix[,gw[,dns]]]]
   patina ctl <vm> stop [--grace 30s] | signal <SIG> | dump | ping | time
   patina ctl --sock <path> | --vsock <path> <op> ...
   patina ps
