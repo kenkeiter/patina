@@ -8,7 +8,7 @@
 //! * wall clocks (`CLOCK_REALTIME`/`MONOTONIC`/`BOOTTIME`, `ITIMER_REAL`):
 //!   `arch::timer::now_ns` (+ `patina.epoch` for realtime);
 //! * thread CPU clocks (`CLOCK_THREAD_CPUTIME_ID`, encoded per-thread
-//!   ids): the target's [`Thread::cpu_time_ns`];
+//!   ids): the target's `sched::thread_cpu_time_ns` (running slice included);
 //! * the process CPU clock (`CLOCK_PROCESS_CPUTIME_ID`, encoded process
 //!   ids, `ITIMER_VIRTUAL`, `ITIMER_PROF`): [`process_cpu_time_ns`].
 //!
@@ -80,7 +80,7 @@ impl Clock {
             Clock::ThreadCpu(w) => w
                 .upgrade()
                 .filter(|t| t.state() != ThreadState::Dead)
-                .map(|t| t.cpu_time_ns()),
+                .map(|t| super::sched::thread_cpu_time_ns(&t)),
             Clock::ProcessCpu => Some(process_cpu_time_ns()),
         }
     }
@@ -147,7 +147,7 @@ pub fn process_cpu_time_ns() -> u64 {
     let live: u64 = super::threads()
         .iter()
         .filter(|t| matches!(t.kind, ThreadKind::User))
-        .map(|t| t.cpu_time_ns())
+        .map(|t| super::sched::thread_cpu_time_ns(t))
         .sum();
     let v = live + DEAD_CPU_NS.load(Ordering::Relaxed);
     let prev = LAST_PROC_CPU_NS.fetch_max(v, Ordering::Relaxed);

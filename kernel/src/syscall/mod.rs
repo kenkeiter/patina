@@ -55,8 +55,21 @@ fn enosys(n: usize) -> SysResult {
     Err(Errno(ENOSYS))
 }
 
+/// `<tid>` in strace lines, `<tid>@<cpu>` with more than one CPU.
+struct TraceTid(u32);
+
+impl core::fmt::Display for TraceTid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if task::sched::online_cpus() > 1 {
+            write!(f, "{}@{}", self.0, crate::arch::cpu::id())
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
+}
+
 fn trace(n: usize, a: &[u64; 6], ret: Option<isize>) {
-    let tid = task::current().tid;
+    let tid = TraceTid(task::current().tid);
     let name = current::syscall_name(n).unwrap_or("?");
     match ret {
         None => crate::kprintln!(

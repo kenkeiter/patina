@@ -1,16 +1,22 @@
 //! The sleep list: blocked threads with a deadline, ordered by deadline and
-//! expired from the timer tick (10 ms granularity at 100 Hz; a deadline
-//! is honoured at the first tick at or after it, never early).
+//! expired from the timer tick. One global list for all CPUs; deadlines
+//! are honoured through the per-CPU one-shot timer (`timer::set_deadline`):
+//! [`add`] arms the adding CPU's one-shot if the new deadline is earlier
+//! than what it has armed, and every CPU's tick re-arms its one-shot to
+//! the earliest remaining deadline (`sched::tick`), so a deadline is
+//! honoured at the first timer interrupt at or after it (sub-tick, never
+//! early) on some CPU. The 100 Hz periodic tick still runs underneath.
 //!
 //! Entries quote the thread's block sequence; an entry whose thread was
 //! woken another way is removed by [`cancel`] (or would fail the sequence
 //! check in `sched::wake`).
 //!
-//! Phase 2: one list per CPU (or a timer wheel), and a one-shot timer
-//! programmed for the earliest deadline instead of the periodic tick, so
-//! sub-tick sleeps (`usleep(20)` in Go's sysmon) are accurate and idle
-//! CPUs can stop ticking. `timer_create`/`setitimer` hang off the same
-//! structure.
+//! Later: per-CPU lists or a timer wheel if the list gets long, and idle
+//! CPUs that stop ticking. `timer_create`/`setitimer` can hang off the
+//! same list (an entry per armed timer) or arm `sched::arm_deadline`
+//! themselves and check their own expiry in the tick.
+//!
+//! Lock order: wait-queue lock → sleep list → runqueue (`sched::wake`).
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -27,7 +33,8 @@ struct Sleeper {
 /// Sorted by `deadline`, earliest first (FIFO among equal deadlines).
 static SLEEPERS: SpinLock<VecDeque<Sleeper>> = SpinLock::new(VecDeque::new());
 
-/// Add `thread` (blocked in block `seq`) with `deadline` (monotonic ns).
+/// Add `thread` (blocked in block `seq`) with `deadline` (monotonic ns)
+/// and make sure this CPU's one-shot timer fires by then.
 pub fn add(deadline: u64, thread: Arc<Thread>, seq: u64) {
     let mut l = SLEEPERS.lock();
     let pos = l.partition_point(|s| s.deadline <= deadline);
@@ -39,6 +46,8 @@ pub fn add(deadline: u64, thread: Arc<Thread>, seq: u64) {
             seq,
         },
     );
+    drop(l);
+    sched::arm_deadline(deadline);
 }
 
 /// Remove the entry for `thread`'s block `seq`, if any.
@@ -66,7 +75,7 @@ pub fn expire(now: u64) -> usize {
     woken
 }
 
-/// Earliest pending deadline (Phase 2: one-shot timer programming).
+/// Earliest pending deadline (one-shot timer programming).
 pub fn next_deadline() -> Option<u64> {
     SLEEPERS.lock().front().map(|s| s.deadline)
 }

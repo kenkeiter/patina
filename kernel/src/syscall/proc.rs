@@ -13,8 +13,10 @@ use super::{SysResult, with_space};
 use crate::sync::SpinLock;
 use crate::task;
 
-/// `exit_group(code)`. W2b: `exit` (one thread) gets its own path.
+/// `exit_group(code)`: stop the other CPUs (so no other thread runs user
+/// code any more), then end the VM with `code`.
 pub fn exit_group(code: u64) -> ! {
+    crate::task::sched::stop_other_cpus();
     let (free, total) = crate::mm::frame::stats();
     crate::kprintln!("[patina] frames at exit: {} free / {} total", free, total);
     crate::exit((code & 0xff) as i32)
@@ -43,8 +45,9 @@ fn valid_pid(pid: i32) -> bool {
     pid == 0 || pid == task::process().pid as i32 || pid == task::current().tid as i32
 }
 
-/// One CPU for now (W2b / Phase 2: all vCPUs). Returns the bytes written,
-/// as Linux does (its cpumask size: 8 on 64-bit with NR_CPUS <= 64).
+/// Every CPU running the scheduler (so Go's `NumCPU`/GOMAXPROCS = vCPUs).
+/// Returns the bytes written, as Linux does (its cpumask size: 8 on 64-bit
+/// with NR_CPUS <= 64).
 pub fn sched_getaffinity(pid: i32, len: usize, mask: usize) -> SysResult {
     if !valid_pid(pid) {
         return Err(Errno(ESRCH));
@@ -52,7 +55,8 @@ pub fn sched_getaffinity(pid: i32, len: usize, mask: usize) -> SysResult {
     if len < 8 || !len.is_multiple_of(8) {
         return Err(Errno(EINVAL));
     }
-    with_space(|s| s.write_val(mask, &1u64))?;
+    let m = crate::task::sched::online_mask();
+    with_space(|s| s.write_val(mask, &m))?;
     Ok(8)
 }
 

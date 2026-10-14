@@ -61,10 +61,10 @@ pub fn clone(frame: &TrapFrame, a: &[u64; 6]) -> SysResult {
 
     let child = task::spawn_user_thread(cf, fp, mask, cleartid)?;
     let tid = child.tid;
-    // Same address space, so both writes can happen here. The child has
-    // not run yet (it is only runnable; uniprocessor) — Phase 2 must do
-    // these before the child is enqueued. A bad pointer is ignored rather
-    // than failing an already created thread.
+    // Same address space, so both writes can happen here, before the child
+    // becomes runnable (it could otherwise run on another CPU and read its
+    // tid word first, D41). A bad pointer is ignored rather than failing an
+    // already created thread.
     if flags.contains(CloneFlags::PARENT_SETTID) {
         let _ = with_space(|s| s.write_val(args.parent_tid as usize, &tid));
     }
@@ -72,6 +72,7 @@ pub fn clone(frame: &TrapFrame, a: &[u64; 6]) -> SysResult {
         child.set_child_tid.store(args.child_tid, Ordering::Relaxed);
         let _ = with_space(|s| s.write_val(args.child_tid as usize, &tid));
     }
+    sched::make_runnable(child);
     Ok(tid as isize)
 }
 
@@ -85,7 +86,7 @@ pub fn exit(code: u64) -> ! {
         futex::wake(ctid, 1, FUTEX_BITSET_MATCH_ANY);
     }
     let last = task::unregister_current();
-    crate::task::timers::account_dead(t.cpu_time_ns());
+    crate::task::timers::account_dead(sched::current_cpu_time_ns());
     if last {
         super::proc::exit_group(code);
     }

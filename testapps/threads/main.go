@@ -20,9 +20,13 @@ func fail(format string, a ...any) {
 func main() {
 	workers := flag.Int("g", 1000, "goroutines")
 	rounds := flag.Int("rounds", 200, "allocation rounds per goroutine")
+	cpus := flag.Int("cpus", 0, "if > 0: expected vCPU count (GOMAXPROCS and NumCPU must match)")
 	flag.Parse()
 
 	fmt.Printf("threads: GOMAXPROCS=%d NumCPU=%d\n", runtime.GOMAXPROCS(0), runtime.NumCPU())
+	if *cpus > 0 && (runtime.GOMAXPROCS(0) != *cpus || runtime.NumCPU() != *cpus) {
+		fail("GOMAXPROCS=%d NumCPU=%d, want %d", runtime.GOMAXPROCS(0), runtime.NumCPU(), *cpus)
+	}
 
 	// Fan-out / fan-in with allocation pressure.
 	var wg sync.WaitGroup

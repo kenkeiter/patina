@@ -241,7 +241,7 @@ pub fn alarm(secs: u32) -> SysResult {
 pub fn getrusage(who: i32, ru: usize) -> SysResult {
     let cpu = match who {
         RUSAGE_SELF => timers::process_cpu_time_ns(),
-        RUSAGE_THREAD => task::current().cpu_time_ns(),
+        RUSAGE_THREAD => task::sched::current_cpu_time_ns(),
         RUSAGE_CHILDREN => 0,
         _ => return Err(Errno(EINVAL)),
     };

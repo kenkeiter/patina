@@ -18,8 +18,12 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     // Mask interrupts first; we never return.
     let _ = arch::irq::save_disable();
     if PANICKING.swap(true, Ordering::SeqCst) {
-        arch::cpu::halt();
+        crate::task::sched::halt_this_cpu();
     }
+    // Stop the other CPUs (this may be an AP; CPU 0 is stopped too) so
+    // nothing else prints or runs user code; if another CPU is already
+    // exiting, this one halts here and that one powers off.
+    crate::task::sched::stop_other_cpus();
     match info.location() {
         Some(loc) => panic_write_fmt(format_args!(
             "[patina] panic: {} at {}:{}\n",
