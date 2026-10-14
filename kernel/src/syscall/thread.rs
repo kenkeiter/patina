@@ -30,6 +30,12 @@ pub fn clone(frame: &TrapFrame, a: &[u64; 6]) -> SysResult {
             .difference(CLONE_THREAD_OPTIONAL)
             .is_empty()
     {
+        // A process-creating clone (Go's forkExec: CLONE_VFORK|CLONE_VM, or
+        // no CLONE_THREAD at all) is fork/vfork, which is ENOSYS by design
+        // (D57); any other unsupported flag combination is EINVAL.
+        if !flags.contains(CloneFlags::THREAD) {
+            return Err(Errno(ENOSYS));
+        }
         return Err(Errno(EINVAL));
     }
     let settls = flags.contains(CloneFlags::SETTLS);
