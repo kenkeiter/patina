@@ -47,6 +47,7 @@ dependencies = [
  "bitflags",
  "buddy_system_allocator",
  "fdt",
+ "patina-abi",
 ]
 
 [[package]]

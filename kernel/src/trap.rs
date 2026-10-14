@@ -83,10 +83,10 @@ pub fn syscall(frame: &mut TrapFrame) {
             // Self-test only: the real core resolves user pointers through
             // the address space. Here the user page is known to be mapped
             // and readable through the direct map by the self-test.
-            crate::selftest::user_write(a[1] as usize, a[2] as usize)
+            crate::selftest_user::user_write(a[1] as usize, a[2] as usize)
         }
         nr::EXIT_GROUP | nr::EXIT => crate::exit(a[0] as i32),
-        _ => errno::ENOSYS.to_ret(),
+        _ => errno::Errno(errno::ENOSYS).to_ret(),
     };
     frame.set_syscall_ret(ret as u64);
 }

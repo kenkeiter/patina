@@ -46,22 +46,22 @@ pub enum MapError {
 }
 
 // Entry bits.
-const PTE_P: u64 = 1 << 0;
-const PTE_RW: u64 = 1 << 1;
-const PTE_US: u64 = 1 << 2;
-const PTE_PWT: u64 = 1 << 3;
-const PTE_PCD: u64 = 1 << 4;
-const PTE_A: u64 = 1 << 5;
-const PTE_D: u64 = 1 << 6;
-const PTE_PS: u64 = 1 << 7;
-const PTE_G: u64 = 1 << 8;
-const PTE_NX: u64 = 1 << 63;
-const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+pub(super) const PTE_P: u64 = 1 << 0;
+pub(super) const PTE_RW: u64 = 1 << 1;
+pub(super) const PTE_US: u64 = 1 << 2;
+pub(super) const PTE_PWT: u64 = 1 << 3;
+pub(super) const PTE_PCD: u64 = 1 << 4;
+pub(super) const PTE_A: u64 = 1 << 5;
+pub(super) const PTE_D: u64 = 1 << 6;
+pub(super) const PTE_PS: u64 = 1 << 7;
+pub(super) const PTE_G: u64 = 1 << 8;
+pub(super) const PTE_NX: u64 = 1 << 63;
+pub(super) const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 const ENTRIES: usize = 512;
 
 /// Leaf attributes (without P, PS and the address).
-fn leaf_attrs(flags: MapFlags) -> u64 {
+pub(super) fn leaf_attrs(flags: MapFlags) -> u64 {
     let mut d = PTE_A | PTE_D;
     if flags.contains(MapFlags::WRITE) {
         d |= PTE_RW;

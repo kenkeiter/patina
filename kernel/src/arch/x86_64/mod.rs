@@ -15,17 +15,29 @@
 //! GDT selectors (see `gdt.rs`): 0x08 kernel code64, 0x10 kernel data,
 //! 0x18 user code32 (placeholder for SYSRET), 0x20 user data, 0x28 user
 //! code64, 0x30 TSS (16-byte descriptor). IST1 = double-fault stack.
+//!
+//! User mode (Phase 1): per-CPU block via GS (`percpu.rs`; `swapgs` on every
+//! ring-3 entry and exit), SYSCALL/SYSRET and exception/IRQ entry sharing one
+//! `ctx::TrapFrame` layout (`entry.rs`, `exceptions.rs`), the LAPIC timer
+//! with PIT calibration (`lapic.rs`, `timer.rs`), user PML4s (`uspace.rs`).
 
 pub mod boot;
 pub mod console;
 pub mod cpu;
+pub mod ctx;
+mod entry;
 mod exceptions;
 mod gdt;
 pub mod irq;
+mod lapic;
 pub mod paging;
+mod percpu;
+mod pic;
 pub mod port;
 pub mod power;
 mod start_info;
+pub mod timer;
+pub mod uspace;
 
 pub const NAME: &str = "x86_64";
 

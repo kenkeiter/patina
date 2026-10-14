@@ -18,7 +18,9 @@ mod console;
 mod mm;
 mod panic;
 mod selftest;
+mod selftest_user;
 mod sync;
+mod trap;
 
 use alloc::format;
 

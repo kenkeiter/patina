@@ -94,13 +94,13 @@ fn user(map_data: bool) -> ! {
 pub fn user_write(va: usize, len: usize) -> isize {
     let guard = TABLES.lock();
     let Some(tables) = guard.as_ref() else {
-        return patina_abi::errno::EFAULT.to_ret();
+        return patina_abi::errno::Errno(patina_abi::errno::EFAULT).to_ret();
     };
     let mut done = 0usize;
     while done < len {
         let cur = va + done;
         let Some((pa, _)) = tables.translate(cur & !(PAGE_SIZE - 1)) else {
-            return patina_abi::errno::EFAULT.to_ret();
+            return patina_abi::errno::Errno(patina_abi::errno::EFAULT).to_ret();
         };
         let off = cur & (PAGE_SIZE - 1);
         let n = (PAGE_SIZE - off).min(len - done);
