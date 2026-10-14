@@ -59,8 +59,35 @@ pub fn init(
         devfs::populate(fs);
         procfs::populate(fs);
         etc(fs, c);
+        initial_cwd(fs, c);
         Ok(rep)
     })
+}
+
+/// `patina.cwd=<dir>` (percent-decoded): the program's initial working
+/// directory, like a container's WORKDIR. A path that is not an existing
+/// directory is reported and ignored (the cwd stays `/`).
+fn initial_cwd(fs: &mut Fs, c: &Cmdline) {
+    let Some(v) = c
+        .unknown
+        .iter()
+        .rev()
+        .find(|p| p.key == "patina.cwd")
+        .and_then(|p| p.value.as_deref())
+    else {
+        return;
+    };
+    let path = patina_cmdline::percent_decode_bytes(v);
+    let root = fs.root();
+    match fs.resolve(root, &path, true) {
+        Ok(ino) if fs.file_type(ino) == Ok(patina_vfs::FileType::Directory) => {
+            vfs::set_initial_cwd(fs, ino);
+            if let Ok(p) = fs.getcwd(ino) {
+                procfs::set_cwd_link(fs, &p);
+            }
+        }
+        _ => crate::kprintln!("[patina] patina.cwd={}: not a directory, using /", v),
+    }
 }
 
 /// Create `path` with `data` unless something is already there.

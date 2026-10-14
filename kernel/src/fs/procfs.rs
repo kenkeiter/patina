@@ -363,6 +363,11 @@ pub fn populate(fs: &mut Fs) {
     if let Ok(n) = fs.mkdir_all(proc, b"sys/net/core", 0o555) {
         gen_file(fs, n, b"somaxconn", text("4096\n"));
     }
+    if let Ok(f) = fs.mkdir_all(proc, b"sys/fs", 0o555) {
+        // Pipes have a fixed 64 KiB ring (no F_SETPIPE_SZ), so that is
+        // also the most an unprivileged F_SETPIPE_SZ could ask for.
+        gen_file(fs, f, b"pipe-max-size", text("65536\n"));
+    }
     if let Ok(v) = fs.mkdir_all(proc, b"sys/vm", 0o555) {
         gen_file(fs, v, b"overcommit_memory", text("0\n"));
     }

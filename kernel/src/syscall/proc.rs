@@ -31,7 +31,8 @@ pub fn set_tid_address(p: u64) -> SysResult {
 pub fn uname(buf: usize) -> SysResult {
     let u = Utsname::new(
         "Linux",
-        "patina",
+        // Same name as /proc/sys/kernel/hostname and /etc/hostname.
+        crate::fs::rootfs::hostname(),
         "6.6.0-patina",
         "#1 SMP",
         patina_abi::current::UTS_MACHINE,
