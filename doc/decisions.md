@@ -282,6 +282,7 @@ present; `TrapFrame` is 176 bytes and an `iretq` return path exists. CR4 =
 PAE|PGE|OSFXSR|OSXMMEXCPT, EFER = LME|NXE, CR0 = PE|MP|NE|WP|PG;
 `flush_tlb_all` toggles CR4.PGE on the local CPU only. `cpu::id()` returns 0
 until per-CPU GS lands.
+
 ## D25: ABI layout check is generated from Linux 7.2.10 UAPI headers (§13)
 
 `crates/abi/src/linux_expected.rs` holds sizes, alignments, offsets and
