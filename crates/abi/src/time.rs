@@ -128,6 +128,8 @@ pub const CPUCLOCK_VIRT: i32 = 1;
 pub const CPUCLOCK_SCHED: i32 = 2;
 pub const CPUCLOCK_PERTHREAD_MASK: i32 = 4;
 pub const CPUCLOCK_CLOCK_MASK: i32 = 3;
+/// Number of CPU clock kinds; `kind == CPUCLOCK_MAX` (3) is `CLOCKFD`, not a CPU clock.
+pub const CPUCLOCK_MAX: i32 = 3;
 
 /// A decoded negative (dynamic) clock id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

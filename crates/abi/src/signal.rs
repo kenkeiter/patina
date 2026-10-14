@@ -317,6 +317,8 @@ impl SigInfo {
     pub const OFF_OVERRUN: usize = 20;
     pub const OFF_VALUE: usize = 24;
     pub const OFF_STATUS: usize = 24;
+    pub const OFF_UTIME: usize = 32;
+    pub const OFF_STIME: usize = 40;
     pub const OFF_ADDR: usize = 16;
     pub const OFF_BAND: usize = 16;
     pub const OFF_FD: usize = 24;

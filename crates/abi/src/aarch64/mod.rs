@@ -92,7 +92,10 @@ pub mod hwcap {
 
     /// Derive the `ID_AA64ISAR0_EL1`-based subset of `AT_HWCAP` (what Go
     /// checks: AES, PMULL, SHA1, SHA2, CRC32, ATOMICS, SHA3, SHA512, ...).
-    /// FP/ASIMD are always set (the kernel requires them).
+    /// FP/ASIMD are always set (the kernel requires them). Field/threshold
+    /// pairs follow `arm64_elf_hwcaps[]` in arch/arm64/kernel/cpufeature.c;
+    /// the ISAR0 entries that map to `AT_HWCAP2`/`AT_HWCAP3` (RNDR, FLAGM2,
+    /// LSE128, F16F32DOT/MM) are not produced here.
     pub const fn from_id_aa64isar0(isar0: u64) -> u64 {
         const fn field(isar0: u64, shift: u32) -> u64 {
             (isar0 >> shift) & 0xf
@@ -240,6 +243,70 @@ pub const TPIDR2_MAGIC: u32 = 0x5450_4902;
 pub const ZA_MAGIC: u32 = 0x5436_6345;
 pub const ZT_MAGIC: u32 = 0x5a54_4e01;
 pub const FPMR_MAGIC: u32 = 0x4650_4d52;
+pub const POE_MAGIC: u32 = 0x504f_4530;
+pub const GCS_MAGIC: u32 = 0x4743_5300;
+
+/// Space for the zero `_aarch64_ctx` that ends the record list, rounded to
+/// 16 (`TERMINATOR_SIZE`, arch/arm64/kernel/signal.c).
+pub const TERMINATOR_SIZE: usize = 16;
+/// `round_up(sizeof(struct extra_context), 16)` (signal.c).
+pub const EXTRA_CONTEXT_SIZE: usize = 32;
+
+/// `struct extra_context` (32 bytes): points at records that did not fit in
+/// `__reserved`. patina never emits it (no SVE/SME state) and rejects it in
+/// `rt_sigreturn`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct ExtraContext {
+    pub head: Aarch64Ctx,
+    pub datap: u64,
+    pub size: u32,
+    pub _reserved: [u32; 3],
+}
+
+/// Offsets (within `__reserved`) of the records Linux writes for a task
+/// with only FPSIMD state (`setup_sigframe_layout`,
+/// arch/arm64/kernel/signal.c): `fpsimd_context` first, `esr_context` only
+/// when the signal comes from a fault with a syndrome
+/// (`thread.fault_code != 0`), then the terminator. Each record is padded
+/// to 16 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservedLayout {
+    pub fpsimd: usize,
+    pub esr: Option<usize>,
+    /// The zero terminator header.
+    pub end: usize,
+}
+
+const fn round16(x: usize) -> usize {
+    (x + 15) & !15
+}
+
+/// See [`ReservedLayout`].
+pub const fn reserved_layout(with_esr: bool) -> ReservedLayout {
+    let fpsimd = 0;
+    let after = fpsimd + round16(core::mem::size_of::<FpsimdContext>());
+    if with_esr {
+        ReservedLayout {
+            fpsimd,
+            esr: Some(after),
+            end: after + round16(core::mem::size_of::<EsrContext>()),
+        }
+    } else {
+        ReservedLayout {
+            fpsimd,
+            esr: None,
+            end: after,
+        }
+    }
+}
+
+/// Bytes Linux reserves for the frame (`sigframe_size`: the records fit in
+/// `__reserved`, so this is `round_up(sizeof(rt_sigframe), 16)`).
+pub const SIGFRAME_SIZE: usize = round16(core::mem::size_of::<RtSigframe>());
+const _: () = assert!(reserved_layout(true).end + TERMINATOR_SIZE <= SIGCONTEXT_RESERVED_SIZE);
 
 /// `struct fpsimd_context` (528 bytes): FPSR, FPCR, V0..V31.
 #[repr(C, align(16))]
@@ -290,23 +357,22 @@ impl SigContext {
     /// `fpsimd_context`, then `esr_context` if `esr` is given, then a zero
     /// terminator. The rest is zeroed.
     pub fn write_reserved(&mut self, fpsimd: &FpsimdContext, esr: Option<u64>) {
+        let l = reserved_layout(esr.is_some());
         let r = &mut self.reserved;
         r.fill(0);
-        let mut off = 0;
         let f = fpsimd.as_bytes();
-        r[off..off + f.len()].copy_from_slice(f);
+        r[l.fpsimd..l.fpsimd + f.len()].copy_from_slice(f);
         // Force a correct header even if the caller left it zeroed.
         let head = Aarch64Ctx {
             magic: FPSIMD_MAGIC,
             size: f.len() as u32,
         };
-        r[off..off + 8].copy_from_slice(head.as_bytes());
-        off += f.len();
-        if let Some(esr) = esr {
+        r[l.fpsimd..l.fpsimd + 8].copy_from_slice(head.as_bytes());
+        if let (Some(esr), Some(off)) = (esr, l.esr) {
             let e = EsrContext::new(esr);
             r[off..off + 16].copy_from_slice(e.as_bytes());
         }
-        // Terminator is the zeroed header that follows.
+        // Terminator (at l.end) is the zeroed header.
     }
 
     /// Walk the `__reserved` records (as `rt_sigreturn` does) and return the
@@ -413,8 +479,7 @@ pub struct SigframePlacement {
 /// `sp` (arm64 has no red zone).
 pub const fn sigframe_placement(sp_top: u64) -> SigframePlacement {
     let rec = (sp_top - core::mem::size_of::<FrameRecord>() as u64) & !15;
-    let size = (core::mem::size_of::<RtSigframe>() as u64 + 15) & !15;
-    let frame = (rec & !15) - size;
+    let frame = (rec & !15) - SIGFRAME_SIZE as u64;
     SigframePlacement {
         frame,
         frame_record: rec,

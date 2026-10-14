@@ -254,14 +254,30 @@ pub struct SigframePlacement {
     pub fpstate: u64,
 }
 
+/// Stack alignment of the frame before the `- 8` "return address" slot
+/// (`FRAME_ALIGNMENT`, arch/x86/kernel/signal.c).
+pub const FRAME_ALIGNMENT: u64 = 16;
+
+/// Bytes reserved on the signal stack for the fpstate area
+/// (`xstate_sigframe_size`, arch/x86/kernel/fpu/signal.c): the user XSAVE
+/// area plus the trailing [`FP_XSTATE_MAGIC2`] word when the CPU uses
+/// XSAVE; just the 512-byte FXSAVE image (no magic) otherwise.
+pub const fn xstate_sigframe_size(xstate_size: u64, xsave: bool) -> u64 {
+    if xsave {
+        xstate_size + FP_XSTATE_MAGIC2_SIZE as u64
+    } else {
+        xstate_size
+    }
+}
+
 /// Lay out a signal frame below `sp_top` (Linux `get_sigframe`):
 /// `sp_top` is `ss_sp + ss_size` when switching to the alternate stack,
-/// otherwise the interrupted `rsp - REDZONE`. `xstate_size` is the XSAVE
-/// area size (512 for FXSAVE-only); the kernel reserves 4 more bytes for
-/// [`FP_XSTATE_MAGIC2`].
-pub const fn sigframe_placement(sp_top: u64, xstate_size: u64) -> SigframePlacement {
-    let fpstate = (sp_top - (xstate_size + FP_XSTATE_MAGIC2_SIZE as u64)) & !(FPSTATE_ALIGN - 1);
-    let frame = ((fpstate - core::mem::size_of::<RtSigframe>() as u64) & !15) - 8;
+/// otherwise the interrupted `rsp - REDZONE`. `math_size` is
+/// [`xstate_sigframe_size`].
+pub const fn sigframe_placement(sp_top: u64, math_size: u64) -> SigframePlacement {
+    let fpstate = (sp_top - math_size) & !(FPSTATE_ALIGN - 1);
+    let frame =
+        ((fpstate - core::mem::size_of::<RtSigframe>() as u64) & !(FRAME_ALIGNMENT - 1)) - 8;
     SigframePlacement { frame, fpstate }
 }
 
@@ -336,7 +352,7 @@ mod tests {
 
     #[test]
     fn placement() {
-        let p = sigframe_placement(0x7fff_0000 - REDZONE, 512);
+        let p = sigframe_placement(0x7fff_0000 - REDZONE, xstate_sigframe_size(512, true));
         assert_eq!(p.fpstate % 64, 0);
         assert!(p.fpstate + 516 <= 0x7fff_0000 - REDZONE);
         assert_eq!(p.frame % 16, 8);

@@ -90,6 +90,14 @@ pub const FUTEX_CMP_REQUEUE_PI: i32 = 12;
 pub const FUTEX_LOCK_PI2: i32 = 13;
 pub const FUTEX_PRIVATE_FLAG: i32 = 128;
 pub const FUTEX_CLOCK_REALTIME: i32 = 256;
+/// Linux 7.2 robust-futex op flags. patina does not implement them; they
+/// are deliberately NOT stripped by [`FUTEX_CMD_MASK`], so an op carrying
+/// them decodes to an unknown command (`ENOSYS`, as on Linux < 7.2) instead
+/// of silently running the base op.
+pub const FUTEX_ROBUST_UNLOCK: i32 = 512;
+pub const FUTEX_ROBUST_LIST32: i32 = 1024;
+/// Op-number mask as on Linux < 7.2 (see [`FUTEX_ROBUST_UNLOCK`]); Linux
+/// 7.2 also clears the two robust flags.
 pub const FUTEX_CMD_MASK: i32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 pub const FUTEX_WAIT_PRIVATE: i32 = FUTEX_WAIT | FUTEX_PRIVATE_FLAG;
 pub const FUTEX_WAKE_PRIVATE: i32 = FUTEX_WAKE | FUTEX_PRIVATE_FLAG;

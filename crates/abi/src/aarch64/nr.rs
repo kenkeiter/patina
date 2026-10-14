@@ -247,7 +247,6 @@ pub const RT_TGSIGQUEUEINFO: usize = 240;
 pub const PERF_EVENT_OPEN: usize = 241;
 pub const ACCEPT4: usize = 242;
 pub const RECVMMSG: usize = 243;
-pub const ARCH_SPECIFIC_SYSCALL: usize = 244;
 pub const WAIT4: usize = 260;
 pub const PRLIMIT64: usize = 261;
 pub const FANOTIFY_INIT: usize = 262;
@@ -579,7 +578,6 @@ pub const TABLE: &[(usize, &str)] = &[
     (241, "perf_event_open"),
     (242, "accept4"),
     (243, "recvmmsg"),
-    (244, "arch_specific_syscall"),
     (260, "wait4"),
     (261, "prlimit64"),
     (262, "fanotify_init"),

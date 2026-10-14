@@ -273,6 +273,8 @@ pub const ENOTRECOVERABLE: i32 = 131;
 pub const ERFKILL: i32 = 132;
 /// memory page has hardware error
 pub const EHWPOISON: i32 = 133;
+/// wrong file type for the intended operation
+pub const EFTYPE: i32 = 134;
 
 /// Primary symbolic name for an errno value (first name wins for aliases).
 pub const fn name(e: i32) -> Option<&'static str> {
@@ -408,6 +410,7 @@ pub const fn name(e: i32) -> Option<&'static str> {
         131 => Some("ENOTRECOVERABLE"),
         132 => Some("ERFKILL"),
         133 => Some("EHWPOISON"),
+        134 => Some("EFTYPE"),
         _ => None,
     }
 }
