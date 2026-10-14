@@ -21,9 +21,18 @@
 //! are the overrun, reported in the one signal sent, as Linux), collects
 //! `(target, siginfo)` pairs, drops the lock and only then sends — the
 //! signal code takes the thread table, sigaction and pending locks.
-//! Expiries are therefore honoured at the first tick at or after them
-//! (never early, up to one tick late). `timer_settime`/`setitimer` run
-//! the same pass after arming, so an already-expired value fires at once.
+//! Expiries are honoured at the first timer interrupt at or after them,
+//! never early. Wall-clock timers (`CLOCK_REALTIME`/`MONOTONIC`,
+//! `ITIMER_REAL`) are sub-tick: their earliest expiry ([`WALL_NEXT`],
+//! recomputed on every change) is a one-shot deadline like a sleeper's —
+//! `timer_settime`/`setitimer` arm it on the calling CPU
+//! (`sched::arm_deadline`), every ticking CPU re-arms to the global
+//! earliest, and a CPU going tickless-idle arms the earliest wall expiry
+//! of the timers it *owns* (the CPU that last set them, D77). CPU-clock
+//! timers only advance while a thread runs, i.e. on a ticking CPU, and
+//! stay tick-granular (up to one tick late). `timer_settime`/`setitimer`
+//! run the expiry pass after arming, so an already-expired value fires
+//! at once.
 //!
 //! # Overruns
 //! A fire whose signal could not be queued (the previous one from this
@@ -219,6 +228,8 @@ struct PosixTimer {
     overrun_last: i32,
     /// Fires whose signal could not be queued since then.
     overrun_acc: u64,
+    /// CPU that last armed it (tickless idle ownership, D77).
+    owner: usize,
 }
 
 struct Table {
@@ -226,15 +237,67 @@ struct Table {
     next_id: i32,
     /// `ITIMER_REAL`, `ITIMER_VIRTUAL`, `ITIMER_PROF`.
     itimers: [Arm; 3],
+    /// CPU that last set `ITIMER_REAL` (D77).
+    real_owner: usize,
+}
+
+/// Monotonic-ns expiry of a wall-clock timer (`None`: CPU clock or
+/// disarmed). Realtime expiries convert with the current epoch.
+fn wall_deadline(clock: &Clock, arm: &Arm) -> Option<u64> {
+    if !arm.armed() {
+        return None;
+    }
+    match clock {
+        Clock::Monotonic => Some(arm.expiry),
+        Clock::Realtime => Some(arm.expiry.saturating_sub(crate::wallclock::epoch_ns())),
+        _ => None,
+    }
 }
 
 impl Table {
-    /// Recount the armed timers into [`ARMED`].
+    /// Recount the armed timers into [`ARMED`] and recompute
+    /// [`WALL_NEXT`].
     fn publish(&self) {
         let n = self.timers.values().filter(|t| t.arm.armed()).count()
             + self.itimers.iter().filter(|a| a.armed()).count();
         ARMED.store(n as u64, Ordering::Release);
+        WALL_NEXT.store(self.wall_next(None).unwrap_or(u64::MAX), Ordering::Release);
     }
+
+    /// Earliest wall-clock expiry (monotonic ns), of the timers owned by
+    /// `owner` if given.
+    fn wall_next(&self, owner: Option<usize>) -> Option<u64> {
+        let posix = self
+            .timers
+            .values()
+            .filter(|t| owner.is_none_or(|o| o == t.owner))
+            .filter_map(|t| wall_deadline(&t.clock, &t.arm));
+        let real = owner
+            .is_none_or(|o| o == self.real_owner)
+            .then(|| wall_deadline(&Clock::Monotonic, &self.itimers[ITIMER_REAL as usize]))
+            .flatten();
+        posix.chain(real).min()
+    }
+}
+
+/// Earliest wall-clock timer expiry (monotonic ns, `u64::MAX`: none).
+static WALL_NEXT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Earliest wall-clock timer expiry over all timers (a ticking CPU's
+/// one-shot covers it; `sched::tick`).
+pub fn next_wall_deadline() -> Option<u64> {
+    match WALL_NEXT.load(Ordering::Acquire) {
+        u64::MAX => None,
+        d => Some(d),
+    }
+}
+
+/// Earliest wall-clock timer expiry owned by `cpu` (tickless idle, D77).
+pub fn next_wall_deadline_for(cpu: usize) -> Option<u64> {
+    if WALL_NEXT.load(Ordering::Acquire) == u64::MAX {
+        return None;
+    }
+    TABLE.lock().wall_next(Some(cpu))
 }
 
 static TABLE: SpinLock<Table> = SpinLock::new(Table {
@@ -244,6 +307,7 @@ static TABLE: SpinLock<Table> = SpinLock::new(Table {
         expiry: 0,
         interval: 0,
     }; 3],
+    real_owner: 0,
 });
 
 /// Number of armed timers; [`tick`] returns at once while 0.
@@ -280,6 +344,7 @@ pub fn create(n: NewTimer) -> Result<i32, Errno> {
             arm: Arm::default(),
             overrun_last: 0,
             overrun_acc: 0,
+            owner: 0,
         },
     );
     Ok(id)
@@ -334,7 +399,13 @@ pub fn settime(id: i32, abs: bool, interval: u64, value: u64) -> Result<(u64, u6
             },
         };
         t.overrun_acc = 0;
+        t.owner = crate::arch::cpu::id();
+        let dl = wall_deadline(&t.clock, &t.arm);
         tab.publish();
+        if let Some(dl) = dl {
+            // IRQs are still masked (TABLE): same CPU as `owner`.
+            super::sched::arm_deadline(dl);
+        }
         old
     };
     run(true);
@@ -384,6 +455,12 @@ pub fn setitimer(which: i32, interval: u64, value: u64) -> Result<(u64, u64), Er
                 interval,
             }
         };
+        if i == ITIMER_REAL as usize {
+            tab.real_owner = crate::arch::cpu::id();
+            if let Some(dl) = wall_deadline(&Clock::Monotonic, &tab.itimers[i]) {
+                super::sched::arm_deadline(dl);
+            }
+        }
         tab.publish();
         old
     };

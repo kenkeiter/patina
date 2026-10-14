@@ -63,8 +63,21 @@
 //! quanta) before the tick sets `need_resched`. Sleep-list deadlines
 //! program the per-CPU one-shot timer: [`arm_deadline`] when a sleeper is
 //! added (on the adding CPU, if earlier than what it has armed), and every
-//! CPU's tick re-arms its one-shot to the global earliest deadline, so
-//! some CPU always wakes at the earliest deadline.
+//! ticking CPU's tick re-arms its one-shot to the global earliest deadline
+//! (sleepers and wall-clock timers).
+//!
+//! # Tickless idle (D77)
+//! A CPU about to wait in its idle loop with nothing to run stops its
+//! periodic tick (`timer::set_periodic(false)`) and arms its one-shot only
+//! for the earliest deadline it *owns*: sleepers it added and wall-clock
+//! timers it last set (`sleep::next_deadline_for`,
+//! `timers::next_wall_deadline_for`). It restarts the tick when it
+//! switches to a thread. Nothing else needs an idle CPU's tick: CPU time
+//! is accounted at switches, CPU-clock timers only advance on CPUs that
+//! run threads (and so tick), the quantum belongs to running threads,
+//! deferred TLB reclaim also runs here before waiting and at every vm
+//! operation, and wake-ups / signals / TLB flushes reach an idle CPU by
+//! IPI.
 //!
 //! # Stop (exit_group / exit / panic)
 //! [`stop_other_cpus`] sends `Stop` to every other CPU and waits up to
@@ -138,6 +151,12 @@ pub struct PerCpu {
     armed: AtomicU64,
     /// Context switches into a thread on this CPU (diagnostics).
     switches: AtomicU64,
+    /// `tick` calls on this CPU, and those taken in the idle loop
+    /// (diagnostics, `patina.stats`).
+    ticks: AtomicU64,
+    idle_ticks: AtomicU64,
+    /// Times the idle loop waited for an interrupt (`patina.stats`).
+    idle_waits: AtomicU64,
 }
 
 // SAFETY: the UnsafeCells are only accessed on this CPU with IRQs masked;
@@ -157,6 +176,9 @@ impl PerCpu {
             run_start: AtomicU64::new(0),
             armed: AtomicU64::new(NO_DEADLINE),
             switches: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+            idle_ticks: AtomicU64::new(0),
+            idle_waits: AtomicU64::new(0),
         }
     }
 
@@ -491,15 +513,66 @@ fn idle_loop() -> ! {
             Some(next) => {
                 IDLE.fetch_and(!bit(me), Ordering::SeqCst);
                 cpu.need_resched.store(false, Ordering::Relaxed);
+                // Leaving idle: the running thread gets the periodic tick
+                // (quantum, CPU-clock timers) back.
+                timer::set_periodic(true);
                 // SAFETY: IRQs masked; the idle loop is the current context
                 // of this CPU.
                 unsafe { context_switch(cpu, None, Some(next)) };
             }
-            // Nothing to run: sleep until an interrupt (lost-wakeup-free,
-            // also for IPIs, see `cpu::idle_wait`); the tick may have
-            // woken sleepers, an IPI may have brought work.
-            None => cpu::idle_wait(),
+            // Nothing to run: go tickless and sleep until an interrupt
+            // (lost-wakeup-free, also for IPIs, see `cpu::idle_wait`); a
+            // deadline may have woken sleepers, an IPI may have brought
+            // work.
+            None => {
+                enter_tickless(cpu, me);
+                cpu.idle_waits.fetch_add(1, Ordering::Relaxed);
+                cpu::idle_wait();
+            }
         }
+    }
+}
+
+/// Idle with nothing to run (IRQs masked): stop the periodic tick and arm
+/// the one-shot for the earliest deadline this CPU owns (D77).
+fn enter_tickless(cpu: &PerCpu, me: usize) {
+    crate::mm::tlb::reclaim();
+    let own = super::sleep::next_deadline_for(me)
+        .into_iter()
+        .chain(super::timers::next_wall_deadline_for(me))
+        .min()
+        .unwrap_or(NO_DEADLINE);
+    timer::set_periodic(false);
+    // Unconditionally: the arch drops a deadline once it passed, so
+    // `armed` may be stale here.
+    cpu.armed.store(own, Ordering::Relaxed);
+    timer::set_deadline((own != NO_DEADLINE).then_some(own));
+}
+
+/// Global earliest deadline (sleepers, wall-clock timers).
+fn earliest_deadline() -> u64 {
+    let s = super::sleep::next_deadline().unwrap_or(NO_DEADLINE);
+    let t = super::timers::next_wall_deadline().unwrap_or(NO_DEADLINE);
+    s.min(t)
+}
+
+/// `patina.stats=1` at exit (other CPUs stopped): per-CPU timer
+/// interrupts, ticks (all / in idle), idle waits, context switches.
+pub fn print_stats() {
+    let mut m = ONLINE.load(Ordering::SeqCst);
+    while m != 0 {
+        let c = m.trailing_zeros() as usize;
+        m &= m - 1;
+        let p = &CPUS[c];
+        crate::console::panic_write_fmt(format_args!(
+            "[patina] stats cpu{}: timer irqs {}, ticks {} (idle {}), idle waits {}, switches {}\n",
+            c,
+            timer::irq_count(c),
+            p.ticks.load(Ordering::Relaxed),
+            p.idle_ticks.load(Ordering::Relaxed),
+            p.idle_waits.load(Ordering::Relaxed),
+            p.switches.load(Ordering::Relaxed),
+        ));
     }
 }
 
@@ -655,17 +728,21 @@ pub fn tick() {
         return;
     }
     let cpu = this_cpu();
+    cpu.ticks.fetch_add(1, Ordering::Relaxed);
     let now = timer::now_ns();
     let woke = super::sleep::expire(now);
     super::timers::tick();
     crate::mm::tlb::reclaim();
-    let next = super::sleep::next_deadline().unwrap_or(NO_DEADLINE);
+    if cpu.is_idle_context() {
+        // The idle loop re-checks the runqueue after the IRQ and re-arms
+        // for its own deadlines (`enter_tickless`) if it waits again.
+        cpu.idle_ticks.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let next = earliest_deadline();
     if next != cpu.armed.load(Ordering::Relaxed) {
         cpu.armed.store(next, Ordering::Relaxed);
         timer::set_deadline((next != NO_DEADLINE).then_some(next));
-    }
-    if cpu.is_idle_context() {
-        return; // the idle loop re-checks the runqueue after the IRQ
     }
     if woke > 0 && cpu.runnable() > 0 {
         // Run a timer-woken thread promptly (sysmon, time.Sleep).

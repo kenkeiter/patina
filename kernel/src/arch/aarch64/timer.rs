@@ -11,7 +11,7 @@
 //! kinds of expiry call `trap::timer_tick` (the arch contract).
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::cpu::{self, MAX_CPUS};
 use super::{gic, irq};
@@ -86,6 +86,9 @@ struct PerCpuTimer {
     deadline: AtomicU64,
     /// Timer interrupts taken on this CPU (diagnostics / self-tests).
     irqs: AtomicU64,
+    /// Whether the periodic grid is armed (false while the CPU idles
+    /// tickless, D77: only the deadline is programmed then).
+    periodic: AtomicBool,
 }
 
 static PER_CPU: [PerCpuTimer; MAX_CPUS] = [const {
@@ -93,6 +96,7 @@ static PER_CPU: [PerCpuTimer; MAX_CPUS] = [const {
         next_tick: AtomicU64::new(0),
         deadline: AtomicU64::new(0),
         irqs: AtomicU64::new(0),
+        periodic: AtomicBool::new(true),
     }
 }; MAX_CPUS];
 
@@ -104,9 +108,26 @@ fn this_cpu() -> &'static PerCpuTimer {
 /// and the pending deadline. Call with IRQs masked (the per-CPU state and
 /// CNTV_CVAL_EL0 change together).
 fn program(t: &PerCpuTimer) {
-    let next = t.next_tick.load(Ordering::Relaxed);
+    let next = if t.periodic.load(Ordering::Relaxed) {
+        t.next_tick.load(Ordering::Relaxed)
+    } else {
+        u64::MAX
+    };
     let dl = t.deadline.load(Ordering::Relaxed);
     let cval = if dl != 0 { next.min(dl) } else { next };
+    if cval == u64::MAX {
+        // Tickless idle with no deadline: the timer stays off (its
+        // level-triggered PPI deasserts with ENABLE clear).
+        // SAFETY: disables this CPU's virtual timer.
+        unsafe {
+            asm!(
+                "msr cntv_ctl_el0, xzr",
+                "isb",
+                options(nostack, preserves_flags)
+            )
+        };
+        return;
+    }
     // SAFETY: programs this CPU's virtual timer; its interrupt is handled by
     // `irq::handle`.
     unsafe {
@@ -170,17 +191,44 @@ pub(super) fn rearm() {
     let t = this_cpu();
     t.irqs.fetch_add(1, Ordering::Relaxed);
     let now = cntvct();
-    let next = t.next_tick.load(Ordering::Relaxed);
-    if next <= now {
-        let missed = (now - next) / period;
-        t.next_tick
-            .store(next + (missed + 1) * period, Ordering::Relaxed);
+    if t.periodic.load(Ordering::Relaxed) {
+        advance_grid(t, now, period);
     }
     let dl = t.deadline.load(Ordering::Relaxed);
     if dl != 0 && dl <= now {
         t.deadline.store(0, Ordering::Relaxed);
     }
     program(t);
+}
+
+/// Move `next_tick` to the first grid point after `now` if it was reached
+/// (missed ticks are skipped, the phase is kept).
+fn advance_grid(t: &PerCpuTimer, now: u64, period: u64) {
+    let next = t.next_tick.load(Ordering::Relaxed);
+    if next != 0 && next <= now {
+        let missed = (now - next) / period;
+        t.next_tick
+            .store(next + (missed + 1) * period, Ordering::Relaxed);
+    }
+}
+
+/// Turn this CPU's periodic tick on or off (tickless idle, D77; the
+/// one-shot deadline is unaffected). Back on, the next tick is the next
+/// point of this CPU's grid. Before the tick was started only the flag is
+/// recorded.
+pub fn set_periodic(on: bool) {
+    let t = this_cpu();
+    let f = irq::save_disable();
+    if t.periodic.load(Ordering::Relaxed) != on {
+        t.periodic.store(on, Ordering::Relaxed);
+        if t.next_tick.load(Ordering::Relaxed) != 0 {
+            if on {
+                advance_grid(t, cntvct(), PERIOD.load(Ordering::Relaxed));
+            }
+            program(t);
+        }
+    }
+    irq::restore(f);
 }
 
 /// Per-CPU one-shot deadline at monotonic time `ns` (as [`now_ns`]), in
@@ -204,7 +252,8 @@ pub fn set_deadline(ns: Option<u64>) {
 
 /// Counter value at monotonic time `ns` (saturating).
 fn ns_to_count(ns: u64) -> u64 {
-    let ticks = (ns as u128 * cntfrq() as u128) / 1_000_000_000;
+    // Rounded up: the interrupt must not come before `now_ns() >= ns`.
+    let ticks = (ns as u128 * cntfrq() as u128).div_ceil(1_000_000_000);
     let c = BOOT_COUNT.load(Ordering::Relaxed) as u128 + ticks;
     c.min(u64::MAX as u128) as u64
 }

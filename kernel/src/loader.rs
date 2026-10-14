@@ -142,6 +142,9 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
 
     let strace = matches!(c.get("patina.strace"), Some(None) | Some(Some("1")));
     let novdso = matches!(c.get("patina.novdso"), Some(None) | Some(Some("1")));
+    if matches!(c.get("patina.stats"), Some(None) | Some(Some("1"))) {
+        crate::STATS.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     let epoch_ns = c.epoch_ns.unwrap_or(0);
     crate::random::seed_boot(arch::timer::now_ns() ^ epoch_ns.rotate_left(32));
 
