@@ -289,7 +289,7 @@ fn stat() -> Vec<u8> {
         format!("{} 0 0 0 20 0 {} 0 0", ticks(cpu), threads),
         format!("{} {} 18446744073709551615 0 0 0 0 0", vsz * 1024, rss / 4),
         format!("{} {} {} {} 0 0 0 17 {} 0 0 0 0 0", pnd, blk, ign, cgt, crate::arch::cpu::id()),
-        String::from("0 0 0 0 0 0 0"),
+        String::from("0 0 0 0 0 0 0 0"),
     ];
     let mut s = f.join(" ");
     s.push('\n');
