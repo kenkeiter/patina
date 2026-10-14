@@ -108,6 +108,11 @@ pub fn prlimit64(pid: i32, res: u32, new: usize, old: usize) -> SysResult {
     Ok(0)
 }
 
+/// `RLIMIT_NOFILE`'s soft limit: fds must be below it (`EMFILE`).
+pub fn nofile_limit() -> usize {
+    RLIMITS.lock()[RLIMIT_NOFILE as usize].rlim_cur.min(1 << 20) as usize
+}
+
 /// `getrandom`: see `random.rs` (not cryptographic before Phase 3).
 pub fn getrandom(buf: usize, len: usize, flags: u32) -> SysResult {
     if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
