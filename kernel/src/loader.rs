@@ -258,6 +258,6 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
         strace,
         epoch_ns,
     });
-    task::create_thread0(frame);
-    task::start_thread0()
+    let t0 = task::create_thread0(frame);
+    task::start_thread0(t0)
 }

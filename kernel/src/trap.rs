@@ -24,7 +24,9 @@
 //! `patina.selftest=user|userfault|timer|switch` run without a process)
 //! the minimal fallback remains: `write(1, …)` prints, `exit_group(n)`
 //! exits with `n`, anything else is `ENOSYS`, user faults are fatal. The
-//! tick only counts (W2b: preemption).
+//! tick only counts until the scheduler runs (`task::sched::run`); then it
+//! also expires sleepers and accounts quanta, and reschedules happen in
+//! [`before_return_to_user`].
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -131,14 +133,26 @@ pub fn user_exception(frame: &mut TrapFrame, exc: Exception) {
     crate::exit(128 + 4)
 }
 
-/// Timer tick. `from_user` is true when the interrupt arrived in user mode
-/// (the core may switch threads directly from here); when it arrived in
-/// kernel mode the core only records that a reschedule is due.
+/// Timer tick (IRQs masked). `from_user` is true when the interrupt
+/// arrived in user mode. The core never switches here: the tick wakes
+/// expired sleepers and, when the quantum is used up, sets `need_resched`;
+/// the switch happens in [`before_return_to_user`], which the arch runs
+/// right after this hook for an interrupt from user mode (the kernel is not
+/// preemptible, so an interrupt from kernel mode only leaves the flag).
 pub fn timer_tick(_frame: &mut TrapFrame, _from_user: bool) {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::task::sched::tick();
 }
 
 /// Called by the arch on every return to user mode (after a syscall, fault
-/// or interrupt handled in `frame`), with interrupts disabled. The core uses
-/// it for deferred reschedules and, in Phase 2, signal delivery.
-pub fn before_return_to_user(_frame: &mut TrapFrame) {}
+/// or interrupt handled in `frame`), with interrupts disabled. Runs a
+/// pending reschedule (the thread may switch out here and resume later
+/// with `frame` intact on its kernel stack).
+///
+/// Phase 2: signal delivery hooks in here, after the reschedule (so it
+/// runs on the thread that is about to return to user mode): check the
+/// thread's and the process's pending sets against the mask and build the
+/// `rt_sigframe` by editing `frame`.
+pub fn before_return_to_user(_frame: &mut TrapFrame) {
+    crate::task::sched::before_return_to_user();
+}

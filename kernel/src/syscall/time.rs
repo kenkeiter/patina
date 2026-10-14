@@ -10,7 +10,7 @@ use patina_abi::time::{
 };
 
 use super::{SysResult, with_space};
-use crate::arch::{cpu, timer};
+use crate::arch::timer;
 use crate::task;
 
 fn is_realtime(clk: i32) -> bool {
@@ -60,18 +60,11 @@ pub fn gettimeofday(tv: usize) -> SysResult {
     Ok(0)
 }
 
-/// Block until `now_ns() >= deadline` (monotonic).
-///
-/// W2b: replace with a real sleep (timer queue + switch to another
-/// thread); this just idles the CPU between ticks.
-pub fn sleep_until(deadline: u64) {
-    while timer::now_ns() < deadline {
-        if crate::arch::irq::enabled() {
-            cpu::wait_for_interrupt();
-        } else {
-            core::hint::spin_loop();
-        }
-    }
+/// Block until `now_ns() >= deadline` (monotonic), running other threads
+/// meanwhile (sleep list, tick granularity). No signals yet, so never
+/// interrupted (Phase 2: EINTR + `rem`).
+fn sleep_until(deadline: u64) {
+    task::wait::sleep_until(deadline);
 }
 
 fn read_timespec(p: usize) -> Result<u64, Errno> {
@@ -79,6 +72,7 @@ fn read_timespec(p: usize) -> Result<u64, Errno> {
     ts.to_nanos().ok_or(Errno(EINVAL))
 }
 
+/// `rem` is only written on EINTR, which cannot happen before signals.
 pub fn nanosleep(req: usize, _rem: usize) -> SysResult {
     let ns = read_timespec(req)?;
     sleep_until(timer::now_ns().saturating_add(ns));

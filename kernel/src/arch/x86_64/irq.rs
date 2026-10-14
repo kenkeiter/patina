@@ -28,9 +28,9 @@ pub fn restore(f: Flags) {
     }
 }
 
-/// Unmask interrupts on this CPU (arch-internal: entry paths, timer init).
+/// Unmask interrupts on this CPU.
 #[inline]
-pub(super) fn enable() {
+pub fn enable() {
     // SAFETY: callers enable IRQs only where the IDT and stacks are ready.
     unsafe { asm!("sti", options(nostack)) };
 }

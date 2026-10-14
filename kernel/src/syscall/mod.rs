@@ -7,18 +7,17 @@
 //! `patina.strace` prints every call with its six raw arguments.
 //!
 //! Handlers are grouped by area: [`fs`] (fds, paths), [`mm`] (memory),
-//! [`signal`], [`proc`] (ids, limits, exit, randomness), [`time`].
-//!
-//! W2b: `clone`, `clone3`, `futex` (still ENOSYS here), `exit` of a single
-//! thread, and a real `sched_yield`/sleep plug in at the marked places.
+//! [`signal`], [`proc`] (ids, limits, exit_group, randomness), [`thread`]
+//! (clone, exit, futex, sched_yield), [`time`] (clocks, sleeps).
 
 mod fs;
 mod mm;
 mod proc;
 mod signal;
+mod thread;
 mod time;
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use patina_abi::current::{self, nr};
 use patina_abi::errno::{ENOSYS, Errno};
@@ -42,7 +41,6 @@ fn first_time(set: &[AtomicU64; 16], key: usize) -> bool {
 }
 
 static ENOSYS_SEEN: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
-static THREADS_NOTE: AtomicBool = AtomicBool::new(false);
 
 fn enosys(n: usize) -> SysResult {
     if first_time(&ENOSYS_SEEN, n) {
@@ -52,15 +50,6 @@ fn enosys(n: usize) -> SysResult {
             current::syscall_name(n).unwrap_or("?")
         );
     }
-    Err(Errno(ENOSYS))
-}
-
-/// W2b replaces this with real clone/clone3/futex.
-fn not_yet_threads(n: usize) -> SysResult {
-    if !THREADS_NOTE.swap(true, Ordering::Relaxed) {
-        crate::kprintln!("[patina] clone/futex not yet supported (W2b)");
-    }
-    let _ = first_time(&ENOSYS_SEEN, n);
     Err(Errno(ENOSYS))
 }
 
@@ -131,8 +120,9 @@ pub fn dispatch(frame: &mut TrapFrame) {
         if strace {
             trace(n, &a, None);
         }
-        // W2b: `exit` ends only the calling thread (clear_child_tid +
-        // futex wake); with one thread both end the process.
+        if n == nr::EXIT {
+            thread::exit(a[0]);
+        }
         proc::exit_group(a[0]);
     }
 
@@ -193,8 +183,7 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::SET_TID_ADDRESS => proc::set_tid_address(a[0]),
         nr::UNAME => proc::uname(u(0)),
         nr::SCHED_GETAFFINITY => proc::sched_getaffinity(i(0), u(1), u(2)),
-        // W2b: yield to another runnable thread.
-        nr::SCHED_YIELD => Ok(0),
+        nr::SCHED_YIELD => thread::sched_yield(),
         nr::PRLIMIT64 => proc::prlimit64(i(0), a[1] as u32, u(2), u(3)),
         nr::GETRLIMIT => proc::prlimit64(0, a[0] as u32, 0, u(1)),
         nr::SETRLIMIT => proc::prlimit64(0, a[0] as u32, u(1), 0),
@@ -209,8 +198,10 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::NANOSLEEP => time::nanosleep(u(0), u(1)),
         nr::CLOCK_NANOSLEEP => time::clock_nanosleep(i(0), i(1), u(2), u(3)),
 
-        // W2b.
-        nr::CLONE | nr::CLONE3 | nr::FUTEX => not_yet_threads(n),
+        // thread.rs
+        nr::CLONE => thread::clone(frame, a),
+        nr::FUTEX => thread::futex(u(0), i(1), a[2] as u32, u(3), a[5] as u32),
+        // clone3 → ENOSYS makes glibc/Go fall back to clone.
 
         _ => enosys(n),
     }
