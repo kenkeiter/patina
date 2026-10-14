@@ -13,7 +13,7 @@ import (
 const (
 	reclaimRounds  = 5
 	reclaimThreads = 2000
-	maxFrameDelta  = 64
+	maxFrameDelta  = 96 // Go's idle Ms (8-frame kernel stacks each) vary by a few at 4 vCPUs; a stack leak is 16000 frames
 )
 
 // procKB reads the "key: N kB" field of a /proc file, in 4 KiB frames.

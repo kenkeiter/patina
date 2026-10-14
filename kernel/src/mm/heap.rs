@@ -514,6 +514,11 @@ pub fn reserve(bytes: usize) -> Result<(), Errno> {
 /// against its commit limit (D78) and the watermark ([`reserve`]).
 /// `false`: refused (the caller fails with ENOBUFS/ENOMEM/ENOSPC and
 /// allocates nothing). Undo with [`uncharge`] when the memory is freed.
+///
+/// Charges stop short of the limit by 1/32 of it (1–32 MiB): when kernel
+/// buffers and the program's own mappings race for the last of it, the
+/// buffers are refused (a recoverable errno) and the program's heap
+/// growth, which Go cannot survive failing, still fits.
 pub fn charge(bytes: usize) -> bool {
     if bytes == 0 {
         return true;
@@ -523,7 +528,9 @@ pub fn charge(bytes: usize) -> bool {
     }
     let held = CHARGED.fetch_add(bytes, Ordering::Relaxed) + bytes;
     let committed = COMMITTED.load(Ordering::Relaxed);
-    if committed.saturating_add(held.div_ceil(PAGE_SIZE)) > COMMIT_LIMIT.load(Ordering::Relaxed) {
+    let limit = COMMIT_LIMIT.load(Ordering::Relaxed);
+    let headroom = (limit / 32).clamp(256, 8192);
+    if committed.saturating_add(held.div_ceil(PAGE_SIZE)) > limit.saturating_sub(headroom) {
         CHARGED.fetch_sub(bytes, Ordering::Relaxed);
         return false;
     }

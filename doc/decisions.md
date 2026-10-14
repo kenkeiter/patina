@@ -2939,13 +2939,71 @@ and splitting `munmap`/`mprotect` → ENOMEM), and `munmap`/`madvise`/
 `mprotect` no longer collect every resident page of a range into a Vec.
 
 The fd table now remembers its lowest free slot, so filling it to 2^20
-is linear (it was quadratic: minutes). Known limits: freed heap memory is
-not returned to the frame allocator, so after a program frees many kernel
-buffers its own page faults can still hit the D78 backstop (SIGKILL); the
-x86_64 SMP shootdown list and the epoll ready snapshot stay infallible
+is linear (it was quadratic: minutes). Known limits: ~~freed heap memory
+is not returned to the frame allocator~~ (closed, see "Heap shrinking"
+below); the x86_64 SMP shootdown list and the epoll ready snapshot stay infallible
 (bounded by RAM/512 and by registered items, which are gated). Verified
 with a throwaway program at `PATINA_MEM=256` on aarch64, which panicked
 the kernel before in every case: pipes until `write` ENOMEM (2875), UDP
 sockets until ENOBUFS (2787), 4096 listening sockets (then ENFILE), epolls
 until ENOMEM (734186), and tmpfs writes after committing all memory
 (ENOSPC); each exits 0.
+
+**Heap shrinking** (closes the limit above). The `buddy_system_allocator`
+heap (D3) kept every frame it ever grew by: after a program closed 50k
+pipes the kernel still held their 74 MiB, and `sysfuzz -mode limits` at
+256 MiB ended with 238 MiB of the VM's RAM stuck in the heap, where the
+program's own page faults could only reach it through the D78 backstop.
+`mm/heap.rs` is now an in-tree slab + page allocator (the "in-tree slab"
+D3/design §11 planned) that holds no frame it does not use:
+
+* Small requests (up to 2032 bytes) use 13 size classes (16, 32, 48, 64,
+  96, 128, 192, 256, 384, 512, 768, 1344, 2032). A slab is one 4 KiB
+  frame: a 32-byte header at its start, then equal slots packed against
+  the end of the page, so every slot is aligned to the lowest set bit of
+  its offset and the slot size (power-of-two classes get natural
+  alignment, the others 16–64). A request whose alignment the smallest
+  fitting class cannot give moves to a larger class or the page path.
+  A class keeps its slabs with free slots on a doubly linked list, partly
+  used ones at the front, empty ones at the back; when a slab's last
+  object is freed it goes straight back to the frame allocator unless the
+  class has fewer than 2 empty slabs already (no churn when one object is
+  allocated and freed in a loop).
+* Larger requests take `ceil(size / 4 KiB)` frames: `frame::alloc_pages`
+  takes a buddy block of the covering order and hands the tail back at
+  once, and `dealloc` frees the pages (`frame::free_pages` splits any run
+  into naturally aligned blocks). `realloc` stays in place within a slab
+  class and when a page-path block shrinks (the tail is freed).
+* No metadata outside the slabs: `dealloc` gets the layout, which names
+  the class or page count, and the slab header is at the start of the
+  object's page. Each class has its own IRQ-safe `SpinLock` (the old heap
+  had one); lock order is class → frames and the frame allocator still
+  never allocates, so allocating in interrupt context cannot deadlock
+  and never blocks. Frames are freed synchronously on the freeing path:
+  no trim pass, no idle work.
+
+Size accounting changed with it: `heap::alloc_size` (what `charge`
+callers count) is the slot size or whole pages, not the next power of
+two; `reserve`'s free-memory estimate is free frames plus free slab slots.
+`/proc/meminfo` gains `Slab:` (frames the heap holds). The fd table
+(`FdSlots`) also shrinks: when at most a quarter of its slots are in use
+after a close it moves to an array twice the slots in use (fallibly;
+256 minimum), so a program that once had 2^20 fds open does not keep a
+16 MiB table.
+
+Verified by **test-robust** `kheap` / `kheap-4cpu` (`PATINA_MEM=1024`,
+both arches): 50k pipes (1000 written), 20k sockets (8500 AF_UNIX pairs
+with queued data, 2000 UDP, 1000 TCP), 10k epolls with an item each and
+200 MiB of tmpfs files, each set closed or deleted before the next. The
+kernel grows by up to 204 MiB and comes back to within 1 MiB of its
+baseline after every phase (aarch64: kernel-held 3 → 4 MiB, MemFree
+1012 → 1011 MiB; x86_64: 4 → 5 MiB, 1011 → 1010 MiB); the old heap ended
+the pipe phase 74 MiB up. `sysfuzz -mode limits -limits-strict` (now the
+default in `test-sysfuzz.sh`) ends 2.7 MiB below its MemFree baseline
+(was 238.6 MiB); its MemFree samples now follow `debug.FreeOSMemory()`,
+so what Go keeps resident does not count. `selftest alloc` checks every
+class and alignment, in-place and moving reallocs and that the frames
+come back. Robust `reclaim` now checks the kernel frames outside the
+heap (MemTotal − MemFree − VmRSS − Slab): with a heap that tracks the
+objects alive at the moment, the old total moved by up to ±100 frames
+between samples.
