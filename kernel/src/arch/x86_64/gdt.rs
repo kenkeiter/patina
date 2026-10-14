@@ -1,4 +1,4 @@
-//! GDT and TSS for the boot CPU.
+//! Per-CPU GDT and TSS (a static for the boot CPU, heap for the others).
 //!
 //! Selector layout (fixed; SYSCALL/SYSRET in Phase 1 depend on it):
 //!
@@ -17,7 +17,10 @@
 //! The TSS has IST1 = a dedicated 16 KiB double-fault stack, so a kernel
 //! stack overflow (guard page -> #PF -> #DF) still produces a dump.
 //! `rsp0` (ring-3 -> ring-0 stack) is set per thread from Phase 1.
+//! Secondary CPUs get the same layout in their own tables ([`alloc_ap`]),
+//! with a guarded kernel stack (`task::kstack`) as their IST1 stack.
 
+use alloc::boxed::Box;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
@@ -54,27 +57,37 @@ struct Gdt([u64; GDT_ENTRIES]);
 #[repr(C, align(16))]
 struct DfStack([u8; DF_STACK_SIZE]);
 
-struct Cpu0 {
-    gdt: UnsafeCell<Gdt>,
-    tss: UnsafeCell<Tss>,
+/// One CPU's GDT and TSS.
+#[repr(C, align(16))]
+struct CpuTables {
+    gdt: Gdt,
+    tss: Tss,
 }
+
+impl CpuTables {
+    const fn new() -> Self {
+        Self {
+            gdt: Gdt([0; GDT_ENTRIES]),
+            tss: Tss {
+                _reserved0: 0,
+                rsp: [0; 3],
+                _reserved1: 0,
+                ist: [0; 7],
+                _reserved2: 0,
+                _reserved3: 0,
+                iomap_base: size_of::<Tss>() as u16, // no I/O bitmap
+            },
+        }
+    }
+}
+
+struct Cpu0(UnsafeCell<CpuTables>);
 
 // SAFETY: written once by the boot CPU before anything else can run; later
 // accessed only by the CPU itself (ltr sets the busy bit).
 unsafe impl Sync for Cpu0 {}
 
-static CPU0: Cpu0 = Cpu0 {
-    gdt: UnsafeCell::new(Gdt([0; GDT_ENTRIES])),
-    tss: UnsafeCell::new(Tss {
-        _reserved0: 0,
-        rsp: [0; 3],
-        _reserved1: 0,
-        ist: [0; 7],
-        _reserved2: 0,
-        _reserved3: 0,
-        iomap_base: size_of::<Tss>() as u16, // no I/O bitmap
-    }),
-};
+static CPU0: Cpu0 = Cpu0(UnsafeCell::new(CpuTables::new()));
 
 /// Separate static so it lands in .bss rather than .data.
 struct DfStackCell(UnsafeCell<DfStack>);
@@ -99,9 +112,9 @@ fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
 }
 
 /// The boot CPU's TSS (its `rsp[0]` is updated by `cpu::set_kernel_stack`).
-/// Phase 2: one GDT/TSS per CPU.
 pub(super) fn boot_tss() -> *mut Tss {
-    CPU0.tss.get()
+    // SAFETY: only the address is taken.
+    unsafe { &raw mut (*CPU0.0.get()).tss }
 }
 
 #[repr(C, packed)]
@@ -113,19 +126,63 @@ struct DescriptorPtr {
 /// Build and load the GDT and TSS on the boot CPU; reload all segment
 /// registers. Called once, early, while still on the boot tables.
 pub(super) fn init() {
+    let df_top = DF_STACK.0.get() as u64 + DF_STACK_SIZE as u64;
     // SAFETY: single-threaded boot; nothing else references CPU0 yet.
-    unsafe {
-        let tss = &mut *CPU0.tss.get();
-        let df_top = DF_STACK.0.get() as u64 + DF_STACK_SIZE as u64;
-        tss.ist[IST_DOUBLE_FAULT as usize - 1] = df_top;
+    unsafe { load(CPU0.0.get(), df_top) };
+}
 
-        let gdt = &mut (*CPU0.gdt.get()).0;
+/// A secondary CPU's GDT + TSS, allocated by the boot CPU ([`alloc_ap`])
+/// and loaded by the AP itself ([`load_ap`]).
+pub(super) struct ApTables(*mut CpuTables, u64);
+
+// SAFETY: handed from the boot CPU to the one AP that uses it.
+unsafe impl Send for ApTables {}
+
+/// Allocate (and leak: CPUs never go away) a secondary CPU's GDT + TSS
+/// with IST1 = `df_stack_top` and `rsp0` = `rsp0`.
+pub(super) fn alloc_ap(df_stack_top: u64, rsp0: u64) -> ApTables {
+    let t: *mut CpuTables = Box::leak(Box::new(CpuTables::new()));
+    // SAFETY: freshly allocated; the TSS is packed, so write unaligned.
+    unsafe {
+        core::ptr::addr_of_mut!((*t).tss.rsp)
+            .cast::<u64>()
+            .write_unaligned(rsp0);
+    }
+    ApTables(t, df_stack_top)
+}
+
+/// On the secondary CPU: load its tables and reload all segment registers
+/// (this clears GS_BASE: the per-CPU block is set up afterwards). Returns
+/// the TSS.
+pub(super) fn load_ap(t: ApTables) -> *mut Tss {
+    // SAFETY: allocated by `alloc_ap`, lives forever, used by this CPU only.
+    unsafe {
+        load(t.0, t.1);
+        &raw mut (*t.0).tss
+    }
+}
+
+/// Fill `t` (selectors per the table above, TSS IST1 = `df_top`) and load
+/// it on this CPU.
+///
+/// # Safety
+/// `t` must live forever and be used by this CPU only.
+unsafe fn load(t: *mut CpuTables, df_top: u64) {
+    // SAFETY: caller guarantees exclusive, 'static access.
+    unsafe {
+        let tss = &raw mut (*t).tss;
+        core::ptr::addr_of_mut!((*tss).ist)
+            .cast::<u64>()
+            .add(IST_DOUBLE_FAULT as usize - 1)
+            .write_unaligned(df_top);
+
+        let gdt = &mut (*t).gdt.0;
         gdt[1] = KCODE64;
         gdt[2] = KDATA;
         gdt[3] = UCODE32;
         gdt[4] = UDATA;
         gdt[5] = UCODE64;
-        let (lo, hi) = tss_descriptor(CPU0.tss.get() as u64, size_of::<Tss>() as u32 - 1);
+        let (lo, hi) = tss_descriptor(tss as u64, size_of::<Tss>() as u32 - 1);
         gdt[6] = lo;
         gdt[7] = hi;
 

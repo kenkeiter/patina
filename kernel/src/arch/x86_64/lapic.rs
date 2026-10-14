@@ -20,6 +20,8 @@ pub const REG_ID: u32 = 0x20;
 pub const REG_TPR: u32 = 0x80;
 pub const REG_EOI: u32 = 0xb0;
 pub const REG_SVR: u32 = 0xf0;
+pub const REG_ICR_LOW: u32 = 0x300;
+pub const REG_ICR_HIGH: u32 = 0x310;
 pub const REG_LVT_TIMER: u32 = 0x320;
 pub const REG_LVT_LINT0: u32 = 0x350;
 pub const REG_LVT_ERROR: u32 = 0x370;
@@ -28,7 +30,14 @@ pub const REG_TIMER_CUR: u32 = 0x390;
 pub const REG_TIMER_DIV: u32 = 0x3e0;
 
 pub const LVT_MASKED: u32 = 1 << 16;
-pub const LVT_TIMER_PERIODIC: u32 = 1 << 17;
+
+// ICR low word: delivery mode (bits 8-10), level (14), trigger (15).
+pub const ICR_FIXED: u32 = 0b000 << 8;
+pub const ICR_INIT: u32 = 0b101 << 8;
+pub const ICR_STARTUP: u32 = 0b110 << 8;
+pub const ICR_LEVEL_ASSERT: u32 = 1 << 14;
+pub const ICR_TRIGGER_LEVEL: u32 = 1 << 15;
+const ICR_DELIVERY_PENDING: u32 = 1 << 12;
 const SVR_ENABLE: u32 = 1 << 8;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
 const APIC_BASE_EXTD: u64 = 1 << 10;
@@ -47,6 +56,15 @@ pub fn init(spurious_vector: u8) {
     let base = unsafe { cpu::rdmsr(MSR_APIC_BASE) };
     if base & APIC_BASE_EXTD != 0 {
         X2APIC.store(true, Ordering::Relaxed);
+    } else if X2APIC.load(Ordering::Relaxed) {
+        // A secondary CPU of a machine whose firmware put the boot CPU in
+        // x2APIC mode: INIT reset this one to xAPIC; follow the BSP
+        // (xAPIC -> x2APIC requires EN set first, then EN|EXTD).
+        // SAFETY: CPUs whose BSP runs in x2APIC mode support it.
+        unsafe {
+            cpu::wrmsr(MSR_APIC_BASE, base | APIC_BASE_ENABLE);
+            cpu::wrmsr(MSR_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_EXTD);
+        }
     } else {
         if base & APIC_BASE_ENABLE == 0 {
             // SAFETY: globally enable the xAPIC at its current base.
@@ -96,6 +114,43 @@ pub fn write(reg: u32, v: u32) {
         assert!(base != 0, "lapic: not initialized");
         // SAFETY: as in `read`.
         unsafe { ((base + reg as usize) as *mut u32).write_volatile(v) };
+    }
+}
+
+/// Whether the x2APIC (MSR) interface is in use.
+pub fn is_x2apic() -> bool {
+    X2APIC.load(Ordering::Relaxed)
+}
+
+/// Send an IPI: `low` is the ICR low word (vector | delivery mode |
+/// level/trigger, destination shorthand 0 = use `dest`), `dest` the
+/// destination APIC id. Waits until a previous xAPIC send was accepted
+/// (delivery status) before and after; no allocation, no locks, so callable
+/// with IRQs masked and spinlocks held. The caller masks IRQs around it
+/// (the xAPIC ICR is two registers).
+pub fn send_icr(dest: u32, low: u32) {
+    if X2APIC.load(Ordering::Relaxed) {
+        // SAFETY: x2APIC ICR (MSR 0x830) takes destination and command in
+        // one 64-bit write; there is no delivery-status bit to poll.
+        unsafe {
+            cpu::wrmsr(
+                MSR_X2APIC_BASE + (REG_ICR_LOW >> 4),
+                ((dest as u64) << 32) | low as u64,
+            )
+        };
+        return;
+    }
+    wait_icr_idle();
+    write(REG_ICR_HIGH, (dest & 0xff) << 24);
+    write(REG_ICR_LOW, low);
+    wait_icr_idle();
+}
+
+fn wait_icr_idle() {
+    let mut spins = 0u32;
+    while read(REG_ICR_LOW) & ICR_DELIVERY_PENDING != 0 && spins < 10_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
     }
 }
 

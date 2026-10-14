@@ -6,6 +6,8 @@
 //!   register dump with ESR/FAR, then exit code 255).
 //! * `patina.selftest=alloc` — frame and heap allocate/free round trips.
 //! * `patina.selftest=vm` — VMA operations and uaccess (`mm::vm::selftest`).
+//! * `patina.selftest=smp` — start the secondary CPUs, IPIs, per-CPU ticks,
+//!   a sub-tick timer deadline (`arch::smp::selftest`).
 //!
 //! Only kernel parameters are considered (see `cmdline::params`): tokens
 //! before the first `--`, or raw `key=value` tokens after it.
@@ -34,6 +36,8 @@ pub fn run(cmdline: &str) {
                 "fault" => fault(),
                 "alloc" => alloc_test(),
                 "vm" => crate::mm::vm::selftest(),
+                #[cfg(target_arch = "x86_64")]
+                "smp" => crate::arch::smp::selftest(),
                 other => kprintln!("[patina] selftest: unknown test {:?}", other),
             }
         }

@@ -1,4 +1,10 @@
-//! Periodic tick (LAPIC timer) and monotonic time (TSC).
+//! Tick + one-shot deadlines (LAPIC timer) and monotonic time (TSC).
+//!
+//! Every CPU runs its LAPIC timer in one-shot mode: each interrupt re-arms
+//! it for min(next boundary of this CPU's `TICK_HZ` grid, pending
+//! [`set_deadline`]), so the periodic tick and sub-tick deadlines share the
+//! one timer. (TSC-deadline mode is not used: TCG does not always offer it
+//! and the one-shot path works everywhere.)
 //!
 //! Calibration: one ~10 ms window on PIT channel 0 (mode 0, counted down
 //! from 0xffff and read back with the latch command, so it works without
@@ -12,13 +18,11 @@
 //! LAPIC LINT0 is masked here; the IOAPIC is left as reset (all pins
 //! masked).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use super::cpu::MAX_CPUS;
 use super::entry::{SPURIOUS_VECTOR, TIMER_VECTOR};
-use super::lapic::{
-    self, LVT_MASKED, LVT_TIMER_PERIODIC, REG_LVT_TIMER, REG_TIMER_CUR, REG_TIMER_DIV,
-    REG_TIMER_INIT,
-};
+use super::lapic::{self, LVT_MASKED, REG_LVT_TIMER, REG_TIMER_CUR, REG_TIMER_DIV, REG_TIMER_INIT};
 use super::port::{inb, outb};
 use super::{cpu, irq};
 use crate::sync::SpinLock;
@@ -58,14 +62,68 @@ pub fn now_ns() -> u64 {
     ((dt as u128 * mult as u128) >> 32) as u64
 }
 
-/// Start the periodic tick at `TICK_HZ` on this CPU and unmask IRQs.
+/// Tick period in ns.
+const PERIOD_NS: u64 = 1_000_000_000 / TICK_HZ;
+const NONE: u64 = u64::MAX;
+
+/// Per-CPU timer state. Only the owning CPU writes it, with IRQs masked;
+/// atomics just make the static shareable (and let the self-test read the
+/// counters of other CPUs).
+struct CpuTimer {
+    /// Absolute ns of the next periodic tick (the 100 Hz grid of this CPU,
+    /// advanced by whole periods so it does not drift).
+    next_tick: AtomicU64,
+    /// Pending one-shot deadline, or NONE.
+    deadline: AtomicU64,
+    /// Target the LAPIC timer is currently counting down to, or NONE.
+    armed: AtomicU64,
+    /// Periodic ticks seen / deadlines fired on this CPU (diagnostics).
+    ticks: AtomicU64,
+    fires: AtomicU64,
+    /// How late (ns) the last deadline was handled, measured in the IRQ.
+    late: AtomicU64,
+    running: AtomicBool,
+}
+
+impl CpuTimer {
+    const fn new() -> Self {
+        Self {
+            next_tick: AtomicU64::new(0),
+            deadline: AtomicU64::new(NONE),
+            armed: AtomicU64::new(NONE),
+            ticks: AtomicU64::new(0),
+            fires: AtomicU64::new(0),
+            late: AtomicU64::new(0),
+            running: AtomicBool::new(false),
+        }
+    }
+}
+
+static TIMERS: [CpuTimer; MAX_CPUS] = [const { CpuTimer::new() }; MAX_CPUS];
+
+fn this_cpu() -> &'static CpuTimer {
+    &TIMERS[cpu::id()]
+}
+
+/// Program this CPU's one-shot for min(next tick, deadline). IRQs masked.
+fn arm(t: &CpuTimer, now: u64) {
+    let target = t
+        .next_tick
+        .load(Ordering::Relaxed)
+        .min(t.deadline.load(Ordering::Relaxed));
+    let delta = target.saturating_sub(now) as u128;
+    let hz = LAPIC_HZ.load(Ordering::Relaxed) as u128;
+    let count = (delta * hz)
+        .div_ceil(1_000_000_000)
+        .clamp(1, u32::MAX as u128) as u32;
+    t.armed.store(target, Ordering::Relaxed);
+    lapic::write(REG_TIMER_INIT, count);
+}
+
+/// Start the tick at `TICK_HZ` on the boot CPU and unmask IRQs.
 pub fn init() {
     calibrate();
-    lapic::init(SPURIOUS_VECTOR);
-    let count = (LAPIC_HZ.load(Ordering::Relaxed) / TICK_HZ).max(1) as u32;
-    lapic::write(REG_TIMER_DIV, LAPIC_DIV16);
-    lapic::write(REG_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
-    lapic::write(REG_TIMER_INIT, count);
+    init_cpu();
     let (mode, base) = lapic::mode();
     let (eax15, ebx15, ecx15) = if cpu::cpuid(0, 0).0 >= 0x15 {
         let (a, b, c, _) = cpu::cpuid(0x15, 0);
@@ -74,12 +132,12 @@ pub fn init() {
         (0, 0, 0)
     };
     crate::kprintln!(
-        "[patina] timer: lapic {} @ {:#x}, vector {:#x}, {} Hz periodic (count {} at /16), lapic clock {} kHz, tsc {} kHz ({}; cpuid 0x15 = {}/{} x {} Hz)",
+        "[patina] timer: lapic {} @ {:#x}, vector {:#x}, one-shot: {} Hz tick grid + per-cpu deadlines (period {} counts at /16), lapic clock {} kHz, tsc {} kHz ({}; cpuid 0x15 = {}/{} x {} Hz)",
         mode,
         base,
         TIMER_VECTOR,
         TICK_HZ,
-        count,
+        LAPIC_HZ.load(Ordering::Relaxed) / TICK_HZ,
         LAPIC_HZ.load(Ordering::Relaxed) * LAPIC_DIVISOR / 1000,
         TSC_HZ.load(Ordering::Relaxed) / 1000,
         *CALIBRATION.lock(),
@@ -88,6 +146,89 @@ pub fn init() {
         ecx15
     );
     irq::enable();
+}
+
+/// Start this CPU's tick (LAPIC timer in one-shot mode, re-armed by
+/// [`on_interrupt`] for the next 1/`TICK_HZ` boundary or the pending
+/// deadline, whichever is first). Does not unmask IRQs. Used by
+/// [`init`] on the boot CPU and by `smp::ap_main` on the others.
+pub fn init_cpu() {
+    calibrate();
+    lapic::init(SPURIOUS_VECTOR);
+    let f = irq::save_disable();
+    let t = this_cpu();
+    lapic::write(REG_TIMER_DIV, LAPIC_DIV16);
+    // One-shot mode (LVT timer mode 0), unmasked.
+    lapic::write(REG_LVT_TIMER, TIMER_VECTOR as u32);
+    let now = now_ns();
+    t.next_tick.store(now + PERIOD_NS, Ordering::Relaxed);
+    t.running.store(true, Ordering::Relaxed);
+    arm(t, now);
+    irq::restore(f);
+}
+
+/// Timer interrupt on this CPU (IRQs masked, EOI sent): account a
+/// periodic tick and/or an expired deadline, re-arm. Returns whether
+/// `trap::timer_tick` should run (false for an early wake-up, e.g. after a
+/// cancelled deadline or LAPIC/TSC rounding).
+pub(super) fn on_interrupt() -> bool {
+    let t = this_cpu();
+    if !t.running.load(Ordering::Relaxed) {
+        return false;
+    }
+    let now = now_ns();
+    let mut due = false;
+    let nt = t.next_tick.load(Ordering::Relaxed);
+    if now >= nt {
+        due = true;
+        t.ticks.fetch_add(1, Ordering::Relaxed);
+        // Next grid point strictly after `now` (missed ticks are skipped,
+        // the phase is kept).
+        let next = nt + ((now - nt) / PERIOD_NS + 1) * PERIOD_NS;
+        t.next_tick.store(next, Ordering::Relaxed);
+    }
+    let d = t.deadline.load(Ordering::Relaxed);
+    if d != NONE && now >= d {
+        due = true;
+        t.deadline.store(NONE, Ordering::Relaxed);
+        t.late.store(now - d, Ordering::Relaxed);
+        t.fires.fetch_add(1, Ordering::Relaxed);
+    }
+    arm(t, now);
+    due
+}
+
+/// Per-CPU one-shot deadline (absolute `now_ns` time): the timer interrupt
+/// (and `trap::timer_tick`) also fires at or just after `ns`. `None`
+/// cancels. Replaces the previous deadline; a past deadline fires at once.
+pub fn set_deadline(ns: Option<u64>) {
+    let f = irq::save_disable();
+    let t = this_cpu();
+    match ns {
+        None => t.deadline.store(NONE, Ordering::Relaxed),
+        Some(d) => {
+            let d = d.min(NONE - 1);
+            t.deadline.store(d, Ordering::Relaxed);
+            if t.running.load(Ordering::Relaxed) && d < t.armed.load(Ordering::Relaxed) {
+                arm(t, now_ns());
+            }
+        }
+    }
+    irq::restore(f);
+}
+
+/// (periodic ticks, deadlines fired) on `cpu` so far (self-tests).
+pub(super) fn cpu_stats(cpu: usize) -> (u64, u64) {
+    let t = &TIMERS[cpu];
+    (
+        t.ticks.load(Ordering::Relaxed),
+        t.fires.load(Ordering::Relaxed),
+    )
+}
+
+/// How late (ns after the deadline) `cpu`'s last deadline interrupt ran.
+pub(super) fn last_deadline_lateness(cpu: usize) -> u64 {
+    TIMERS[cpu].late.load(Ordering::Relaxed)
 }
 
 /// Latch and read PIT channel 0's current count.
