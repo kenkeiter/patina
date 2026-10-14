@@ -1,11 +1,30 @@
-//! Kernel heap: `buddy_system_allocator::Heap` behind an IRQ-safe spinlock,
-//! seeded from the frame allocator and grown on demand.
+//! Kernel heap: page-sized slabs for small objects, whole frames for the
+//! rest, both taken from the frame allocator on demand and given back to
+//! it as soon as they are free (D3, D87).
 //!
-//! Init order: `mm::frame::init` must run before [`init`]. Any allocation
-//! before [`init`] (or after RAM runs out) returns null, which the `alloc`
-//! crate turns into a panic via the default alloc error handler.
+//! * Small allocations (up to [`SMALL_MAX`] bytes, alignment permitting)
+//!   come from one of the size classes in `CLASS_SIZE`. Each class keeps
+//!   4 KiB slabs: a 32-byte header at the start of the page, then equal
+//!   slots filling the page's end, placed so that every slot has the
+//!   class's alignment. A slab whose last object is freed goes back to the
+//!   frame allocator, except for up to `KEEP_EMPTY` empty slabs per class,
+//!   kept to avoid churn. Each class has its own IRQ-safe [`SpinLock`].
+//! * Larger allocations take `ceil(size / 4 KiB)` contiguous frames
+//!   ([`frame::alloc_pages`]: a buddy block with its tail handed back) and
+//!   return them on free.
 //!
-//! The heap has no cap of its own: it grows from the frame allocator, so
+//! The allocator keeps no metadata of its own: `dealloc` gets the layout,
+//! which names the class (or the page count), and a slab's header is at
+//! the start of the page holding the object. Lock order is class lock →
+//! frames; the frame allocator never allocates from the heap. Every lock
+//! masks interrupts, so allocating in interrupt context never deadlocks
+//! against the interrupted holder, and nothing blocks.
+//!
+//! Init order: `mm::frame::init` must run before the first allocation.
+//! Any allocation before that (or after RAM runs out) returns null, which
+//! the `alloc` crate turns into a panic via the default alloc error handler.
+//!
+//! The heap has no cap of its own: it takes frames as it needs them, so
 //! it competes with user pages for the same frames. User-driven kernel
 //! memory is therefore kept in check here (D87):
 //!
@@ -17,7 +36,7 @@
 //!   byte buffer.
 //! * [`reserve`]: a syscall that creates kernel objects (pipes, sockets,
 //!   epolls, files, fds, threads) first checks that free memory (free
-//!   frames plus free heap bytes) stays above a low watermark (half of
+//!   frames plus free slab slots) stays above a low watermark (half of
 //!   the D78 reserve), and fails with ENOMEM/ENOSPC/ENOBUFS otherwise.
 //! * [`try_zeroed`] and `try_reserve*`: buffers sized by user input are
 //!   allocated fallibly.
@@ -26,109 +45,427 @@
 
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
-use core::ptr::{self, NonNull};
+use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use buddy_system_allocator::Heap;
 use patina_abi::errno::{ENOMEM, Errno};
 
-use crate::mm::{PAGE_SIZE, frame, phys_to_virt};
+use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, frame, phys_to_virt, virt_to_phys};
 use crate::sync::SpinLock;
 
-/// Initial heap size: 8 MiB (order-11 frame block).
-const INITIAL_ORDER: usize = 11;
-/// Grow in chunks of at least 2 MiB.
-const GROW_MIN_ORDER: usize = 9;
+// ---------------------------------------------------------------------------
+// Size classes.
 
-/// Heap with 32 size classes (up to 2 GiB blocks).
-pub struct KernelHeap {
-    heap: SpinLock<Heap<32>>,
+/// Bytes at the start of a slab page reserved for its [`Slab`] header.
+const HDR: usize = 32;
+/// Slot sizes. Powers of two get natural alignment, the others 16 to 64.
+const CLASS_SIZE: [usize; 13] = [16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1344, 2032];
+const NCLASSES: usize = CLASS_SIZE.len();
+/// Largest small allocation.
+pub const SMALL_MAX: usize = CLASS_SIZE[NCLASSES - 1];
+/// Empty slabs a class keeps instead of freeing them.
+const KEEP_EMPTY: usize = 2;
+
+/// Slots per slab of class `c`.
+const fn class_objs(c: usize) -> usize {
+    (PAGE_SIZE - HDR) / CLASS_SIZE[c]
 }
 
-impl KernelHeap {
+/// Offset of slot 0 in a slab of class `c` (the slots fill the page's end).
+const fn class_offset(c: usize) -> usize {
+    PAGE_SIZE - class_objs(c) * CLASS_SIZE[c]
+}
+
+/// Alignment of every slot of class `c`: the lowest set bit of both the
+/// first slot's offset and the slot size.
+const fn class_align(c: usize) -> usize {
+    (class_offset(c) | CLASS_SIZE[c]).isolate_lowest_one()
+}
+
+/// `SIZE_TO_CLASS[size.div_ceil(16)]`: the smallest class holding `size`.
+const SIZE_TO_CLASS: [u8; SMALL_MAX / 16 + 1] = {
+    let mut t = [0u8; SMALL_MAX / 16 + 1];
+    let mut i = 0;
+    let mut c = 0;
+    while i < t.len() {
+        while CLASS_SIZE[c] < i * 16 {
+            c += 1;
+        }
+        t[i] = c as u8;
+        i += 1;
+    }
+    t
+};
+
+const _: () = {
+    let mut c = 0;
+    while c < NCLASSES {
+        assert!(CLASS_SIZE[c].is_multiple_of(16) && class_objs(c) >= 2);
+        assert!(class_offset(c) >= HDR && class_align(c) >= 16);
+        c += 1;
+    }
+};
+
+/// The class for `layout`, or `None` for the page path.
+#[inline]
+fn class_for(layout: &Layout) -> Option<usize> {
+    let size = layout.size().max(1);
+    if size > SMALL_MAX {
+        return None;
+    }
+    let mut c = SIZE_TO_CLASS[size.div_ceil(16)] as usize;
+    while class_align(c) < layout.align() {
+        c += 1;
+        if c == NCLASSES {
+            return None;
+        }
+    }
+    Some(c)
+}
+
+/// Pages and alignment order of a page-path allocation.
+fn pages_for(layout: &Layout) -> (usize, usize) {
+    let align_order = if layout.align() > PAGE_SIZE {
+        frame::order_for(layout.align())
+    } else {
+        0
+    };
+    (layout.size().max(1).div_ceil(PAGE_SIZE), align_order)
+}
+
+// ---------------------------------------------------------------------------
+// Slabs.
+
+/// Header at the start of every slab page.
+#[repr(C)]
+struct Slab {
+    next: *mut Slab,
+    prev: *mut Slab,
+    /// Free slots, linked through their first word.
+    free: *mut usize,
+    inuse: usize,
+}
+
+const _: () = assert!(core::mem::size_of::<Slab>() <= HDR);
+
+/// The slabs of one class that have a free slot: partly used ones at the
+/// front, empty ones at the back (the last to be used again, so the
+/// partly used ones fill up and empty ones can go back to the frames).
+struct ClassList {
+    head: *mut Slab,
+    tail: *mut Slab,
+    /// Empty slabs on the list.
+    empty: usize,
+}
+
+// SAFETY: the raw pointers name slab pages owned by the heap; every access
+// is serialised by the class's SpinLock.
+unsafe impl Send for ClassList {}
+
+impl ClassList {
     const fn new() -> Self {
         Self {
-            heap: SpinLock::new(Heap::empty()),
+            head: ptr::null_mut(),
+            tail: ptr::null_mut(),
+            empty: 0,
+        }
+    }
+
+    /// # Safety
+    /// `s` is a live slab of this class, not on the list.
+    unsafe fn push_front(&mut self, s: *mut Slab) {
+        // SAFETY: caller contract; list members are live slab headers.
+        unsafe {
+            (*s).prev = ptr::null_mut();
+            (*s).next = self.head;
+            if self.head.is_null() {
+                self.tail = s;
+            } else {
+                (*self.head).prev = s;
+            }
+        }
+        self.head = s;
+    }
+
+    /// # Safety
+    /// `s` is a live slab of this class, not on the list.
+    unsafe fn push_back(&mut self, s: *mut Slab) {
+        // SAFETY: as above.
+        unsafe {
+            (*s).next = ptr::null_mut();
+            (*s).prev = self.tail;
+            if self.tail.is_null() {
+                self.head = s;
+            } else {
+                (*self.tail).next = s;
+            }
+        }
+        self.tail = s;
+    }
+
+    /// # Safety
+    /// `s` is on the list.
+    unsafe fn unlink(&mut self, s: *mut Slab) {
+        // SAFETY: as above.
+        unsafe {
+            let (n, p) = ((*s).next, (*s).prev);
+            if p.is_null() {
+                self.head = n;
+            } else {
+                (*p).next = n;
+            }
+            if n.is_null() {
+                self.tail = p;
+            } else {
+                (*n).prev = p;
+            }
         }
     }
 }
 
-fn add_frames(heap: &mut Heap<32>, order: usize) -> bool {
-    match frame::alloc_frames(order) {
-        Some(pa) => {
-            let start = phys_to_virt(pa).as_usize();
-            // SAFETY: freshly allocated frames, exclusively owned by the heap from now on.
-            unsafe { heap.add_to_heap(start, start + (PAGE_SIZE << order)) };
-            true
-        }
-        None => false,
+static CLASSES: [SpinLock<ClassList>; NCLASSES] =
+    [const { SpinLock::new(ClassList::new()) }; NCLASSES];
+
+/// Per-class counters. Written only under the class's lock, with a plain
+/// load + store (no atomic read-modify-write on the allocation path);
+/// atomics so that [`stats`] and [`reserve`] can read them without it.
+struct ClassStats {
+    /// Slab pages the class holds.
+    slabs: AtomicUsize,
+    /// Slots handed out.
+    slots: AtomicUsize,
+    /// Bytes requested by the slots' owners.
+    user: AtomicUsize,
+}
+
+static CLASS_STATS: [ClassStats; NCLASSES] = [const {
+    ClassStats {
+        slabs: AtomicUsize::new(0),
+        slots: AtomicUsize::new(0),
+        user: AtomicUsize::new(0),
     }
+}; NCLASSES];
+
+/// `a += d` for a counter only the class lock holder writes.
+#[inline]
+fn bump(a: &AtomicUsize, d: isize) {
+    a.store(a.load(Ordering::Relaxed).wrapping_add_signed(d), Ordering::Relaxed);
+}
+
+/// Page-path allocations: frames held, bytes requested.
+static LARGE_PAGES: AtomicUsize = AtomicUsize::new(0);
+static LARGE_USER: AtomicUsize = AtomicUsize::new(0);
+
+/// A new slab for class `c`, every slot on its free list. Called with the
+/// class lock held.
+fn new_slab(c: usize) -> Option<*mut Slab> {
+    let pa = frame::alloc_frames(0)?;
+    bump(&CLASS_STATS[c].slabs, 1);
+    let base = phys_to_virt(pa).as_usize();
+    let size = CLASS_SIZE[c];
+    let mut free: *mut usize = ptr::null_mut();
+    // Linked back to front, so allocation walks the page upwards.
+    let mut off = PAGE_SIZE - size;
+    loop {
+        let slot = (base + off) as *mut usize;
+        // SAFETY: a slot inside the freshly allocated, direct-mapped page.
+        unsafe { slot.write(free as usize) };
+        free = slot;
+        if off == class_offset(c) {
+            break;
+        }
+        off -= size;
+    }
+    let s = base as *mut Slab;
+    // SAFETY: the page's header area.
+    unsafe {
+        s.write(Slab {
+            next: ptr::null_mut(),
+            prev: ptr::null_mut(),
+            free,
+            inuse: 0,
+        })
+    };
+    Some(s)
+}
+
+/// A slot of class `c` for an object of `user` bytes.
+fn slab_alloc(c: usize, user: usize) -> *mut u8 {
+    let mut l = CLASSES[c].lock();
+    if l.head.is_null() {
+        let Some(s) = new_slab(c) else {
+            return ptr::null_mut();
+        };
+        // SAFETY: a new slab, on no list.
+        unsafe { l.push_front(s) };
+        l.empty += 1;
+    }
+    let s = l.head;
+    bump(&CLASS_STATS[c].slots, 1);
+    bump(&CLASS_STATS[c].user, user as isize);
+    // SAFETY: list members are live slabs of this class with a free slot.
+    unsafe {
+        let obj = (*s).free;
+        (*s).free = obj.read() as *mut usize;
+        if (*s).inuse == 0 {
+            l.empty -= 1;
+        }
+        (*s).inuse += 1;
+        if (*s).free.is_null() {
+            l.unlink(s);
+        }
+        obj as *mut u8
+    }
+}
+
+/// # Safety
+/// `p` came from `slab_alloc(c, user)` and is not used any more.
+unsafe fn slab_free(p: *mut u8, c: usize, user: usize) {
+    let s = (p as usize & !(PAGE_SIZE - 1)) as *mut Slab;
+    let mut l = CLASSES[c].lock();
+    bump(&CLASS_STATS[c].slots, -1);
+    bump(&CLASS_STATS[c].user, -(user as isize));
+    // SAFETY: `s` is the live slab holding `p` (caller contract).
+    unsafe {
+        let was_full = (*s).free.is_null();
+        (p as *mut usize).write((*s).free as usize);
+        (*s).free = p as *mut usize;
+        (*s).inuse -= 1;
+        if (*s).inuse == 0 {
+            if !was_full {
+                l.unlink(s);
+            }
+            if l.empty >= KEEP_EMPTY {
+                bump(&CLASS_STATS[c].slabs, -1);
+                drop(l);
+                let pa = virt_to_phys(VirtAddr(s as usize)).expect("heap: slab outside the direct map");
+                frame::free_frames(pa, 0);
+            } else {
+                l.empty += 1;
+                l.push_back(s);
+            }
+        } else if was_full {
+            l.push_front(s);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The global allocator.
+
+pub struct KernelHeap;
+
+fn large_pa(p: *mut u8) -> PhysAddr {
+    virt_to_phys(VirtAddr(p as usize)).expect("heap: block outside the direct map")
 }
 
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut heap = self.heap.lock();
-        if let Ok(p) = heap.alloc(layout) {
-            return p.as_ptr();
+        if let Some(c) = class_for(&layout) {
+            return slab_alloc(c, layout.size());
         }
-        // Grow: enough frames for the request rounded to a power of two,
-        // at least GROW_MIN_ORDER; when RAM is fragmented (user pages
-        // everywhere), fall back to smaller blocks down to the request's
-        // own order. Then retry once.
-        if heap.stats_total_bytes() == 0 {
-            return ptr::null_mut();
-        }
-        let need = layout.size().max(layout.align()).next_power_of_two();
-        let min_order = frame::order_for(need);
-        let mut order = min_order.max(GROW_MIN_ORDER);
-        loop {
-            if add_frames(&mut heap, order) {
-                return match heap.alloc(layout) {
-                    Ok(p) => p.as_ptr(),
-                    Err(()) => ptr::null_mut(),
-                };
+        let (pages, align_order) = pages_for(&layout);
+        match frame::alloc_pages(pages, align_order) {
+            Some(pa) => {
+                LARGE_PAGES.fetch_add(pages, Ordering::Relaxed);
+                LARGE_USER.fetch_add(layout.size(), Ordering::Relaxed);
+                phys_to_virt(pa).as_mut_ptr()
             }
-            if order <= min_order {
-                return ptr::null_mut();
-            }
-            order -= 1;
+            None => ptr::null_mut(),
         }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if let Some(p) = NonNull::new(ptr) {
-            // SAFETY: GlobalAlloc contract: ptr/layout come from `alloc` above.
-            unsafe { self.heap.lock().dealloc(p, layout) };
+    unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+        if p.is_null() {
+            return;
         }
+        if let Some(c) = class_for(&layout) {
+            // SAFETY: GlobalAlloc contract: `p`/`layout` come from `alloc`.
+            unsafe { slab_free(p, c, layout.size()) };
+            return;
+        }
+        let (pages, _) = pages_for(&layout);
+        LARGE_PAGES.fetch_sub(pages, Ordering::Relaxed);
+        LARGE_USER.fetch_sub(layout.size(), Ordering::Relaxed);
+        frame::free_pages(large_pa(p), pages);
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: GlobalAlloc contract: `new_size` with `layout.align()` is
+        // a valid layout.
+        let new = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+        match (class_for(&layout), class_for(&new)) {
+            // Same slot class: nothing moves.
+            (Some(a), Some(b)) if a == b => {
+                let _l = CLASSES[a].lock();
+                bump(&CLASS_STATS[a].user, new_size as isize - layout.size() as isize);
+                return p;
+            }
+            // Page path, not growing: keep the head, free the tail.
+            (None, None) => {
+                let (old_pages, _) = pages_for(&layout);
+                let (new_pages, _) = pages_for(&new);
+                if new_pages <= old_pages {
+                    let tail = old_pages - new_pages;
+                    if tail > 0 {
+                        frame::free_pages(PhysAddr(large_pa(p).0 + new_pages * PAGE_SIZE), tail);
+                        LARGE_PAGES.fetch_sub(tail, Ordering::Relaxed);
+                    }
+                    LARGE_USER.fetch_add(new_size, Ordering::Relaxed);
+                    LARGE_USER.fetch_sub(layout.size(), Ordering::Relaxed);
+                    return p;
+                }
+            }
+            _ => {}
+        }
+        // SAFETY: `new` is a valid, non-zero-size layout.
+        let q = unsafe { self.alloc(new) };
+        if !q.is_null() {
+            // SAFETY: both blocks are live and at least this long; `p` is
+            // not used after.
+            unsafe {
+                ptr::copy_nonoverlapping(p, q, layout.size().min(new_size));
+                self.dealloc(p, layout);
+            }
+        }
+        q
     }
 }
 
 #[global_allocator]
-static HEAP: KernelHeap = KernelHeap::new();
+static HEAP: KernelHeap = KernelHeap;
 
-/// Seed the heap from the frame allocator. Panics if RAM is too small.
+/// Boot hook, after `mm::frame::init`. The heap takes frames on demand,
+/// so there is nothing to seed; this only checks the init order.
 pub fn init() {
-    let mut heap = HEAP.heap.lock();
-    // Shrink the initial chunk on tiny VMs.
-    let (free, _) = frame::stats();
-    let mut order = INITIAL_ORDER;
-    while order > GROW_MIN_ORDER && (1usize << order) > free / 4 {
-        order -= 1;
-    }
-    assert!(
-        add_frames(&mut heap, order),
-        "heap: cannot allocate initial frames"
-    );
+    assert!(frame::is_initialized(), "heap: frame allocator not initialised");
 }
 
-/// `(user_bytes, allocated_bytes, total_bytes)` of the heap.
+/// `(user_bytes, allocated_bytes, total_bytes)` of the heap: bytes
+/// requested, bytes of slots and pages handed out, and bytes of frames
+/// the heap holds (slab pages, kept empty ones included, and page-path
+/// blocks).
 pub fn stats() -> (usize, usize, usize) {
-    let h = HEAP.heap.lock();
-    (
-        h.stats_alloc_user(),
-        h.stats_alloc_actual(),
-        h.stats_total_bytes(),
-    )
+    let large = LARGE_PAGES.load(Ordering::Relaxed);
+    let (mut user, mut actual, mut slabs) = (LARGE_USER.load(Ordering::Relaxed), large * PAGE_SIZE, 0);
+    for (c, st) in CLASS_STATS.iter().enumerate() {
+        user += st.user.load(Ordering::Relaxed);
+        actual += st.slots.load(Ordering::Relaxed) * CLASS_SIZE[c];
+        slabs += st.slabs.load(Ordering::Relaxed);
+    }
+    (user, actual, (slabs + large) * PAGE_SIZE)
+}
+
+/// Bytes of free slots in slab pages (kept empty slabs included).
+fn slab_free_bytes() -> usize {
+    CLASS_STATS
+        .iter()
+        .enumerate()
+        .map(|(c, st)| {
+            (st.slabs.load(Ordering::Relaxed) * PAGE_SIZE)
+                .saturating_sub(st.slots.load(Ordering::Relaxed) * CLASS_SIZE[c])
+        })
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -152,21 +489,24 @@ pub fn charged_pages() -> usize {
     CHARGED.load(Ordering::Relaxed).div_ceil(PAGE_SIZE)
 }
 
-/// What a heap allocation of `n` bytes really takes (buddy blocks are
-/// powers of two): the amount [`charge`] callers account for.
+/// What a heap allocation of `n` bytes (alignment at most 16) really
+/// takes: its slot, or whole pages. The amount [`charge`] callers account
+/// for.
 pub const fn alloc_size(n: usize) -> usize {
-    if n == 0 { 0 } else { n.next_power_of_two() }
+    if n == 0 {
+        0
+    } else if n <= SMALL_MAX {
+        CLASS_SIZE[SIZE_TO_CLASS[n.div_ceil(16)] as usize]
+    } else {
+        n.div_ceil(PAGE_SIZE) * PAGE_SIZE
+    }
 }
 
-/// Free memory the kernel can still allocate from: free frames plus heap
-/// bytes not in use.
+/// Free memory the kernel can still allocate from: free frames plus free
+/// slots in slab pages.
 fn available_bytes() -> usize {
     let (free, _) = frame::stats();
-    let heap_free = {
-        let h = HEAP.heap.lock();
-        h.stats_total_bytes() - h.stats_alloc_actual()
-    };
-    free.saturating_mul(PAGE_SIZE).saturating_add(heap_free)
+    free.saturating_mul(PAGE_SIZE).saturating_add(slab_free_bytes())
 }
 
 /// The low watermark: half of the D78 kernel reserve (RAM/32, 2–32 MiB).
@@ -190,6 +530,11 @@ pub fn reserve(bytes: usize) -> Result<(), Errno> {
 /// against its commit limit (D78) and the watermark ([`reserve`]).
 /// `false`: refused (the caller fails with ENOBUFS/ENOMEM/ENOSPC and
 /// allocates nothing). Undo with [`uncharge`] when the memory is freed.
+///
+/// Charges stop short of the limit by 1/32 of it (1–32 MiB): when kernel
+/// buffers and the program's own mappings race for the last of it, the
+/// buffers are refused (a recoverable errno) and the program's heap
+/// growth, which Go cannot survive failing, still fits.
 pub fn charge(bytes: usize) -> bool {
     if bytes == 0 {
         return true;
@@ -199,7 +544,9 @@ pub fn charge(bytes: usize) -> bool {
     }
     let held = CHARGED.fetch_add(bytes, Ordering::Relaxed) + bytes;
     let committed = COMMITTED.load(Ordering::Relaxed);
-    if committed.saturating_add(held.div_ceil(PAGE_SIZE)) > COMMIT_LIMIT.load(Ordering::Relaxed) {
+    let limit = COMMIT_LIMIT.load(Ordering::Relaxed);
+    let headroom = (limit / 32).clamp(256, 8192);
+    if committed.saturating_add(held.div_ceil(PAGE_SIZE)) > limit.saturating_sub(headroom) {
         CHARGED.fetch_sub(bytes, Ordering::Relaxed);
         return false;
     }

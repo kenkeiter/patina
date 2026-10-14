@@ -15,7 +15,10 @@
 //	          is that the kernel stays alive and the program exits 0
 //	          ("PASS sysfuzz fuzz").
 //	all       cases, then fuzz.
-//	exhaust   reserved (not implemented): kernel memory pressure.
+//	limits    resource limits: pipes, sockets, epolls, mappings and tmpfs
+//	          until the kernel refuses; errnos must be clean and memory
+//	          must come back after release (-limits-strict). "exhaust" is
+//	          an alias.
 //	sigreturn-* hand-crafted bad rt_sigreturn frames (crash.go): the
 //	          program dies by a signal; the kernel must survive.
 //
@@ -36,7 +39,7 @@ import (
 )
 
 var (
-	modeFlag     = flag.String("mode", "all", "cases|fuzz|all|exhaust|sigreturn-*")
+	modeFlag     = flag.String("mode", "all", "cases|fuzz|all|limits|sigreturn-*")
 	seedFlag     = flag.Int64("seed", 1, "fuzz seed")
 	itersFlag    = flag.Int("iters", 20000, "total fuzz syscalls")
 	procsFlag    = flag.Int("procs", 0, "fuzz goroutines (0: GOMAXPROCS)")
@@ -68,9 +71,8 @@ func main() {
 	case "all":
 		runCases()
 		runFuzz()
-	case "exhaust":
-		fmt.Println("sysfuzz: exhaust mode is not implemented (finding 6 is covered by the kernel-side check)")
-		os.Exit(2)
+	case "limits", "exhaust":
+		runLimits()
 	default:
 		if !runCrash(*modeFlag) {
 			fmt.Printf("FAIL sysfuzz: unknown mode %q\n", *modeFlag)

@@ -141,8 +141,28 @@ impl<T> FdSlots<T> {
             while self.slots.last().is_some_and(Option::is_none) {
                 self.slots.pop();
             }
+            self.maybe_shrink();
         }
         v
+    }
+
+    /// Give back the slot array's memory once the table is mostly empty
+    /// (after closing a burst of fds; up to 16 MiB at `RLIMIT_NOFILE`'s
+    /// maximum): at a quarter full or less, keep twice the slots in use.
+    /// Fallible: if the smaller array cannot be allocated, nothing changes.
+    fn maybe_shrink(&mut self) {
+        const MIN_SLOTS: usize = 256;
+        let cap = self.slots.capacity();
+        if cap <= MIN_SLOTS || self.slots.len() > cap / 4 {
+            return;
+        }
+        let keep = (self.slots.len() * 2).max(MIN_SLOTS);
+        let mut v = Vec::new();
+        if v.try_reserve_exact(keep).is_err() {
+            return;
+        }
+        v.append(&mut self.slots);
+        self.slots = v;
     }
 
     /// Occupied slots in fd order.
@@ -377,6 +397,22 @@ pub fn lock_range(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fd_slots_shrink_after_burst() {
+        let mut t = FdSlots::new();
+        for i in 0..100_000 {
+            assert_eq!(t.alloc(i, 0, usize::MAX).unwrap(), i);
+        }
+        assert!(t.capacity() >= 100_000);
+        for fd in 3..100_000 {
+            assert_eq!(t.take(fd), Some(fd));
+        }
+        assert!(t.capacity() <= 256, "capacity {}", t.capacity());
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get(2), Some(&2));
+        assert_eq!(t.alloc(7, 0, usize::MAX).unwrap(), 3);
+    }
+
     extern crate std;
     use super::*;
     use alloc::vec;

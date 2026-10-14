@@ -11,6 +11,8 @@
 //	          (run with patina.stats=1: the kernel prints per-CPU timer
 //	          interrupt counts at exit)
 //	reclaim   kernel stack and page-table frame reclaim
+//	kheap     kernel heap shrink: bursts of pipes, sockets, epolls and
+//	          tmpfs pages; free RAM returns to baseline once closed
 //	sigbus    unaligned atomic (arm64: SIGBUS BUS_ADRALN), exit 2
 //	sigill    undefined instruction (SIGILL), exit 2
 //	gp        amd64: non-canonical access (#GP → SIGSEGV SI_KERNEL), exit 2
@@ -55,6 +57,8 @@ func main() {
 		checkRestartSyscall()
 	case "reclaim":
 		checkReclaim()
+	case "kheap":
+		checkKheap()
 	case "sigbus":
 		crashSigbus()
 	case "sigill":

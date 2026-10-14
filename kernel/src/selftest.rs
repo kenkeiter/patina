@@ -57,9 +57,82 @@ fn fault() {
     kprintln!("[patina] selftest: fault did NOT fault (read {:#x})", v);
 }
 
+/// Every size class and alignment, the page path, in-place and moving
+/// reallocs, frees out of order; then the frames must be back.
+fn layouts_test(f0: usize) {
+    use core::alloc::Layout;
+    let mut blocks: Vec<(*mut u8, Layout, u8)> = Vec::new();
+    let mut tag = 0u8;
+    for round in 0..4 {
+        for size in (1..=9000usize).step_by(37) {
+            for align in [1usize, 8, 16, 32, 64, 256, 4096, 16384] {
+                if (size + align + round) % 3 != 0 {
+                    continue;
+                }
+                let l = Layout::from_size_align(size, align).unwrap();
+                // SAFETY: non-zero size.
+                let p = unsafe { alloc::alloc::alloc(l) };
+                assert!(!p.is_null(), "selftest alloc: {:?} failed", l);
+                assert!((p as usize).is_multiple_of(align), "{:?} misaligned: {:p}", l, p);
+                tag = tag.wrapping_add(1);
+                // SAFETY: freshly allocated, `size` bytes.
+                unsafe { core::ptr::write_bytes(p, tag, size) };
+                blocks.push((p, l, tag));
+            }
+        }
+        // Grow or shrink every third block, free every other one.
+        for (i, b) in blocks.iter_mut().enumerate() {
+            let (p, l, t) = *b;
+            if i % 3 != round % 3 {
+                continue;
+            }
+            let new = if i % 2 == 0 { l.size() * 2 + 100 } else { l.size().div_ceil(3) };
+            // SAFETY: `p`/`l` are live; `new` is non-zero.
+            let q = unsafe { alloc::alloc::realloc(p, l, new) };
+            assert!(!q.is_null());
+            assert!((q as usize).is_multiple_of(l.align()));
+            // SAFETY: the realloc kept the first min(old, new) bytes.
+            let ok = (0..l.size().min(new)).all(|k| unsafe { *q.add(k) } == t);
+            assert!(ok, "selftest alloc: realloc lost data ({:?} -> {})", l, new);
+            // SAFETY: `new` bytes are ours now.
+            unsafe { core::ptr::write_bytes(q, t, new) };
+            *b = (q, Layout::from_size_align(new, l.align()).unwrap(), t);
+        }
+        let mut keep = Vec::new();
+        for (j, (p, l, t)) in blocks.drain(..).enumerate() {
+            // SAFETY: live block of `l.size()` bytes.
+            let ok = (0..l.size()).all(|k| unsafe { *p.add(k) } == t);
+            assert!(ok, "selftest alloc: block {:?} corrupted", l);
+            if j % 2 == round % 2 {
+                // SAFETY: allocated with `l`.
+                unsafe { alloc::alloc::dealloc(p, l) };
+            } else {
+                keep.push((p, l, t));
+            }
+        }
+        blocks = keep;
+    }
+    let n = blocks.len();
+    for (p, l, _) in blocks.drain(..) {
+        // SAFETY: allocated with `l`.
+        unsafe { alloc::alloc::dealloc(p, l) };
+    }
+    drop(blocks);
+    let (f, _) = frame::stats();
+    kprintln!(
+        "[patina] selftest alloc: layouts: {} blocks left after 4 rounds, all freed; frames free {} (start {})",
+        n,
+        f,
+        f0
+    );
+    assert!(f0.saturating_sub(f) <= 64, "heap kept {} frames", f0.saturating_sub(f));
+}
+
 fn alloc_test() {
-    let (f0, total) = frame::stats();
     let h0 = heap::stats();
+    // Reserved before counting: growing it later would take heap frames.
+    let mut blocks: Vec<(PhysAddr, usize)> = Vec::with_capacity(16);
+    let (f0, total) = frame::stats();
     kprintln!(
         "[patina] selftest alloc: before: frames {} free / {} total; heap user {} B, total {} B",
         f0,
@@ -69,7 +142,6 @@ fn alloc_test() {
     );
 
     // Frames: a spread of orders, write a pattern, free in reverse.
-    let mut blocks: Vec<(PhysAddr, usize)> = Vec::new();
     for order in [0usize, 1, 3, 5, 8, 9, 0, 2, 9] {
         let pa = frame::alloc_frames(order).expect("alloc_frames failed");
         assert!(
@@ -104,8 +176,8 @@ fn alloc_test() {
     }
     drop(blocks);
 
-    // Heap: many small objects, a few large ones (forces growth past the
-    // initial chunk), strings and boxes.
+    // Heap: many small objects, a few large ones (page path), strings and
+    // boxes; afterwards the frames must be back in the frame allocator.
     {
         let mut small: Vec<Box<[u64; 4]>> = Vec::new();
         for i in 0..10_000u64 {
@@ -147,5 +219,12 @@ fn alloc_test() {
         h2.2
     );
     assert_eq!(h2.0, h0.0, "heap leak");
+    // The heap gave the frames back (D87): only kept empty slabs remain.
+    assert!(
+        f0.saturating_sub(f3) <= 64,
+        "heap kept {} frames after freeing everything",
+        f0.saturating_sub(f3)
+    );
+    layouts_test(f0);
     kprintln!("[patina] selftest alloc: ok");
 }

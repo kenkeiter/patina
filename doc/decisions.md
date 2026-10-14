@@ -46,6 +46,12 @@ demand: on OOM it pulls at least 2 MiB (a power of two big enough for the
 request) from the frame allocator and retries once. Lock order is
 heap → frames; the frame allocator never allocates from the heap.
 
+*Superseded (Phase 5, D87):* the crate's heap never returned frames, so
+it was replaced by an in-tree slab + page allocator (`mm/heap.rs`, D87
+describes it). The IRQ-safe locking and the heap → frames lock order
+stay; there is no initial chunk any more, the heap takes frames on
+demand. `buddy_system_allocator` is no longer a dependency.
+
 ## D4: In-tree buddy frame allocator
 *2026-10-14 · Phase 0*
 
@@ -2855,9 +2861,36 @@ through 192.168.64.1), `scripts/test-vz.sh`, `test-net.sh aarch64 x86_64`
 after macOS creates the NAT bridge (no other NAT VM running) the first
 connection can be delayed by seconds while the host ARPs unrelated
 addresses (the guest answers in < 1 ms); the e2e test treats the first
-request as informational. Also noted: every accepted TCP connection sends
-one 1-byte segment right after the handshake (smoltcp keep-alive
-handling, harmless, not fixed).
+request as informational. Also noted: every accepted TCP connection sent
+one 1-byte segment right after the handshake.
+
+*Amended 2026-10-14 (root cause, fixed):* the segment was a smoltcp
+keep-alive probe (ACK, seq SND.NXT-1, one 0x00 byte, ~0.1 ms after the
+ACK of the client's first data; the peer answers with a duplicate ACK).
+Go turns on `SO_KEEPALIVE` (idle 15 s) on every accepted and dialed
+connection right after `accept`/`connect`, and smoltcp 0.14's
+`tcp::Socket::set_keep_alive` arms an idle socket's keep-alive timer at
+`Instant` 0 ("would not take effect until the next packet, unless we wind
+up the timer explicitly"), so the next poll probed at once. Linux sends
+the first probe only after `TCP_KEEPIDLE` s without traffic. Fix
+(`net/inet.rs` `apply_live_tcp_opts`): enabling keep-alive on a socket
+past the handshake no longer reaches smoltcp immediately; the connection
+records the start of an idle period (restarted by each successful
+send/recv), and `Stack::track` (every poll, at least once a second) hands
+the interval to smoltcp once `TCP_KEEPIDLE` has elapsed; smoltcp then
+probes and rewinds its timer on every segment it sends or receives.
+Sockets that have not finished the handshake (a listener's pool, which
+inherits the listener's options, or a connect) still get keep-alive
+directly: smoltcp restarts the timer at the handshake. Probes go out
+every `TCP_KEEPIDLE` s (smoltcp has one interval); `TCP_KEEPINTVL` and
+`TCP_KEEPCNT` are stored and reported, not used (a dead peer is detected
+by `TCP_USER_TIMEOUT` only). Not the listen pool: pool sockets carry no
+leftover data. Captured under QEMU with `-object filter-dump` (httphello
++ curl): no 1-byte segment after the handshake; an idle keep-alive
+HTTP connection gets its first probe 15.08 s after the last segment and
+the next 15.0 s later, as on Linux with Go's 15 s / 15 s. **sockets**
+covers the options (defaults, `EINVAL`, stored, inherited by accept) and
+a probing idle connection staying up with no stray bytes.
 
 ## D86: User buffers are checked before data is consumed
 *2026-10-14 · Phase 5*
@@ -2934,16 +2967,82 @@ and splitting `munmap`/`mprotect` → ENOMEM), and `munmap`/`madvise`/
 `mprotect` no longer collect every resident page of a range into a Vec.
 
 The fd table now remembers its lowest free slot, so filling it to 2^20
-is linear (it was quadratic: minutes). Known limits: freed heap memory is
-not returned to the frame allocator, so after a program frees many kernel
-buffers its own page faults can still hit the D78 backstop (SIGKILL); the
-x86_64 SMP shootdown list and the epoll ready snapshot stay infallible
+is linear (it was quadratic: minutes). Known limits: ~~freed heap memory
+is not returned to the frame allocator~~ (closed, see "Heap shrinking"
+below); the x86_64 SMP shootdown list and the epoll ready snapshot stay infallible
 (bounded by RAM/512 and by registered items, which are gated). Verified
 with a throwaway program at `PATINA_MEM=256` on aarch64, which panicked
 the kernel before in every case: pipes until `write` ENOMEM (2875), UDP
 sockets until ENOBUFS (2787), 4096 listening sockets (then ENFILE), epolls
 until ENOMEM (734186), and tmpfs writes after committing all memory
 (ENOSPC); each exits 0.
+
+**Heap shrinking** (closes the limit above). The `buddy_system_allocator`
+heap (D3) kept every frame it ever grew by: after a program closed 50k
+pipes the kernel still held their 74 MiB, and `sysfuzz -mode limits` at
+256 MiB ended with 238 MiB of the VM's RAM stuck in the heap, where the
+program's own page faults could only reach it through the D78 backstop.
+`mm/heap.rs` is now an in-tree slab + page allocator (the "in-tree slab"
+D3/design §11 planned) that holds no frame it does not use:
+
+* Small requests (up to 2032 bytes) use 13 size classes (16, 32, 48, 64,
+  96, 128, 192, 256, 384, 512, 768, 1344, 2032). A slab is one 4 KiB
+  frame: a 32-byte header at its start, then equal slots packed against
+  the end of the page, so every slot is aligned to the lowest set bit of
+  its offset and the slot size (power-of-two classes get natural
+  alignment, the others 16–64). A request whose alignment the smallest
+  fitting class cannot give moves to a larger class or the page path.
+  A class keeps its slabs with free slots on a doubly linked list, partly
+  used ones at the front, empty ones at the back; when a slab's last
+  object is freed it goes straight back to the frame allocator unless the
+  class has fewer than 2 empty slabs already (no churn when one object is
+  allocated and freed in a loop).
+* Larger requests take `ceil(size / 4 KiB)` frames: `frame::alloc_pages`
+  takes a buddy block of the covering order and hands the tail back at
+  once, and `dealloc` frees the pages (`frame::free_pages` splits any run
+  into naturally aligned blocks). `realloc` stays in place within a slab
+  class and when a page-path block shrinks (the tail is freed).
+* No metadata outside the slabs: `dealloc` gets the layout, which names
+  the class or page count, and the slab header is at the start of the
+  object's page. Each class has its own IRQ-safe `SpinLock` (the old heap
+  had one); lock order is class → frames and the frame allocator still
+  never allocates, so allocating in interrupt context cannot deadlock
+  and never blocks. Frames are freed synchronously on the freeing path:
+  no trim pass, no idle work.
+
+Size accounting changed with it: `heap::alloc_size` (what `charge`
+callers count) is the slot size or whole pages, not the next power of
+two; `reserve`'s free-memory estimate is free frames plus free slab slots.
+`/proc/meminfo` gains `Slab:` (frames the heap holds). `charge` now
+stops 1/32 of the commit limit (1–32 MiB) short of it: with a denser
+heap, pipe rings filled the commit limit before the watermark tripped,
+and at 4 vCPUs Go's GC lost the race for the last pages (`fatal error:
+runtime: cannot allocate memory` in `sysfuzz -mode limits`); kernel
+buffers are now refused (a recoverable errno) while the program's heap
+growth still fits. The fd table
+(`FdSlots`) also shrinks: when at most a quarter of its slots are in use
+after a close it moves to an array twice the slots in use (fallibly;
+256 minimum), so a program that once had 2^20 fds open does not keep a
+16 MiB table.
+
+Verified by **test-robust** `kheap` / `kheap-4cpu` (`PATINA_MEM=1024`,
+both arches): 50k pipes (1000 written), 20k sockets (8500 AF_UNIX pairs
+with queued data, 2000 UDP, 1000 TCP), 10k epolls with an item each and
+200 MiB of tmpfs files, each set closed or deleted before the next. The
+kernel grows by up to 204 MiB and comes back to within 1 MiB of its
+baseline after every phase (aarch64: kernel-held 3 → 4 MiB, MemFree
+1012 → 1011 MiB; x86_64: 4 → 5 MiB, 1011 → 1010 MiB); the old heap ended
+the pipe phase 74 MiB up. `sysfuzz -mode limits -limits-strict` (now the
+default in `test-sysfuzz.sh`) ends 2.6–5.6 MiB below its MemFree baseline on both arches at 1 and 4 vCPUs
+(was 238.6 MiB); its MemFree samples now follow `debug.FreeOSMemory()`,
+so what Go keeps resident does not count. `selftest alloc` checks every
+class and alignment, in-place and moving reallocs and that the frames
+come back. Robust `reclaim` now checks the kernel frames outside the
+heap (MemTotal − MemFree − VmRSS − Slab), with a tolerance of 96 frames
+(was 64): with a heap that tracks the objects alive at the moment, the
+old total moved by up to ±130 frames between samples, and at 4 vCPUs the
+number of Go's idle threads (8 kernel-stack frames each) moves the rest
+by up to ~65; a stack leak would be 16000 frames.
 
 ## D88: Multi-queue virtio-net: a queue pair per vCPU, per-pair MSI-X vectors on their CPU, one interface
 *2026-10-14 · Phase 5*

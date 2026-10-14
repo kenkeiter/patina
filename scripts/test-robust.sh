@@ -12,6 +12,10 @@
 #                       (tickless idle; a 100 Hz tick would give ~700 each)
 #   restart   exit 0    nanosleep continued through restart_syscall
 #   reclaim   exit 0    kernel stack + page-table frame reclaim (1 and 4 vCPUs)
+#   kheap     exit 0    PATINA_MEM=1024, 1 and 4 vCPUs: 50k pipes, 20k sockets,
+#                       10k epolls, 200 MiB of tmpfs, each closed/deleted;
+#                       the kernel heap returns its frames (D87): kernel-held
+#                       frames and MemFree back to within 4 MiB of baseline
 #   sigbus    exit 2    aarch64: [signal SIGBUS: bus error code=0x1 addr=<the
 #                       unaligned address> pc=...]
 #   sigill    exit 2    SIGILL: illegal instruction, sigcode=1 (arm64) / 2 (amd64)
@@ -125,6 +129,8 @@ for arch in "${arches[@]}"; do
     "restart|$base_cpus|512|0|PASS robust|re:ok restart_syscall: .*|--|-mode|restart"
     "reclaim|1|512|0|PASS robust|re:ok kstack reclaim: .*|re:ok page-table reclaim: .*|--|-mode|reclaim"
     "reclaim-4cpu|4|512|0|PASS robust|re:ok kstack reclaim: .*|re:ok page-table reclaim: .*|--|-mode|reclaim"
+    "kheap|1|1024|0|PASS robust|re:ok kheap shrink: .*|$nofatal|--|-mode|kheap"
+    "kheap-4cpu|4|1024|0|PASS robust|re:ok kheap shrink: .*|$nofatal|--|-mode|kheap"
     "sigill|$base_cpus|512|2|SIGILL: illegal instruction|re:PC=0x[0-9a-f]+ m=[0-9]+ sigcode=$sigcode|[patina] exit code 2|--|-mode|sigill"
     "accerr|$base_cpus|512|2|re:\[signal SIGSEGV: segmentation violation code=0x2 addr=0x[0-9a-f]+ $pcre\]|[patina] exit code 2|--|-mode|accerr"
     "sigkill|$base_cpus|512|137|[patina] exit signal SIGKILL|[patina] exit code 137|--|-mode|sigkill"
@@ -157,7 +163,7 @@ for arch in "${arches[@]}"; do
       failed=1
     else
       results+=("PASS $arch $name")
-      grep -E '^(ok |skip |PASS|\[signal |SIGILL|PC=|fatal error|\[patina\] (exit|stats))' "$log" | sed "s|^|  $name $arch: |"
+      grep -E '^(ok |skip |PASS|robust: kheap |\[signal |SIGILL|PC=|fatal error|\[patina\] (exit|stats))' "$log" | sed "s|^|  $name $arch: |"
     fi
   done
 done
