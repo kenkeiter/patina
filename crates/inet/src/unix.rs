@@ -175,8 +175,10 @@ pub fn parse_cmsgs(buf: &[u8]) -> Result<Vec<Cmsg<'_>>, ()> {
 
 /// The fds of an `SCM_RIGHTS` payload (`(len - CMSG_LEN(0)) / 4` ints).
 pub fn rights_fds(data: &[u8]) -> impl Iterator<Item = i32> + '_ {
-    data.chunks_exact(4)
-        .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
+    data.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_ne_bytes(*c))
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +317,11 @@ mod tests {
 
     #[test]
     fn cmsg_roundtrip() {
-        let mut buf = rec(SOL_SOCKET, SCM_RIGHTS, &[3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0]);
+        let mut buf = rec(
+            SOL_SOCKET,
+            SCM_RIGHTS,
+            &[3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0],
+        );
         assert_eq!(buf.len(), cmsg_space(12));
         buf.extend(rec(SOL_SOCKET, SCM_CREDENTIALS, &[0; 12]));
         let v = parse_cmsgs(&buf).unwrap();

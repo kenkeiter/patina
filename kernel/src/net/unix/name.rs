@@ -157,7 +157,13 @@ pub fn bind_path(id: u64, p: Vec<u8>) -> Result<(), Errno> {
             let start = base.start(fs)?;
             let sp: Arc<dyn Special> = Arc::new(SockSpecial(id));
             fs.mknod(start, &p, S_IFSOCK | (0o777 & !umask), 0, Some(sp))
-                .map_err(|e| if e == Errno(EEXIST) { Errno(EADDRINUSE) } else { e })
+                .map_err(|e| {
+                    if e == Errno(EEXIST) {
+                        Errno(EADDRINUSE)
+                    } else {
+                        e
+                    }
+                })
         })
     });
     super::with(|w, _| {

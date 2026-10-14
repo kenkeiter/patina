@@ -11,9 +11,7 @@ use patina_abi::net::*;
 use patina_inet::unix::{CmsgWriter, SCM_MAX_FD, parse_cmsgs, rights_fds};
 
 use super::name::{self, Name};
-use super::{
-    Anc, BUF_SIZE, Conn, MAX_DGRAM, Msg, Rx, Sock, UnixSocket, World, own_creds, with,
-};
+use super::{Anc, BUF_SIZE, Conn, MAX_DGRAM, Msg, Rx, Sock, UnixSocket, World, own_creds, with};
 use crate::fs::file::File;
 use crate::net::socket::{self as so, RecvInfo, SockAddr, SocketOps};
 
@@ -121,12 +119,7 @@ fn peek_anc(a: &Anc) -> Anc {
 }
 
 impl UnixSocket {
-    fn send_stream(
-        &self,
-        data: &[u8],
-        to: Option<&SockAddr>,
-        anc: Anc,
-    ) -> Result<usize, Errno> {
+    fn send_stream(&self, data: &[u8], to: Option<&SockAddr>, anc: Anc) -> Result<usize, Errno> {
         let mut anc = (!anc.is_empty()).then_some(anc);
         with(|w, out| {
             let me = w.sock(self.id)?;
@@ -516,7 +509,11 @@ impl SocketOps for UnixSocket {
             };
             let eid = queue.pop_front().ok_or(Errno(EAGAIN))?;
             out.wake_waiters(w, self.id);
-            let peer = w.socks.get(&eid).map(|e| e.peer_name.clone()).unwrap_or_default();
+            let peer = w
+                .socks
+                .get(&eid)
+                .map(|e| e.peer_name.clone())
+                .unwrap_or_default();
             Ok((eid, peer))
         })?;
         let f: Arc<dyn File> = UnixSocket::new(eid, self.ty);
@@ -669,7 +666,11 @@ impl SocketOps for UnixSocket {
                 SO_RCVBUF => int(me.rcvbuf, out),
                 SO_PASSCRED => int(me.passcred as i32, out),
                 SO_PEERCRED => {
-                    let c = if me.has_peercred { own_creds() } else { NO_CREDS };
+                    let c = if me.has_peercred {
+                        own_creds()
+                    } else {
+                        NO_CREDS
+                    };
                     out[..12].copy_from_slice(&ucred_bytes(&c));
                     Ok(12)
                 }
@@ -684,7 +685,11 @@ impl SocketOps for UnixSocket {
                 SO_REUSEADDR | SO_REUSEPORT | SO_KEEPALIVE | SO_BROADCAST | SO_OOBINLINE
                 | SO_PRIORITY | SO_RCVLOWAT | SO_SNDLOWAT | SO_DONTROUTE | SO_NO_CHECK
                 | SO_TIMESTAMP_OLD => {
-                    let def = if name == SO_RCVLOWAT || name == SO_SNDLOWAT { 1 } else { 0 };
+                    let def = if name == SO_RCVLOWAT || name == SO_SNDLOWAT {
+                        1
+                    } else {
+                        0
+                    };
                     int(*me.misc.get(&name).unwrap_or(&def), out)
                 }
                 SO_BINDTODEVICE => Ok(0),

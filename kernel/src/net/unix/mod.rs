@@ -46,12 +46,12 @@ use patina_abi::epoll::EpollFlags;
 use patina_abi::errno::*;
 use patina_abi::fs::S_IFSOCK;
 use patina_abi::misc::FIONREAD;
-use patina_abi::net::{
-    MsgFlags, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, Ucred,
-};
+use patina_abi::net::{MsgFlags, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, Ucred};
 use patina_inet::unix::StreamBuf;
 
-use crate::fs::file::{File, FileFlags, Notify, OpenFile, PollHook, PollList, alloc_ino, anon_stat};
+use crate::fs::file::{
+    File, FileFlags, Notify, OpenFile, PollHook, PollList, alloc_ino, anon_stat,
+};
 use crate::net::socket::SocketOps;
 use crate::sync::SpinLock;
 
@@ -141,7 +141,10 @@ enum Conn {
     /// Neither listening nor connected (a datagram socket is always here;
     /// its default destination is `Sock::dgram_peer`).
     Idle,
-    Listening { backlog: usize, queue: VecDeque<u64> },
+    Listening {
+        backlog: usize,
+        queue: VecDeque<u64>,
+    },
     /// Connected stream/seqpacket socket (the peer id stays after the peer
     /// is gone; `rcv_shut`/`snd_shut` say so).
     Connected { peer: u64 },
