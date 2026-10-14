@@ -307,6 +307,17 @@ impl Device for Mux {
         if self.tx.lo.is_full() {
             return None;
         }
+        // Likewise while the NIC's transmit ring is full: a token would
+        // make `route` drop the frame, which costs TCP a retransmission
+        // timeout (smoltcp's minimum RTO is 1 s; a 4 MiB send over VZ NAT
+        // stalled for 1 s in about half the runs). Without a token smoltcp
+        // keeps the data; the driver's transmit-completion interrupt wakes
+        // the net task to poll again.
+        if let Some(n) = self.tx.nic.as_mut() {
+            if !n.can_send() {
+                return None;
+            }
+        }
         Some(TxToken(&mut self.tx))
     }
 
