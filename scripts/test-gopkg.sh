@@ -12,7 +12,8 @@
 # from testapps/, packs the binary as /app with a copy of $GOROOT/src/<pkg>
 # at /src/<pkg> (testdata included: `go test` runs a test binary in its
 # package directory and many tests read "."), $GOROOT/src/testdata at
-# /src/testdata (net's sendfile tests read ../testdata), plus per-package
+# /src/testdata (net's sendfile tests read ../testdata), $GOROOT/src/go.mod
+# at /src/go.mod (internal/testenv then finds GOROOT = /), plus per-package
 # extras (see pkg_extras below: os gets a small /usr/bin, time gets
 # $GOROOT/lib/time/zoneinfo.zip at /lib/time/zoneinfo.zip, which
 # time/internal_test.go loads as ../../lib/time/zoneinfo.zip), and runs it
@@ -162,6 +163,10 @@ for arch in "${arches[@]}"; do
     mkdir -p "$extra/src/$(dirname "$pkg")"
     cp -R "$goroot/src/$pkg" "$extra/src/$(dirname "$pkg")/"
     [[ $pkg == testdata ]] || cp -R "$goroot/src/testdata" "$extra/src/"
+    # internal/testenv finds GOROOT (-trimpath binaries have none) by
+    # walking up from the cwd to a src/ directory holding the std go.mod:
+    # with it GOROOT is "/" (testenv.GOROOT, MustHaveSource).
+    cp "$goroot/src/go.mod" "$extra/src/"
     pkg_extras "$pkg" "$extra"
     chmod -R u+w "$extra"
 

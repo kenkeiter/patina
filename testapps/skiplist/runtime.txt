@@ -15,3 +15,4 @@ TestArenaCollision  # needs os/exec (no execve, D57): runs itself
 TestMemHashGlobalSeed  # needs os/exec (no execve, D57): compares two children's hash seeds
 TestTracebackSystem  # needs os/exec (no execve, D57): checks a child's crash report
 TestIssue66841  # GODEBUG re-exec: reruns itself with GODEBUG=cpu.aes=off
+TestPanicSystemstack  # needs os/exec (no execve, D57): checks a child's crash output (runs without -test.short only)
