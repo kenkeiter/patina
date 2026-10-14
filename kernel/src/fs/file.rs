@@ -343,6 +343,11 @@ pub trait File: Send + Sync {
     fn as_epoll(&self) -> Option<&super::epoll::Epoll> {
         None
     }
+
+    /// Downcast for the socket syscalls (`ENOTSOCK` when `None`).
+    fn as_socket(&self) -> Option<&dyn crate::net::socket::SocketOps> {
+        None
+    }
 }
 
 /// An open file description: the file and its status flags.

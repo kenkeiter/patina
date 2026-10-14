@@ -130,7 +130,7 @@ pub fn write(fd: i32, buf: usize, len: usize) -> SysResult {
 }
 
 /// Read an iovec array: (base, len) pairs.
-fn read_iov(iov: usize, cnt: usize) -> Result<Vec<(usize, usize)>, Errno> {
+pub(super) fn read_iov(iov: usize, cnt: usize) -> Result<Vec<(usize, usize)>, Errno> {
     if cnt > UIO_MAXIOV {
         return Err(Errno(EINVAL));
     }
