@@ -27,8 +27,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, Ipv6Addr};
 
-use smoltcp::iface::{Config, Interface, PollIngressSingleResult, PollResult, SocketSet};
-use smoltcp::time::Instant;
+use smoltcp::iface::{
+    Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
+};
+use smoltcp::socket::dhcpv4;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Cidr, Ipv6Cidr};
 
 use super::inet::Sock;
@@ -37,6 +40,7 @@ use crate::drivers::Event;
 use crate::fs::file::Notify;
 use crate::sync::{OnceCell, SpinLock};
 use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicBool, Ordering};
 use patina_inet::PortTable;
 
 /// Longest the net task sleeps between polls.
@@ -48,6 +52,33 @@ const MAX_INGRESS: usize = 1024;
 
 /// MAC used when there is no NIC: locally administered, unicast.
 const LO_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+
+/// How long boot waits for a DHCP lease before user mode starts anyway.
+const DHCP_WAIT_NS: u64 = 10_000_000_000;
+/// DHCP options requested: subnet mask, router, DNS, host name, domain.
+static DHCP_PARAMS: [u8; 5] = [1, 3, 6, 12, 15];
+
+/// The effective IPv4 configuration: the static `ip=` values, replaced by
+/// a DHCP lease when there is one. `/etc/resolv.conf` and `/etc/hosts` are
+/// generated from it (`fs::rootfs`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetConfig {
+    /// Interface address and prefix length (not loopback / link-local).
+    pub addr: Option<(Ipv4Addr, u8)>,
+    pub gateway: Option<Ipv4Addr>,
+    pub dns: Vec<Ipv4Addr>,
+    /// Host name from the DHCP server (option 12), if any.
+    pub hostname: Option<String>,
+    /// Domain name from the DHCP server (option 15), if any.
+    pub domain: Option<String>,
+    /// True when `addr` comes from a DHCP lease.
+    pub leased: bool,
+}
+
+/// The current effective configuration (default without a stack).
+pub fn effective_config() -> NetConfig {
+    get().map_or_else(NetConfig::default, |l| l.lock().cfg.clone())
+}
 
 pub struct Stack {
     pub iface: Interface,
@@ -66,7 +97,18 @@ pub struct Stack {
     pub gw4: Option<Ipv4Addr>,
     /// When the net task will next poll on its own (ns).
     pub task_deadline: u64,
+    /// The DHCPv4 client socket (`ip=dhcp`), kept for renewals.
+    pub dhcp: Option<SocketHandle>,
+    /// When the DHCP client started (ns), for the lease log line.
+    pub dhcp_t0: u64,
+    /// Effective configuration (see [`NetConfig`]).
+    pub cfg: NetConfig,
+    /// DNS servers from `ip=` (used when a lease names none).
+    pub static_dns: Vec<Ipv4Addr>,
 }
+
+/// `ip=` asked for DHCP (whether or not there is a NIC to run it on).
+static DHCP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 static STACK: OnceCell<SpinLock<Stack>> = OnceCell::new();
 static LOCAL_EVENT: Event = Event::new();
@@ -131,7 +173,99 @@ impl Stack {
                 break;
             }
         }
+        self.dhcp_events();
         self.track(crate::arch::timer::now_ns());
+    }
+
+    /// Apply a DHCP client event (lease acquired, renewed with changes, or
+    /// lost). Runs after every poll, so whoever polls applies it.
+    fn dhcp_events(&mut self) {
+        let Some(h) = self.dhcp else {
+            return;
+        };
+        let lease = match self.sockets.get_mut::<dhcpv4::Socket>(h).poll() {
+            None => return,
+            Some(dhcpv4::Event::Deconfigured) => None,
+            Some(dhcpv4::Event::Configured(c)) => {
+                let (hostname, domain) = c.packet.as_ref().map_or((None, None), dhcp_names);
+                Some(NetConfig {
+                    addr: Some((c.address.address(), c.address.prefix_len())),
+                    gateway: c.router,
+                    dns: c.dns_servers.iter().copied().collect(),
+                    hostname,
+                    domain,
+                    leased: true,
+                })
+            }
+        };
+        match lease {
+            Some(mut new) => {
+                if new.dns.is_empty() {
+                    new.dns = self.static_dns.clone();
+                }
+                if new == self.cfg {
+                    return; // a renewal with nothing new
+                }
+                let first = !self.cfg.leased;
+                self.set_v4(new.addr, new.gateway);
+                let ms = crate::arch::timer::now_ns().saturating_sub(self.dhcp_t0) / 1_000_000;
+                let mut dns = String::new();
+                for d in &new.dns {
+                    if !dns.is_empty() {
+                        dns.push(' ');
+                    }
+                    dns.push_str(&format!("{}", d));
+                }
+                let (a, p) = new.addr.unwrap_or((Ipv4Addr::UNSPECIFIED, 0));
+                crate::kprintln!(
+                    "[patina] net: dhcp {} {}/{} via {}, dns {}{}{} ({} ms)",
+                    if first { "lease" } else { "lease changed:" },
+                    a,
+                    p,
+                    new.gateway
+                        .map_or(String::from("none"), |g| format!("{}", g)),
+                    if dns.is_empty() { "none" } else { &dns },
+                    new.hostname
+                        .as_ref()
+                        .map_or(String::new(), |h| format!(", host {}", h)),
+                    new.domain
+                        .as_ref()
+                        .map_or(String::new(), |d| format!(", domain {}", d)),
+                    ms
+                );
+                self.cfg = new;
+            }
+            None => {
+                // Also the client's first event, before any lease.
+                if self.cfg.leased {
+                    crate::kprintln!("[patina] net: dhcp lease lost, no IPv4 address");
+                    self.set_v4(None, None);
+                    self.cfg = NetConfig {
+                        dns: self.static_dns.clone(),
+                        ..NetConfig::default()
+                    };
+                }
+            }
+        }
+    }
+
+    /// Replace the interface's (non-loopback) IPv4 address and default
+    /// route.
+    fn set_v4(&mut self, addr: Option<(Ipv4Addr, u8)>, gw: Option<Ipv4Addr>) {
+        self.iface.update_ip_addrs(|a| {
+            a.retain(|c| !matches!(c, IpCidr::Ipv4(c) if !c.address().is_loopback()));
+            if let Some((ip, p)) = addr {
+                let _ = a.push(IpCidr::Ipv4(Ipv4Cidr::new(ip, p)));
+            }
+        });
+        self.sync_own_addrs();
+        self.iface.routes_mut().remove_default_ipv4_route();
+        self.gw4 = None;
+        if let Some(g) = gw
+            && self.iface.routes_mut().add_default_ipv4_route(g).is_ok()
+        {
+            self.gw4 = Some(g);
+        }
     }
 
     /// When the interface wants to be polled next (ns, capped).
@@ -216,6 +350,27 @@ impl Stack {
     }
 }
 
+/// Host name (option 12) and domain name (option 15) of a DHCP packet.
+fn dhcp_names(p: &smoltcp::wire::DhcpPacket<&[u8]>) -> (Option<String>, Option<String>) {
+    let text = |d: &[u8]| {
+        core::str::from_utf8(d)
+            .ok()
+            .map(|t| t.trim_end_matches('\0'))
+            .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_graphic()))
+            .map(String::from)
+    };
+    let mut host = None;
+    let mut dom = None;
+    for o in p.options() {
+        match o.kind {
+            12 => host = text(o.data),
+            15 => dom = text(o.data),
+            _ => {}
+        }
+    }
+    (host, dom)
+}
+
 fn mac_str(m: &[u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -265,6 +420,10 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
         zombies: Vec::new(),
         gw4: None,
         task_deadline: 0,
+        dhcp: None,
+        dhcp_t0: 0,
+        cfg: NetConfig::default(),
+        static_dns: Vec::new(),
     };
     s.add_addr(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 8)));
     s.add_addr(IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Addr::LOCALHOST, 128)));
@@ -274,15 +433,19 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
 
     let mut dhcp = false;
     if let Some(ip) = &cmdline.ip {
+        s.static_dns = ip.dns.iter().flatten().copied().collect();
+        s.cfg.dns = s.static_dns.clone();
         if ip.is_static() {
             if let Some(client) = ip.client {
                 let prefix = ip.prefix_len().unwrap_or(24);
                 s.add_addr(IpCidr::Ipv4(Ipv4Cidr::new(client, prefix)));
+                s.cfg.addr = Some((client, prefix));
             }
             if let Some(gw) = ip.gateway
                 && s.iface.routes_mut().add_default_ipv4_route(gw).is_ok()
             {
                 s.gw4 = Some(gw);
+                s.cfg.gateway = Some(gw);
             }
         } else if ip.autoconf.wants_dhcp()
             || (ip.client.is_none() && ip.autoconf == patina_cmdline::Autoconf::Unspecified)
@@ -321,24 +484,71 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     if let Some(ev) = ev {
         let _ = EVENT.set(ev);
     }
+    if dhcp && has_nic {
+        let mut sock = dhcpv4::Socket::new();
+        let mut rc = dhcpv4::RetryConfig::default();
+        // Retransmit quickly while booting (smoltcp waits 10 s / 5 s).
+        rc.discover_timeout = Duration::from_secs(1);
+        rc.initial_request_timeout = Duration::from_secs(1);
+        sock.set_retry_config(rc);
+        sock.set_parameter_request_list(&DHCP_PARAMS);
+        // The last received packet, for the host/domain name options.
+        sock.set_receive_packet_buffer(alloc::vec![0u8; 1500].leak());
+        s.dhcp = Some(s.sockets.add(sock));
+        s.dhcp_t0 = crate::arch::timer::now_ns();
+    }
+    DHCP_REQUESTED.store(dhcp, Ordering::Relaxed);
     if STACK.set(SpinLock::new(s)).is_err() {
         return;
-    }
-    if dhcp && has_nic {
-        start_dhcp();
     }
     crate::drivers::spawn(task);
 }
 
-/// `ip=dhcp` (or `ip=` without a client address): the DHCPv4 client hook.
-///
-/// TODO(Phase 4, eth0 wiring): add a `smoltcp::socket::dhcpv4::Socket` to
-/// the set here, and in [`Stack::track`]'s caller (the task loop) apply
-/// `Event::Configured` (address, router → `routes_mut()`, DNS → rewrite
-/// `/etc/resolv.conf`) and `Event::Deconfigured`. smoltcp's
-/// `socket-dhcpv4` feature is already enabled.
-fn start_dhcp() {
-    crate::kprintln!("[patina] net: ip=dhcp: DHCP client not implemented yet; no IPv4 address");
+/// `ip=dhcp` (or `ip=` without a client address): wait, at boot and before
+/// user mode, until the DHCP client has a lease or [`DHCP_WAIT_NS`] passed.
+/// Called from `kernel_main` after `ctl::init`, so a timeout is also
+/// reported as a control-channel log event. Interrupts are not needed: the
+/// NIC's `recv` polls its used ring. The client socket stays in the set;
+/// whoever polls afterwards (the net task, socket syscalls) applies
+/// renewals and losses ([`Stack::poll_all`]).
+pub fn wait_dhcp() {
+    if !DHCP_REQUESTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(lock) = get() else {
+        return;
+    };
+    if lock.lock().dhcp.is_none() {
+        crate::kprintln!("[patina] net: ip=dhcp: no network device, continuing without an address");
+        crate::ctl::log_warn(format_args!(
+            "net: ip=dhcp: no network device, continuing without an address"
+        ));
+        return;
+    }
+    let t0 = crate::arch::timer::now_ns();
+    loop {
+        let (leased, next) = {
+            let mut s = lock.lock();
+            s.poll_all();
+            (s.cfg.leased, s.next_deadline())
+        };
+        if leased {
+            return;
+        }
+        let now = crate::arch::timer::now_ns();
+        if now.saturating_sub(t0) >= DHCP_WAIT_NS {
+            break;
+        }
+        // Poll at least every millisecond (replies are found by polling).
+        let until = next.min(now + 1_000_000).min(t0 + DHCP_WAIT_NS);
+        while crate::arch::timer::now_ns() < until {
+            core::hint::spin_loop();
+        }
+    }
+    crate::kprintln!("[patina] net: dhcp: no lease after 10 s, continuing without an address");
+    crate::ctl::log_warn(format_args!(
+        "net: dhcp: no lease after 10 s, continuing without an address"
+    ));
 }
 
 /// The net task: poll, notify, sleep until the next deadline or an event.

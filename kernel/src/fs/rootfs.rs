@@ -7,7 +7,6 @@
 
 use alloc::format;
 use alloc::string::String;
-use alloc::vec::Vec;
 
 use patina_cmdline::Cmdline;
 use patina_cpio::Reader;
@@ -18,7 +17,8 @@ use crate::sync::OnceCell;
 
 static HOSTNAME: OnceCell<String> = OnceCell::new();
 
-/// The host name (`ip=` host name field, else `patina`).
+/// The host name (`ip=` host name field, else the DHCP server's, else
+/// `patina`).
 pub fn hostname() -> &'static str {
     HOSTNAME.get().map_or("patina", |s| s.as_str())
 }
@@ -36,6 +36,7 @@ pub fn init(
         .as_ref()
         .and_then(|ip| ip.hostname.clone())
         .filter(|h| !h.is_empty())
+        .or_else(|| crate::net::effective_config().hostname)
         .unwrap_or_else(|| String::from("patina"));
     let _ = HOSTNAME.set(host);
     vfs::with(|fs| {
@@ -58,7 +59,7 @@ pub fn init(
         }
         devfs::populate(fs);
         procfs::populate(fs);
-        etc(fs, c);
+        etc(fs);
         initial_cwd(fs, c);
         Ok(rep)
     })
@@ -105,21 +106,37 @@ fn put(fs: &mut Fs, path: &[u8], data: &[u8], mode: u32) {
     }
 }
 
-fn etc(fs: &mut Fs, c: &Cmdline) {
-    let ip = c.ip.as_ref();
+/// Generated `/etc` files (D54, D72). `/etc/resolv.conf` and `/etc/hosts`
+/// come from the stack's effective configuration (`net::effective_config`:
+/// a DHCP lease, else `ip=`), which is final by now (`net::wait_dhcp` ran
+/// before the loader). DNS falls back to 10.0.2.3 (QEMU slirp's resolver).
+/// Later lease changes do not rewrite them.
+fn etc(fs: &mut Fs) {
+    let cfg = crate::net::effective_config();
     let mut resolv = String::new();
-    let dns: Vec<_> = ip.map_or(Vec::new(), |i| i.dns.iter().flatten().collect());
-    if dns.is_empty() {
+    if let Some(d) = &cfg.domain {
+        resolv.push_str(&format!("search {}\n", d));
+    }
+    if cfg.dns.is_empty() {
         resolv.push_str("nameserver 10.0.2.3\n");
     }
-    for d in dns {
+    for d in &cfg.dns {
         resolv.push_str(&format!("nameserver {}\n", d));
     }
     put(fs, b"/etc/resolv.conf", resolv.as_bytes(), 0o644);
 
-    let mut hosts = String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
-    if let Some(addr) = ip.and_then(|i| i.client) {
-        hosts.push_str(&format!("{}\t{}\n", addr, hostname()));
+    // Without an address the host name resolves to 127.0.0.1 (the only
+    // 127/8 address the stack has, D68).
+    let mut hosts = match cfg.addr {
+        Some(_) => String::from("127.0.0.1\tlocalhost\n"),
+        None => format!("127.0.0.1\tlocalhost {}\n", hostname()),
+    };
+    hosts.push_str("::1\tlocalhost ip6-localhost ip6-loopback\n");
+    if let Some((addr, _)) = cfg.addr {
+        match &cfg.domain {
+            Some(d) => hosts.push_str(&format!("{}\t{}.{} {}\n", addr, hostname(), d, hostname())),
+            None => hosts.push_str(&format!("{}\t{}\n", addr, hostname())),
+        }
     }
     put(fs, b"/etc/hosts", hosts.as_bytes(), 0o644);
     put(fs, b"/etc/hostname", format!("{}\n", hostname()).as_bytes(), 0o644);

@@ -18,3 +18,11 @@ pub mod stack;
 pub fn init(cmdline: &patina_cmdline::Cmdline) {
     stack::init(cmdline);
 }
+
+pub use stack::effective_config;
+
+/// `ip=dhcp`: wait (bounded) for a lease before user mode. After
+/// `ctl::init`, so a timeout also reaches the control channel.
+pub fn wait_dhcp() {
+    stack::wait_dhcp();
+}
