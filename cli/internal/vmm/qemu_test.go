@@ -81,10 +81,8 @@ func TestDriversRegistered(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if n == target.VZ {
-			if _, err := d.Start(nil, &Config{}); err == nil || !strings.Contains(err.Error(), "not implemented") {
-				t.Errorf("%s: %v", n, err)
-			}
+		if _, ok := d.(unimplemented); ok {
+			t.Errorf("%s: still a placeholder driver", n)
 		}
 	}
 	if _, err := Get("xen"); err == nil {
