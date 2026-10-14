@@ -23,6 +23,14 @@
 #   panic           patina.selftest=panic (no initrd): {"ev":"panic","msg":"selftest"},
 #                   then the dump and exit 255 on serial
 #
+# PATINA_VMM=vz (aarch64 only) runs the same cases under `patina run --vmm vz`
+# through run-qemu.sh -> run-vz.sh: PATINA_CTL_SOCK becomes a symlink to the
+# run's control proxy socket. Differences: the console is always hvc0 and
+# the channel is virtio-vsock ("[patina] ctl: virtio-vsock port 4242"
+# instead of the virtio-console port line); panic cannot hold the VM until
+# the client connects (no PATINA_CTL_WAIT on VZ), so it checks the exit
+# status (255, from `patina run`'s own panic event) and the console only.
+#
 # Requests are sent only after the program printed its "signals: ready" line
 # on serial (ctlclient.py log:), so its handlers are installed even under TCG.
 # Every QEMU run has PATINA_TIMEOUT (default 60 s). Artifacts in out/test/ctl/.
@@ -36,6 +44,8 @@ mkdir -p "$out"
 export PATINA_TIMEOUT=${PATINA_TIMEOUT:-60}
 PY=$(command -v python3) || { echo "error: python3 not found" >&2; exit 2; }
 client=$root/scripts/ctlclient.py
+vz=0
+[[ ${PATINA_VMM:-qemu} == vz ]] && vz=1
 
 # run_case <name> <arch> <cpio> <want rc> <client actions...> -- <program args...>
 # Env for run-qemu.sh can be set by the caller. Leaves $log, $clog, $rc, $crc.
@@ -148,13 +158,23 @@ for arch in "${arches[@]}"; do
   PATINA_CONSOLE=hvc0 run_case hvc0 "$arch" "$cpio" \
     'wait@30:"ev":"ready"' 'log:signals: ready' 'send:{"op":"ping","id":1}' 'wait:"ev":"pong","id":1' \
     'send:{"op":"stop","grace_ms":5000}' 'wait:"ev":"exit"'
+  ctl_re='^\[patina\] ctl: virtio-console port 1 "patina.ctl"'
+  [[ $vz == 1 ]] && ctl_re='^\[patina\] ctl: virtio-vsock port 4242$'
   check "$arch hvc0" 0 '"ev":"exit","code":0' \
-    -- '^\[patina\] console: hvc0 \(virtio-console port 0\)' '^\[patina\] ctl: virtio-console port 1 "patina.ctl"' \
+    -- '^\[patina\] console: hvc0 \(virtio-console port 0\)' "$ctl_re" \
     '^PASS signals \(handler\)' '^\[patina\] exit code 0$'
 
-  PATINA_CTL_WAIT=1 run_case panic "$arch" "" 'wait@30:"ev":"panic"' -- patina.selftest=panic
-  check "$arch panic" 255 '^<< \{"ev":"panic","msg":"selftest"\}' \
-    -- '^\[patina\] panic: selftest at ' '^\[patina\] exit code 255$'
+  if [[ $vz == 1 ]]; then
+    # No client: the panic may precede any connection.
+    log=$out/panic-$arch.log clog=/dev/null crc=0 rc=0
+    PATINA_LOG=$log.raw "$root/scripts/run-qemu.sh" "$arch" -- patina.selftest=panic >/dev/null 2>"$log.err" || rc=$?
+    tr -d '\r' <"$log.raw" >"$log"
+    check "$arch panic" 255 -- '^\[patina\] panic: selftest at ' '^\[patina\] exit code 255$'
+  else
+    PATINA_CTL_WAIT=1 run_case panic "$arch" "" 'wait@30:"ev":"panic"' -- patina.selftest=panic
+    check "$arch panic" 255 '^<< \{"ev":"panic","msg":"selftest"\}' \
+      -- '^\[patina\] panic: selftest at ' '^\[patina\] exit code 255$'
+  fi
 done
 
 printf '%s\n' "${results[@]}"
