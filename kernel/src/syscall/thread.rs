@@ -2,7 +2,7 @@
 
 use core::sync::atomic::Ordering;
 
-use patina_abi::errno::{EINVAL, ENOSYS, EPERM, Errno};
+use patina_abi::errno::{EFAULT, EINVAL, ENOSYS, EPERM, Errno};
 use patina_abi::sched::{
     CLONE_THREAD_OPTIONAL, CloneFlags, FUTEX_BITSET_MATCH_ANY, FUTEX_CLOCK_REALTIME,
     FUTEX_CMD_MASK, FUTEX_LOCK_PI, FUTEX_LOCK_PI2, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAIT_REQUEUE_PI,
@@ -157,6 +157,10 @@ pub fn futex(uaddr: usize, op: i32, val: u32, timeout: usize, val3: u32) -> SysR
             };
             if bits == 0 || !uaddr.is_multiple_of(4) {
                 return Err(Errno(EINVAL));
+            }
+            // get_futex_key: access_ok, even with nobody waiting.
+            if !crate::mm::vm::access_ok(uaddr, 4) {
+                return Err(Errno(EFAULT));
             }
             // Linux wakes at least one waiter even for val <= 0.
             let n = (val as i32).max(1) as usize;

@@ -1251,7 +1251,8 @@ priority 0, and `sched_get_priority_max`/`min` → 0. `getpriority` gives
 `personality` gives 0. `sysinfo` fills in uptime, `totalram`/`freeram`
 from the frame allocator, `procs` = live threads and `mem_unit` 1.
 `getcpu` gives the current CPU, node 0. `mlock*`/`munlock*`/`msync` give
-0. The `xattr` family gives `EOPNOTSUPP`. `inotify_*`, `memfd_create`,
+0 (their flags, alignment and range are checked as Linux does: bad flags
+EINVAL, a hole ENOMEM). The `xattr` family gives `EOPNOTSUPP`. `inotify_*`, `memfd_create`,
 `pidfd_open`, `kcmp`, `seccomp`, `*_mempolicy` and `ioprio_*` remain
 `ENOSYS` (logged once). Go handles all of these.
 ## D58: virtio is in-tree behind a `Transport` trait; no `virtio-drivers`

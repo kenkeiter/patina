@@ -86,6 +86,13 @@ pub const MS_ASYNC: i32 = 1;
 pub const MS_INVALIDATE: i32 = 2;
 pub const MS_SYNC: i32 = 4;
 
+/// `mlock2` flags.
+pub const MLOCK_ONFAULT: u32 = 1;
+/// `mlockall` flags.
+pub const MCL_CURRENT: i32 = 1;
+pub const MCL_FUTURE: i32 = 2;
+pub const MCL_ONFAULT: i32 = 4;
+
 /// Round up to a page boundary (saturating at the top of the address space
 /// is the caller's problem: returns `None` on overflow).
 pub const fn page_align_up(x: u64) -> Option<u64> {

@@ -8,7 +8,7 @@ use core::sync::atomic::Ordering;
 use patina_abi::current::nr;
 
 use patina_abi::epoll::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
-use patina_abi::errno::{EINVAL, ESRCH, Errno};
+use patina_abi::errno::{EINVAL, EPERM, ESRCH, Errno};
 use patina_abi::misc::{
     RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_STACK, Rlimit, Utsname,
 };
@@ -103,10 +103,14 @@ pub fn prlimit64(pid: i32, res: u32, new: usize, old: usize) -> SysResult {
     if res >= RLIM_NLIMITS {
         return Err(Errno(EINVAL));
     }
-    if let Some(v) = &newv
-        && v.rlim_cur > v.rlim_max
-    {
-        return Err(Errno(EINVAL));
+    if let Some(v) = &newv {
+        if v.rlim_cur > v.rlim_max {
+            return Err(Errno(EINVAL));
+        }
+        // do_prlimit: the fd table cannot grow past fs.nr_open.
+        if res == RLIMIT_NOFILE && v.rlim_max > NR_OPEN {
+            return Err(Errno(EPERM));
+        }
     }
     let prev = {
         let mut l = RLIMITS.lock();
@@ -122,9 +126,13 @@ pub fn prlimit64(pid: i32, res: u32, new: usize, old: usize) -> SysResult {
     Ok(0)
 }
 
+/// Linux `sysctl_nr_open` (default 1024 * 1024): the largest
+/// `RLIMIT_NOFILE`.
+const NR_OPEN: u64 = 1 << 20;
+
 /// `RLIMIT_NOFILE`'s soft limit: fds must be below it (`EMFILE`).
 pub fn nofile_limit() -> usize {
-    RLIMITS.lock()[RLIMIT_NOFILE as usize].rlim_cur.min(1 << 20) as usize
+    RLIMITS.lock()[RLIMIT_NOFILE as usize].rlim_cur.min(NR_OPEN) as usize
 }
 
 /// `getrandom`: see `random.rs` (not cryptographic before Phase 3).

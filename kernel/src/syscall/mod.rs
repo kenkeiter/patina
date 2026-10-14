@@ -483,7 +483,11 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::PERSONALITY => Ok(0),
         nr::SYSINFO => proc::sysinfo(u(0)),
         nr::GETCPU => proc::getcpu(u(0), u(1)),
-        nr::MLOCK | nr::MUNLOCK | nr::MLOCKALL | nr::MUNLOCKALL | nr::MSYNC | nr::MLOCK2 => Ok(0),
+        nr::MLOCK | nr::MUNLOCK => mm::mlock(u(0), u(1)),
+        nr::MLOCK2 => mm::mlock2(u(0), u(1), a[2] as u32),
+        nr::MLOCKALL => mm::mlockall(i(0)),
+        nr::MUNLOCKALL => Ok(0),
+        nr::MSYNC => mm::msync(u(0), u(1), i(2)),
         nr::WAIT4 | nr::WAITID => Err(Errno(ECHILD)),
         // Logged once (enosys): a program that needs these cannot work.
         nr::EXECVE | nr::EXECVEAT => enosys(n),

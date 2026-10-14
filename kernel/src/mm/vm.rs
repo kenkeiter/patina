@@ -142,7 +142,15 @@ fn pte_flags(prot: ProtFlags) -> PteFlags {
     f
 }
 
-/// Validate a user `prot` argument; returns the R/W/X part.
+/// The R/W/X part of an `mmap` `prot`. Linux `do_mmap` does not validate
+/// `prot`: bits other than R/W/X (`PROT_SEM`, `PROT_GROWSDOWN`/`GROWSUP`,
+/// arm64 `PROT_BTI`/`PROT_MTE` without MTE, unknown ones) are ignored.
+fn mmap_prot(prot: u32) -> ProtFlags {
+    ProtFlags::from_bits_truncate(prot) & (ProtFlags::READ | ProtFlags::WRITE | ProtFlags::EXEC)
+}
+
+/// Validate a user `prot` argument (`mprotect`: Linux
+/// `arch_validate_prot`); returns the R/W/X part.
 fn parse_prot(prot: u32) -> Result<ProtFlags> {
     #[cfg(target_arch = "aarch64")]
     let extra = patina_abi::aarch64::PROT_BTI;
@@ -269,7 +277,7 @@ impl AddressSpace {
     }
 
     /// Whether `[start, end)` is entirely covered by VMAs (no holes).
-    fn is_covered(&self, start: usize, end: usize) -> bool {
+    pub fn is_covered(&self, start: usize, end: usize) -> bool {
         let mut cur = start;
         while cur < end {
             match self.find(cur) {
@@ -531,7 +539,7 @@ impl AddressSpace {
         off: u64,
     ) -> Result<usize> {
         let mf = MmapFlags::from_bits_retain(flags);
-        let prot = parse_prot(prot)?;
+        let prot = mmap_prot(prot);
         if !mf.contains(MmapFlags::ANONYMOUS) {
             return Err(Errno(ENODEV));
         }
@@ -808,9 +816,23 @@ impl AddressSpace {
         new_len: usize,
         flags: u32,
     ) -> Result<usize> {
-        if !old.is_multiple_of(PAGE_SIZE)
-            || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+        // Linux mm/mremap.c (check_mremap_params): unknown flags, FIXED
+        // without MAYMOVE, DONTUNMAP without MAYMOVE or with a size
+        // change, an unaligned address, a zero (or wrapping) new length
+        // and a new length beyond the user address space are EINVAL.
+        if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+            || (flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0)
+            || (flags & MREMAP_DONTUNMAP != 0
+                && (flags & MREMAP_MAYMOVE == 0 || old_len != new_len))
+            || !old.is_multiple_of(PAGE_SIZE)
         {
+            return Err(Errno(EINVAL));
+        }
+        let new_len = new_len
+            .checked_add(PAGE_SIZE - 1)
+            .map(|l| l & !(PAGE_SIZE - 1))
+            .ok_or(Errno(EINVAL))?;
+        if new_len == 0 || new_len > USER_VA_END {
             return Err(Errno(EINVAL));
         }
         if flags & (MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 {
@@ -818,11 +840,7 @@ impl AddressSpace {
             return Err(Errno(EINVAL));
         }
         let old_len = page_len(old, old_len).ok_or(Errno(EINVAL))?;
-        let new_len = new_len
-            .checked_add(PAGE_SIZE - 1)
-            .map(|l| l & !(PAGE_SIZE - 1))
-            .ok_or(Errno(EINVAL))?;
-        if new_len == 0 || old_len == 0 {
+        if old_len == 0 {
             return Err(Errno(EINVAL));
         }
         let vma = *self.find(old).ok_or(Errno(EFAULT))?;
