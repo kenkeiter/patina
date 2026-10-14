@@ -2854,9 +2854,36 @@ through 192.168.64.1), `scripts/test-vz.sh`, `test-net.sh aarch64 x86_64`
 after macOS creates the NAT bridge (no other NAT VM running) the first
 connection can be delayed by seconds while the host ARPs unrelated
 addresses (the guest answers in < 1 ms); the e2e test treats the first
-request as informational. Also noted: every accepted TCP connection sends
-one 1-byte segment right after the handshake (smoltcp keep-alive
-handling, harmless, not fixed).
+request as informational. Also noted: every accepted TCP connection sent
+one 1-byte segment right after the handshake.
+
+*Amended 2026-10-14 (root cause, fixed):* the segment was a smoltcp
+keep-alive probe (ACK, seq SND.NXT-1, one 0x00 byte, ~0.1 ms after the
+ACK of the client's first data; the peer answers with a duplicate ACK).
+Go turns on `SO_KEEPALIVE` (idle 15 s) on every accepted and dialed
+connection right after `accept`/`connect`, and smoltcp 0.14's
+`tcp::Socket::set_keep_alive` arms an idle socket's keep-alive timer at
+`Instant` 0 ("would not take effect until the next packet, unless we wind
+up the timer explicitly"), so the next poll probed at once. Linux sends
+the first probe only after `TCP_KEEPIDLE` s without traffic. Fix
+(`net/inet.rs` `apply_live_tcp_opts`): enabling keep-alive on a socket
+past the handshake no longer reaches smoltcp immediately; the connection
+records the start of an idle period (restarted by each successful
+send/recv), and `Stack::track` (every poll, at least once a second) hands
+the interval to smoltcp once `TCP_KEEPIDLE` has elapsed; smoltcp then
+probes and rewinds its timer on every segment it sends or receives.
+Sockets that have not finished the handshake (a listener's pool, which
+inherits the listener's options, or a connect) still get keep-alive
+directly: smoltcp restarts the timer at the handshake. Probes go out
+every `TCP_KEEPIDLE` s (smoltcp has one interval); `TCP_KEEPINTVL` and
+`TCP_KEEPCNT` are stored and reported, not used (a dead peer is detected
+by `TCP_USER_TIMEOUT` only). Not the listen pool: pool sockets carry no
+leftover data. Captured under QEMU with `-object filter-dump` (httphello
++ curl): no 1-byte segment after the handshake; an idle keep-alive
+HTTP connection gets its first probe 15.08 s after the last segment and
+the next 15.0 s later, as on Linux with Go's 15 s / 15 s. **sockets**
+covers the options (defaults, `EINVAL`, stored, inherited by accept) and
+a probing idle connection staying up with no stray bytes.
 
 ## D86: User buffers are checked before data is consumed
 *2026-10-14 · Phase 5*
