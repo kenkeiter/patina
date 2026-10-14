@@ -566,3 +566,311 @@ remains ends the process with that code; `exit_group` ends the process at
 once (Phase 2 must stop the other CPUs first). `tgkill` validates the tid
 against the thread table and still only logs (delivery is Phase 2), so Go's
 `SIGURG` async preemption is a no-op in Phase 1.
+
+## D42: Signal delivery model
+*2026-10-14 · Phase 2*
+
+`kernel/src/task/signal.rs` (replaces the store-only signal state of
+D37/D41). Handlers are `Process::sigactions`. The process-wide pending set
+is the statics `SHARED` (a `PendingQueue` in a `SpinLock`) and its bit
+mirror `SHARED_BITS`, not a `Process` field, because there is one process
+per VM. Each thread has `sigq` plus the bit mirror `sig_pending`, and
+`Thread::blocked` (an `AtomicU64` written only by the thread itself)
+replaces the Phase 1 `SigState.mask`. The mirrors are written under the
+queue lock and read without it, so `deliver` (called from
+`trap::before_return_to_user` after the reschedule, IRQs masked) returns
+after a handful of relaxed atomic loads when nothing is pending: that is the
+SIGURG async-preemption path. Standard signals coalesce; RT signals queue
+one `SigInfo` each, up to `MAX_QUEUED = 1024` per queue. A signal whose
+disposition ignores it (`SIG_IGN`, or `SIG_DFL` with default action
+ignore/continue: CHLD, URG, WINCH, CONT) is dropped at send time unless the
+target blocks it; for process signals, unless every user thread blocks it
+(Linux `sig_ignored`). Dequeue order: thread-private synchronous signals
+(SEGV/BUS/ILL/TRAP/FPE/SYS) first, then the lowest private one, then the
+lowest shared one. At most one handler frame is built per return to user
+mode. SIGKILL always terminates (137). `SIG_DFL` STOP/TSTP/TTIN/TTOU are
+treated as ignored: there is no job control in a one-process VM. Unlike
+Linux, pid 1 is not `SIGNAL_UNKILLABLE`: design §6 asks for `SIG_DFL`
+termination, so a terminating signal prints `[patina] exit signal NAME`
+before the `[patina] exit code 128+signo` sentinel (`crate::exit_signal`).
+That name is also what the future control-channel `exit` event's `signal`
+field will carry. `kill` queues on the process with `SI_USER` (`si_pid` =
+the pid, 1); `tgkill`/`tkill` queue on the thread with `SI_TKILL`. A write
+that fails with `EPIPE` sends SIGPIPE to the writing thread
+(`syscall/fs.rs`, as Linux `send_sig`). `rt_sigtimedwait`, `rt_sigqueueinfo`
+and `rt_tgsigqueueinfo` are `ENOSYS` (Go does not use them). The API is
+`send_to_thread`, `send_to_tid`, `send_to_process` and
+`force_fault`/`force_sig`. `send_to_process` kicks a running thread that
+does not block the signal first, then one in an interruptible wait, then any
+(Linux `complete_signal`). Lock rules: `sigactions` and `sigq`/`SHARED` are
+leaf locks, taken one at a time. The `THREADS` lock is held only to clone
+the thread list (`task::threads()`), never while kicking. Delivery runs with
+IRQs masked and takes the address-space lock to write the frame.
+
+## D43: Fault → signal mapping
+*2026-10-14 · Phase 2*
+
+User faults and exceptions become forced signals on the faulting thread
+(`trap::user_fault` / `trap::user_exception` → `signal::force_fault`, as
+Linux `force_sig_fault`). If the thread blocks the signal or the process
+ignores it, the disposition is reset to `SIG_DFL` and the signal is
+unblocked, so it terminates. A `SIG_DFL` fault, or any `SI_KERNEL` signal,
+keeps the Phase 1 diagnostics: `[patina] fatal: SIGSEGV (si_code …, addr …)
+at pc …`, the register dump and the VMA table, then `exit signal` and exit
+128+signo. A page fault the address space cannot resolve is SIGSEGV
+`SEGV_MAPERR` when no VMA covers the address and `SEGV_ACCERR` when one
+does. x86_64: `#UD` → SIGILL `ILL_ILLOPN` (si_addr = rip); `int3` → SIGTRAP
+`SI_KERNEL` with rip after the `int3`; `#DE` → SIGFPE `FPE_INTDIV` at rip;
+`#GP` → SIGSEGV `SI_KERNEL`; `#SS` → SIGBUS `SI_KERNEL`; `#DB` → SIGTRAP
+`TRAP_TRACE`; `#AC` → SIGBUS `BUS_ADRALN` (no address); any other user
+vector → SIGILL. aarch64: undefined instruction (EC 0x00/0x0e, and an `MRS`
+that is not emulated, D31) → SIGILL `ILL_ILLOPC` at pc; `BRK` → SIGTRAP
+`TRAP_BRKPT` with pc at the `BRK`; data, PC and SP alignment faults → SIGBUS
+`BUS_ADRALN`; any other EC → SIGILL. FP exception traps (x86 `#MF`/`#XM`,
+arm64 EC 0x2c) are SIGFPE `FPE_FLTINV` on both arches: Linux decodes FPSR or
+the x87/MXCSR status to pick the exact code, and patina does not (Go never
+unmasks FP exceptions). The frame gets the hardware details through
+`arch::sigframe::fault_info` / `exception_info` (x86 `cr2`/`err`/`trapno`;
+arm64 `fault_address` and `esr_context`). One consequence: Go's
+`runtime.Breakpoint` ends as Go's own throw (`SIGTRAP: trace trap`, exit 2),
+not exit 133, because Go has a handler installed and SIGTRAP is `_SigThrow`
+in Go's sigtable.
+
+## D44: Signal frames and `sigaltstack`
+*2026-10-14 · Phase 2*
+
+x86_64 (`arch/x86_64/sigframe.rs`) builds `rt_sigframe` as Linux
+`arch/x86/kernel/signal_64.c` does. Below the 128-byte red zone (or at the
+top of the alternate stack) comes the fpstate, 64-byte aligned, then
+`{pretcode, ucontext, siginfo}` with `rsp ≡ 8 (mod 16)`, all written with
+one `copy_to_user`. `uc_flags = UC_FP_XSTATE | UC_SIGCONTEXT_SS |
+UC_STRICT_RESTORE_SS`. The fpstate is the live XSAVE image with
+`fpx_sw_bytes` (`xfeatures` = XCR0 = x87|SSE|AVX, `xstate_size` from CPUID
+0xD.0:EBX), `XSTATE_BV |= FP|SSE`, and `FP_XSTATE_MAGIC2` after the state. A
+CPU without XSAVE gets a plain 512-byte FXSAVE image and no `UC_FP_XSTATE`;
+this is untested because QEMU `-cpu max` has XSAVE. The handler starts with
+the FPU in its init state. `rt_sigreturn` falls back to an FXSAVE-only
+restore when the software bytes or magic2 are bad. It treats an MXCSR with
+reserved bits set as a bad frame, takes only the `FIX_EFLAGS` bits of
+RFLAGS, forces user CS/SS and sets `orig_rax = -1`; a non-canonical rip is
+also a bad frame. Every bad frame forces SIGSEGV. A handler without
+`SA_RESTORER` cannot be delivered on x86_64: frame setup fails and SIGSEGV
+is forced, with a log line. Go always sets `SA_RESTORER` on amd64. aarch64
+(`arch/aarch64/sigframe.rs`): `{siginfo, ucontext}` is 16-aligned with an
+AAPCS64 frame record above it. `__reserved` always holds `fpsimd_context`
+(taken from the trap frame, D28), plus `esr_context` for forced fault and
+exception signals (`fault_address` = FAR for aborts, 0 otherwise), then the
+terminator. `rt_sigreturn` requires a 16-aligned sp, PSTATE = EL0t (AArch64)
+with DAIF clear, and well-formed records. **Deviation:** Go does not set
+`SA_RESTORER` on arm64; it relies on the vDSO's `__kernel_rt_sigreturn`.
+patina has no vDSO, so on the first such delivery the kernel maps one R-X
+page at `SIGTRAMP_HINT = 0x7fff_f000_0000` (just above the main stack, D36;
+elsewhere if that address is taken) holding `mov x8, #139; svc #0`. It
+cleans and invalidates the caches for that page and puts the page's address
+in x30. `sigaltstack` follows Linux `do_sigaltstack`. The raw flags are
+stored (`SS_AUTODISARM` kept); it returns `EPERM` while running on the stack
+and `ENOMEM` below `MINSIGSTKSZ`; `oss` flags are computed from the current
+sp. `SS_AUTODISARM` is honoured: the stack is disabled once a frame is
+placed on it. `rt_sigreturn` restores `uc_stack` and ignores errors. The
+arch contract `arch::sigframe::{setup_frame, restore_frame, rewind_syscall,
+fault_info, exception_info}` is documented in `kernel/src/arch/mod.rs`.
+
+## D45: Syscall interruption and restart
+*2026-10-14 · Phase 2*
+
+This adds the third `WakeReason`, `Interrupted` (D38). The thread's sched
+word packs a 2-bit wake reason and an "interruptible" bit next to the state
+and block sequence. Both that word and the pending bits are accessed SeqCst,
+so either the sender sees the blocker as interruptible (and `sched::kick`
+wakes it), or the blocker sees the pending bit before it sleeps.
+`wait::block_interruptible` and `sleep_until_interruptible` take the same
+arguments as `block` and `sleep_until`, which stay non-interruptible.
+Blocking syscalls return Linux's internal codes. `ERESTARTSYS` (512)
+restarts only if the handler has `SA_RESTART`; pipe and console read/write
+return it (a partial transfer still returns the byte count), as does futex
+wait without a timeout. `ERESTARTNOHAND` (514) is `EINTR` if a handler runs
+and is re-executed otherwise; `ppoll`/`poll`, `rt_sigsuspend`, `pause` and
+absolute `clock_nanosleep` return it. `ERESTART_RESTARTBLOCK` (516) plus
+`Thread::restart_block` is continued through `restart_syscall`; `nanosleep`,
+relative `clock_nanosleep` and futex wait with a timeout return it.
+`ERESTARTNOINTR` (513) is handled, but nothing returns it yet. `epoll_pwait`
+returns plain `EINTR` and is never restarted, as on Linux.
+
+`syscall::dispatch` records the code in `Thread::restart`, and `deliver`
+resolves it exactly like Linux's arm64 `do_signal`. With a handler it
+returns EINTR or rewinds; without one, every code rewinds.
+`sigframe::rewind_syscall` moves pc back over `svc`/`syscall`, restores
+`orig_x0`/`orig_rax`, and for 516 sets x8/rax to `restart_syscall`.
+`nanosleep` writes `rem`. `ppoll` and `poll` restart with the original
+relative timeout (Linux keeps the deadline in a restart block), and `ppoll`
+never writes the remaining time back. A sigmask passed to `epoll_pwait` or
+`ppoll` (and `rt_sigsuspend`'s mask) is installed with `set_temp_mask`. If
+the wait is interrupted, the temporary mask stays until the handler runs,
+and the frame's `uc_sigmask` is the original mask (`Thread::saved_mask`,
+Linux `saved_sigmask`). Otherwise the original is restored on return. Codes
+512–516 never reach user mode, although `patina.strace=1` shows them
+(`-errno 512`). `sched::kick` wakes an interruptible blocker; for a thread
+running on another CPU it calls `sched::kick_remote`, the SMP hook (D50).
+
+## D46: fd table and the `File` trait
+*2026-10-14 · Phase 2*
+
+Design §8 puts pipes, eventfd and epoll in Phase 3. They landed in Phase 2
+because Go's netpoller needs them for timers (D49). The module docs of
+`kernel/src/fs/file.rs` are the contract that Phase 3's VFS files, `/dev`
+nodes and sockets implement. There is one `File` per open file description.
+`OpenFile` adds the status flags (access mode, `O_NONBLOCK`, `O_APPEND`) and
+is shared by `dup`/`F_DUPFD`, so `F_SETFL` is seen through duplicates; it
+changes only NONBLOCK and APPEND. The fd table (`fs/fdtable.rs`) maps fd →
+(`Arc<OpenFile>`, cloexec). It allocates the lowest free fd, bounded by the
+live `RLIMIT_NOFILE` soft limit (`proc::nofile_limit()`). `OpenFile`s, and
+so `File::release`, are dropped only after the fd-table lock is released and
+never under the VFS lock (the patina-vfs `Handle` rule). File operations
+never block: the syscall layer retries after `wait_ready`. That registers a
+`PollWaiter` via `poll(Some(hook))` under the file's lock and blocks
+interruptibly unless the file is already ready. Files keep a `PollList` of
+`Weak<dyn PollHook>`; they call `collect` under their lock and `fire()`
+after releasing it. Epoll never holds its own lock while calling into a
+file. Lock order: fd table → (released) → file → leaf; epoll lock → wait
+queue / sleep list; `PollWaiter` → sleep list. The pure parts (fd slot
+allocation, pipe ring, eventfd counter) are in the in-tree, host-tested
+crate `crates/fsutil`, which has no third-party dependencies.
+
+Pipes use a 64 KiB ring allocated on the first write; writes of up to
+`PIPE_BUF` (4096) bytes are all or `EAGAIN`; the write end is `OUT` while at
+least 4096 bytes are free and `ERR` with no readers, the read end `HUP` with
+no writers; `FIONREAD` works and `O_DIRECT` → `EINVAL`. `fstat`: pipes are
+`S_IFIFO|0600`, eventfd and epoll `S_IFREG|0600` anonymous inodes, the
+console `S_IFCHR|0620` with rdev 5:1; fds 1 and 2 share one `O_RDWR` console
+description and fd 0 is a read-only one at EOF. Epoll (`fs/epoll.rs`) keys
+items by (fd, `OpenFile` address) and holds a `Weak<OpenFile>`, so an item
+goes away when its description is released (pruned lazily). Level-triggered
+items are re-queued after each report, edge-triggered ones wait for the next
+notification, `EPOLLONESHOT` clears the event bits until `EPOLL_CTL_MOD`,
+and ERR/HUP are always in the mask. Epoll deviations: an epoll fd inside an
+epoll → `EINVAL` (Linux allows nesting), `EPOLLEXCLUSIVE` is accepted but
+every waiter is woken, and `poll()` on an epoll fd reports `IN` whenever its
+ready list is non-empty (may be a false positive). `pselect6` is `ENOSYS`
+(logged); `membarrier`, `set_robust_list` and `rseq` are `ENOSYS` without a
+log line. `readv` reads once into a bounce buffer of at most 64 KiB and
+scatters it; `writev` writes each iovec in turn (atomic per iovec only).
+Timeouts are tick-granular and never early until sub-tick deadlines reach
+the sleep list (D51). Syscalls added: `pipe2`/`pipe`, `eventfd2`/`eventfd`,
+`epoll_create1`/`epoll_create`/`epoll_ctl`/`epoll_pwait`/`epoll_pwait2`/
+`epoll_wait`, `dup`/`dup2`/`dup3`, `F_DUPFD(_CLOEXEC)`, `F_GETFD`/`F_SETFD`,
+`ppoll`/`poll`, `readv`/`writev`, `pread64`/`pwrite64`/`lseek` (`ESPIPE` on
+pipes), and `ioctl` `FIONBIO`/`FIONREAD`/`FIOCLEX`/`FIONCLEX`. The non-`2`
+variants and `dup2`/`poll`/`epoll_wait` exist on x86_64 only.
+
+## D47: aarch64 SMP bring-up, IPIs and per-CPU timer
+*2026-10-14 · Phase 2*
+
+`arch/aarch64/{smp,boot,gic,timer}.rs`. CPUs come from DT `/cpus`, using
+enabled nodes with `enable-method = "psci"` or no enable-method (spin-table
+CPUs are skipped). The boot CPU (by MPIDR) is logical CPU 0, the rest follow
+in DT order, capped at `MAX_CPUS = 8`. CPU_ON is fid 0xC4000003 for
+`arm,psci-0.2`/`1.0` nodes, else the node's `cpu_on` property. Bring-up is
+serial through the single `AP_BOOT` slot (cpu id, TTBR1 root, the empty
+TTBR0 table, stack top). The slot is cleaned to PoC with `dc cvac; dsb sy`
+before `CPU_ON(mpidr, PA of __ap_entry, PA of AP_BOOT)`. PSCI errors are
+logged by name and that CPU is skipped. A CPU that is not online within 1 s
+stops further bring-up, because a late CPU would read a rewritten slot. AP
+stacks come from `task::kstack::alloc()` and are never freed, except after a
+failed CPU_ON. `__ap_entry` shares `__el2_to_el1` and `__setup_mair_tcr`
+with the boot CPU. It sets TPIDR_EL1 (the cpu id) before the MMU is on, so
+the overflow-stack path (D29) works. It turns the MMU on with the boot
+identity map (kept intact in `.bss.boot_pt`) in TTBR0, jumps to the link
+address, parks TTBR0 on the empty table and sets SP and VBAR. Then
+`ap_rust_entry` enables PAN and EL0 counter access, runs `gic::init_cpu` and
+`timer::init_cpu`, sets the online bit and calls `entry(cpu)` with IRQs
+masked.
+
+IPIs are SGI 0 (Reschedule) and SGI 1 (Stop). GICv3 sends through
+`ICC_SGI1R_EL1` by affinity: TargetList = 1 << (Aff0 % 16), RS = Aff0 / 16
+(RS ≠ 0 is untested). GICv2 sends through `GICD_SGIR` with the target's
+CPU-interface mask, which each CPU reads from its banked `GICD_ITARGETSR0`;
+SGIs stay Group 0 there. `send_ipi_others` loops over the online CPUs (no
+broadcast). GICv2 EOI must write back the raw IAR, which carries the SGI
+source CPU in bits 12:10, so `gic::ack` returns `(intid, token)`. Timer:
+each CPU keeps `next_tick` on a fixed `start + k*period` grid (missed ticks
+are skipped; no drift) and an optional one-shot `deadline`. CNTV_CVAL holds
+the earlier of the two, and both expiries call `trap::timer_tick`.
+`cpu::hw_random` uses RNDR when `ID_AA64ISAR0_EL1.RNDR` reports it (TCG
+`-cpu max`: yes; HVF on this M-series host: none). Unverified: SMC on real
+firmware, spin-table CPUs, more than 8 CPUs.
+
+## D48: x86_64 SMP enumeration, AP trampoline, IPIs and LAPIC one-shot timer
+*2026-10-14 · Phase 2*
+
+`arch/x86_64/{smp,acpi,fwcfg,gdt,percpu,lapic,timer}.rs`. Enumeration runs
+in `early_main` on the boot page tables, before `frame::init`, because an
+e820 map may report the ACPI table pages as RAM. The first source in this
+chain that yields CPUs wins: the MADT via `start_info.rsdp_paddr` → via an
+RSDP scan (first KiB of the EBDA, then 0xE0000–0xFFFFF) → via fw_cfg
+`etc/acpi/rsdp` + `etc/acpi/tables` (table pointers read as offsets into the
+blob, checksums skipped, a 64 KiB static buffer; pc/q35 pad the blob to 128
+KiB) → an MP table scan (EBDA, top KiB of base memory, 0x9FC00, 0xF0000) →
+fw_cfg `NB_CPUS` (APIC ids assumed 0..n) → one CPU. The test knob
+`patina.smp.skip=N` skips the first N sources. MADT types 0 and 9 are read,
+enabled entries only, deduplicated and capped at `MAX_CPUS = 32`; CPU 0 is
+the boot CPU by CPUID APIC id. Observed: QEMU `microvm` passes `rsdp_paddr`
+0, but qboot installs ACPI and the BIOS-area scan finds the RSDP at 0xf5560
+(pc/q35 SeaBIOS: 0xf52e0). SeaBIOS/qboot MP tables list one processor per
+package, so a single-socket `-smp N` would report 1 CPU. That is why fw_cfg
+comes before the MP table (Firecracker lists every CPU). The trampoline
+lives at fixed low pages. Code and data are at 0x8000 (SIPI vector 8). Its
+own page tables at 0x9000/0xA000/0xB000 identity-map 0–2 MiB (one executable
+2 MiB page) and copy the kernel PML4's upper 256 entries. The path is 16-bit
+→ 32-bit → long mode (CR4 PAE|PGE|OSFXSR|OSXMMEXCPT, EFER LME|NXE, CR0 WP) →
+`__ap_entry64` → kernel CR3 + AP stack → `ap_main`. These pages are safe to
+use because the whole low 1 MiB stays reserved.
+
+For each AP the BSP pre-allocates a 32 KiB guarded kernel stack, an IST1
+stack, a heap GDT/TSS (leaked) and a heap `PerCpu`. It then sends INIT
+assert, waits 10 ms, sends INIT deassert (xAPIC only), sends two SIPIs 200
+µs apart, and waits up to 1 s for the online flag. Bring-up is serialised; a
+timeout stops it, since the AP may still be using the trampoline. xAPIC ids
+above 254 are skipped, and MTRRs are not copied. `cpu::init_features` and
+`entry::init_syscall` run unchanged on each AP; the self-test asserts that
+CR4 and EFER equal the BSP's. Vectors: timer 0xec, Reschedule 0xf0, Stop
+0xf1, spurious 0xff. IPIs use fixed delivery to the physical APIC id (xAPIC
+ICR high/low with bounded delivery-status spins; x2APIC MSR 0x830), with
+IRQs masked around the send. Timer (replaces D33's periodic mode): the LAPIC
+timer is one-shot on every CPU (no TSC-deadline mode). Each interrupt
+re-arms it for min(next 100 Hz grid point, deadline). `trap::TICKS` counts
+deadline interrupts too. `set_deadline(None)` only clears the deadline: the
+interrupt already armed still fires and re-arms. `cpu::hw_random` is RDSEED
+with retries, else RDRAND. Unverified: x2APIC, KVM/Firecracker/Cloud
+Hypervisor, APIC ids above 254, calling `start_secondaries` twice, MTRRs.
+
+## D49: Phase 2 test programs and scripts
+*2026-10-14 · Phase 2*
+
+`scripts/test-hello.sh --app <name> [arch...]` builds `testapps/<name>` and
+passes when it prints `PASS <name>` and exits 0; `PATINA_PARAMS` adds kernel
+params (e.g. `patina.strace=1`), and `--threads` remains as the mode that
+only shows output. `scripts/test-signals.sh [arch...]` runs six cases per
+arch: `signals -self`, `signals -mode nohandler -self` (exit 143),
+`sigstress`, `sigstress -procs 2`, `sigstress -crash` and `sigstress
+-breakpoint` (exit 2 each). `testapps/fdtest` covers pipes, dup/fcntl,
+`EMFILE`, eventfd, epoll (LT/ET/ONESHOT/HUP/auto-removal), ppoll and Go
+timers. `testapps/sigstress` covers SIGURG async preemption (GOMAXPROCS
+spinners with no function calls, so main runs only if they are preempted);
+nil dereference and integer divide by zero, each recovered 200 times;
+`-crash` (unrecovered SIGSEGV, Go's `code=0x1 addr=0x0` line) and
+`-breakpoint`; `kill` and `tgkill` SIGUSR1, counted (1000 and 100);
+`nanosleep` interrupted with `EINTR` and `rem`; a blocking pipe read
+restarted across signals (`SA_RESTART`); and `time.Sleep` under a SIGUSR1
+storm. `signals -self` busy-waits instead of sleeping because it was written
+before the netpoller worked; that is harmless and keeps it independent of
+epoll.
+
+Background: Go's runtime initialises its netpoller (`epoll_create1`,
+`eventfd2`, `epoll_ctl`) on first timer use. That is why Phase 1's threads
+test died at `netpollinit`.
+
+## D50: SMP scheduler core
+*(second documentation pass; see the SMP/timers worker reports)*
+
+## D51: Timers and CPU clocks
+*(second documentation pass; see the SMP/timers worker reports)*

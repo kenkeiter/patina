@@ -110,3 +110,17 @@ in-tree crates `patina-abi`, `patina-cmdline`, `patina-cpio` and
 `patina-loader` (ELF parser + initial-stack builder, `#![deny(unsafe_code)]`,
 host-tested against real Go binaries); `patina-loader` depends only on
 `patina-abi`. `fdt` and `buddy_system_allocator` are unchanged.
+
+## Phase 2 note
+
+Phase 2 (part 1: signals, fd layer, SMP bring-up) added no third-party
+dependency, so no new audit section. The two new crates are in-tree and
+have empty or path-only `[dependencies]` (checked in their `Cargo.toml`):
+
+- `crates/fsutil` (`patina-fsutil`): `#![no_std]` + `alloc`, no
+  dependencies at all, no `unsafe`. It holds fd slot allocation, the pipe
+  byte ring and the eventfd counter (D46). The kernel depends on it.
+- `crates/vfs` (`patina-vfs`): `#![no_std]`, `#![forbid(unsafe_code)]`,
+  depends only on the in-tree `patina-abi` and `patina-cpio` (whose
+  third-party dependencies, `bitflags` and `zerocopy`, are audited above).
+  It is not linked into the kernel yet (Phase 3).
