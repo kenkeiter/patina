@@ -490,3 +490,79 @@ errors on `ENOSYS`), `rt_sigaction`/`rt_sigprocmask`/`sigaltstack` store
 state exactly (KILL/STOP rejected, mask never blocks them) but nothing is
 delivered, and `rt_sigreturn` is fatal (exit 139). Kernel-mode user memory
 access never touches user VAs (D27, D36).
+
+## D38: Uniprocessor scheduler with per-CPU structure; kernel is not preemptible
+*2026-10-14 · Phase 1*
+
+`kernel/src/task/sched.rs` keeps one `PerCpu` (current thread, round-robin
+`VecDeque` runqueue, idle context = the boot stack, zombie slot,
+`need_resched`, quantum) reached through `sched::this_cpu()`; Phase 2
+indexes it by `cpu::id()`. The 100 Hz tick (`trap::timer_tick`) never
+switches directly: it expires sleepers, counts the 2-tick (20 ms) quantum
+and sets `need_resched`; the switch happens in `trap::before_return_to_user`,
+on block, yield or exit, or at an explicit `preempt_point`. Thread state,
+wake reason and a per-block sequence number share one atomic word so
+`try_wake(seq, reason)` is a single CAS and stale/double wake-ups are
+harmless — the property SMP wakers need. The idle loop runs with IRQs
+masked: x86 `sti; hlt; cli` (sti shadow), aarch64 `wfi` relying on WFI
+waking for a pending-but-masked IRQ (as Linux's `cpu_do_idle`), verified on
+HVF and TCG. FP state is saved into the outgoing thread and restored for
+the incoming one only if it has run before; fresh threads load their start
+state in the entry trampoline; a clone child gets `fp_save` of the parent's
+live registers (no-op on aarch64, where the frame carries FP). Signal
+delivery (Phase 2) hooks into `before_return_to_user` after the reschedule
+and needs a third `WakeReason` for `EINTR`.
+
+## D39: Kernel stacks: 32 KiB + guard page in a dedicated window; thread 0 is a normal thread
+*2026-10-14 · Phase 1*
+
+`task/kstack.rs` hands out 32 KiB stacks with one unmapped guard page below
+each, mapped page-by-page with `arch::paging::map_range` in the window at
+`KSTACK_BASE = 0xffff_a000_0000_0000` (1 TiB; PML4 slot 320 on x86_64,
+pre-populated by `populate_kernel_pml4` so every user PML4 sees it; TTBR1 on
+aarch64). Slots come from a bump pointer and freed slots go to a free list
+with their frames still mapped (no kernel unmap/TLB shootdown needed; the
+frames are not returned to the allocator). Thread 0 gets a slot like every
+other thread; the boot stack becomes CPU 0's idle context. A thread cannot
+free the stack it runs on, so a dead thread's stack is released by the next
+context that runs (`PerCpu` zombie slot). `patina.selftest=kstack` overflows
+a thread stack: aarch64 reports it on the overflow stack (D29), x86_64 as
+`#DF` on IST1.
+
+## D40: Wait queues, sleep list and futexes
+*2026-10-14 · Phase 1*
+
+`wait::block(guard, queue, key, bits, deadline)` enqueues the current thread
+under the caller's lock, releases that lock with IRQs still masked
+(`SpinLockGuard::unlock_irqs_masked`) and then schedules, so no wake-up can
+be lost between the check and the sleep. The sleep list (`task/sleep.rs`)
+is ordered by deadline and expired from the tick, so `nanosleep`,
+`clock_nanosleep` and futex timeouts have 10 ms resolution in Phase 1
+(Go's sysmon `usleep(20)` sleeps a whole tick); Phase 2 adds one-shot
+deadlines per CPU and hangs `timer_create`/`setitimer` off the same list.
+Futexes (`task/futex.rs`) are 64 buckets keyed by user virtual address (one
+address space); `FUTEX_WAIT`/`WAIT_BITSET` read the word through uaccess
+under the bucket lock, `FUTEX_WAKE`/`WAKE_BITSET` wake up to `val`
+(`val <= 0` wakes one, as Linux), `FUTEX_CLOCK_REALTIME` only with
+`WAIT_BITSET`, bitset 0 or a misaligned address → `EINVAL`, requeue/PI ops →
+`ENOSYS` (D26). Lock order: futex bucket → address space → frame allocator;
+bucket → sleep list → runqueue.
+
+## D41: `clone` accepts Go's flag set only; thread exit semantics
+*2026-10-14 · Phase 1*
+
+`clone` (`syscall/thread.rs`) requires exactly
+`CLONE_VM|FS|FILES|SIGHAND|SYSVSEM|THREAD` plus any of
+`SETTLS|PARENT_SETTID|CHILD_SETTID|CHILD_CLEARTID|DETACHED`; anything else
+is `EINVAL` (design §5). Go passes `0x50f00` on arm64 and `0xd0f00`
+(+`CLONE_SETTLS`, the FS base) on amd64; argument order comes from
+`patina_abi::current::clone_args`. The child is the parent's `TrapFrame`
+with return value 0, the given stack and TLS, a copied signal mask, a
+disabled sigaltstack, and the parent's FP state; tids start at 2;
+`clone3` → `ENOSYS`; a `SETTLS` value outside user space → `EPERM`
+(a non-canonical FS base would fault the kernel's `wrfsbase`). `exit`
+zeroes `clear_child_tid`, futex-wakes it, and if no live user thread
+remains ends the process with that code; `exit_group` ends the process at
+once (Phase 2 must stop the other CPUs first). `tgkill` validates the tid
+against the thread table and still only logs (delivery is Phase 2), so Go's
+`SIGURG` async preemption is a no-op in Phase 1.

@@ -102,3 +102,11 @@ be revisited in later phases.
   walker, all in-tree under `kernel/src/arch/x86_64/` (no crates added by the
   x86_64 port). `raw-cpuid`/`x2apic` become relevant with SMP and the APIC
   timer in Phase 2.
+
+## Phase 1 note
+
+Phase 1 added no third-party dependency. The kernel now depends on the
+in-tree crates `patina-abi`, `patina-cmdline`, `patina-cpio` and
+`patina-loader` (ELF parser + initial-stack builder, `#![deny(unsafe_code)]`,
+host-tested against real Go binaries); `patina-loader` depends only on
+`patina-abi`. `fdt` and `buddy_system_allocator` are unchanged.
