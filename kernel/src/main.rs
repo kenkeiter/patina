@@ -20,6 +20,7 @@ mod drivers;
 mod fs;
 mod loader;
 mod mm;
+mod net;
 mod panic;
 mod random;
 mod selftest;
