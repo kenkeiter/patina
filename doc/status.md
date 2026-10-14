@@ -30,6 +30,9 @@ scripts/test-net.sh [aarch64] [x86_64]              # Phase 4 Milestone A on QEM
 scripts/test-gonet.sh [--pkg net/http] [arch...]    # Go's own `net` (or net/http) package tests with testapps/skiplist/net.txt
 scripts/test-gopkg.sh <pkg>... [--arch aarch64|x86_64|both] [--cpus N] [--run RE] [--no-short] [--mem MiB]
                                                     # Milestone B: any Go std package's tests with testapps/skiplist/<pkg>.txt (D74); test-os.sh/test-gonet.sh wrap it
+scripts/bench.sh [arch...] [--cpus 1,2] [--runs 3] [--novdso] [-n F] [--only L]
+                                                    # Phase 5 per-syscall benchmarks (testapps/bench): table of medians per arch (D79)
+GO=go1.26.9 scripts/build-testapp.sh <name> <arch> <out>  # build a testapp with another Go toolchain (default GO=go)
 PATINA_NET=user scripts/run-qemu.sh <arch> -- patina.selftest=net   # virtio-net driver self-test (ARP against slirp)
 cargo test --workspace --exclude patina-kernel      # host tests
 ```
@@ -448,3 +451,63 @@ for syscalls); `cargo test -p patina-vdso` for the image checks.
 - [x] vvar seqlock; the control channel's `time` op updates the vvar realtime offset — **test-ctl** `usr1-time` (Go's `time.Now()` after the step goes through the vDSO)
 - [x] vDSO `getrandom` (Linux 6.11 contract: params query, per-thread opaque state, ChaCha20 with fast key erasure, key refill on kernel reseed via `rng_generation`) — **vdsobench** (output checks, strace shows the refill after a reseed)
 - [~] x86_64 TSC assumed synchronized/invariant across CPUs (true under TCG; not checked on KVM hosts); vDSO `getrandom` re-entry fallback (`in_use`), vvar refault after `madvise(DONTNEED)`/`munmap` of the vDSO: written, not exercised
+
+### Benchmarks
+
+Decision D79. `scripts/bench.sh aarch64 x86_64 --cpus 1,2 --novdso` runs
+`testapps/bench` (Go 1.27.1, release kernel, `PATINA_MEM=512`) 3× per
+configuration and prints the **median of 3**. Host: Apple M1 Max (10
+cores), macOS 26.6.2, QEMU 11.1.2; aarch64 = `virt` + HVF, x86_64 =
+`microvm` + **TCG** (an emulator: its absolute numbers are not comparable
+with aarch64 or with real x86 hardware, only its ratios mean something).
+Run 2026-10-14 while other agents' QEMU guests shared the host, so single
+runs vary by ~10–30 %; the medians are the honest number. Latency rows:
+lower is better; MB/s = 10^6 bytes/s. The `novdso` columns are the clock
+rows rerun with `patina.novdso=1` (other rows "-").
+
+| Benchmark | unit | aarch64 1 vCPU | aarch64 1, novdso | aarch64 2 vCPUs | aarch64 2, novdso | x86_64 1 vCPU | x86_64 1, novdso | x86_64 2 vCPUs | x86_64 2, novdso |
+|---|---|---|---|---|---|---|---|---|---|
+| `getpid-raw` (RawSyscall: bare entry/exit) | ns | 57 | - | 59 | - | 574 | - | 474 | - |
+| `getpid-syscall` (syscall.Syscall: + Go's entersyscall) | ns | 76 | - | 77 | - | 915 | - | 749 | - |
+| `clock_gettime-syscall` (raw, MONOTONIC) | ns | 132 | 136 | 134 | 135 | 1144 | 1174 | 1157 | 1026 |
+| `time.Now` (vDSO) | ns | 60 | 266 | 63 | 332 | 286 | 2478 | 266 | 2211 |
+| `getrandom32-syscall` (32 B) | ns | 387 | 388 | 385 | 388 | 2783 | 2816 | 2491 | 2307 |
+| `crypto-rand-read32` (vDSO getrandom) | ns | 121 | 427 | 122 | 455 | 1114 | 3655 | 908 | 3394 |
+| `futex-pingpong` (2 locked threads, raw WAIT/WAKE) | µs/round trip | 0.65 | - | 0.90 | - | 8.66 | - | 9.03 | - |
+| `chan-pingpong` (goroutines, unbuffered chans) | µs/round trip | 0.23 | - | 0.21 | - | 4.09 | - | 3.85 | - |
+| `mutex-handoff` (sync.Mutex + Cond, strict alternation) | µs/round trip | 0.22 | - | 0.22 | - | 4.06 | - | 4.13 | - |
+| `pipe-pingpong` (2 locked threads, blocking pipes, 1 B) | µs/round trip | 1.01 | - | 1.40 | - | 19.3 | - | 27.0 | - |
+| `pipe-throughput` (64 KiB writes, 1 s) | MB/s | 3306 | - | 3567 | - | 396 | - | 899 | - |
+| `netpoll-pipe-pingpong` (os.Pipe: epoll wakeup) | µs/round trip | 1.75 | - | 1.80 | - | 30.2 | - | 26.8 | - |
+| `tcp-rtt` (127.0.0.1, 1 B, TCP_NODELAY) | µs/round trip | 4.33 | - | 4.51 | - | 72.9 | - | 74.2 | - |
+| `tcp-throughput` (64 KiB writes, 2 s) | MB/s | 693 | - | 688 | - | 146 | - | 144 | - |
+| `unix-rtt` (AF_UNIX stream, 1 B) | µs/round trip | 1.87 | - | 1.96 | - | 34.1 | - | 33.5 | - |
+| `unix-throughput` (64 KiB writes, 2 s) | MB/s | 2823 | - | 3223 | - | 400 | - | 730 | - |
+| `thread-create-exit` (LockOSThread'd goroutine exits: clone + exit) | µs | 3.79 | - | 6.60 | - | 71.8 | - | 74.2 | - |
+| `mmap-munmap-1M` (anon, touch one page) | µs | 1.41 | - | 1.54 | - | 13.1 | - | 42.9 | - |
+| `signal-rtt` (kill(self, SIGUSR1) → signal.Notify chan) | µs | 3.17 | - | 6.89 | - | 41.3 | - | 40.0 | - |
+
+| Name | Command | Observed |
+|---|---|---|
+| **bench** | `scripts/bench.sh aarch64 x86_64 --cpus 1,2 --novdso` (3 runs each) | every run prints `PASS bench` and exits 0 on both arches, 1 and 2 vCPUs, with and without the vDSO; no `ENOSYS` line; table above. No HVF row crosses the pathology thresholds of D79 (futex > 50 µs, pipe ping-pong > 100 µs, TCP < 200 MB/s, signal > 100 µs) |
+
+- [x] Per-syscall benchmarks (design §14): `testapps/bench` (std only, `-n` scale, `-only`, `-list`) + `scripts/bench.sh` (medians, `--novdso`) — **bench**
+- [~] Known costs, explained in D79, not fixed: TCP loopback moves ~4× less data than AF_UNIX and has ~2.3× its round trip (smoltcp under one lock + the net task, D67); with 2 vCPUs, cross-CPU wakeups (Reschedule IPI to a CPU idling in WFI) roughly double `signal-rtt` and `thread-create-exit` on HVF; x86_64 `mmap-munmap-1M` at 2 vCPUs is 3× the 1-vCPU cost because `munmap` sends a `TlbFlush` IPI (aarch64 uses broadcast `tlbi …is` instead), which TCG makes expensive
+
+### Go version matrix
+
+Decision D79, design §13/§15. go1.26.9 (`go install
+golang.org/dl/go1.26.9@latest && go1.26.9 download`, outside the repo) next
+to the default go1.27.1. `GO=go1.26.9 scripts/build-testapp.sh …` picks the
+toolchain (default `go`, unchanged behaviour). Each app was run with
+`patina.strace=1` on both arches, 1 vCPU; the ENOSYS set is the union of
+`[patina] ENOSYS` lines and strace lines ending `= -ENOSYS` (the silent
+by-design ones).
+
+| Name | Command | Observed |
+|---|---|---|
+| **gomatrix-1.26** | per arch: `GO=go1.26.9 scripts/build-testapp.sh <app> …`, `run-qemu.sh … -- patina.strace=1 -- <args>` for hello (`3 a b`, exit 3), threads, fdtest, fileio, signals (`-self`), sockets, unixsock, httphello (`-selftest`), bench (`-n 0.01`); the same with go1.27.1 | **18/18 PASS with go1.26.9 and 18/18 with go1.27.1** (`go version` of each binary checked). ENOSYS set identical for both versions and arches: only `copy_file_range` (fileio, silent by design, Go falls back to read/write); no `[patina] ENOSYS` line at all. The distinct-syscall sets per app are the same for both versions except timing noise (`sched_yield`, and `getpid`+`tgkill` from a preemption signal, appear in one version's run or the other's) |
+| **gomatrix-os-1.26** | `scripts/test-os.sh aarch64` with `$HOME/sdk/go1.26.9/bin` first in `PATH` (test-gopkg.sh runs plain `go test -c`; the `GO` knob does not reach it, a PATH shim does, no harness change) | `os aarch64 (cpus=1): 247 passed, 33 skipped (10 by our list), 0 failed, exit 0`; test binary `go1.26.9`; ENOSYS: `pidfd_open` only (as with 1.27). 247 vs 248 is the test set: 1.27 adds `TestFileFdWithConcurrentIO`, `TestReadDirFD`, `TestRootSymlinkNormalization` and drops `TestRootOpenatFallback` |
+
+- [x] Two-version matrix (go1.26.9, go1.27.1): same ENOSYS set, no behavioural difference — **gomatrix-1.26**, **gomatrix-os-1.26**
+- [x] Go 1.27.1 syscall numbers (`runtime/sys_linux_{amd64,arm64}.s`, `internal/runtime/syscall/linux`, `internal/syscall/unix`, `syscall`, `os`, `net`, `internal/poll`, `crypto/rand`, `time`) diffed against `kernel/src/syscall/mod.rs`: nothing on a normal path is missing; the unimplemented ones are listed in D79
