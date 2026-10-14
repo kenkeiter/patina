@@ -332,5 +332,14 @@ pub(super) fn init_kernel_tables(ram: &[(usize, usize)]) -> Result<(), MapError>
         );
     }
     KERNEL_ROOT.store(root.0, Ordering::Relaxed);
+    EMPTY_USER.store(empty_user.0, Ordering::Relaxed);
     Ok(())
+}
+
+static EMPTY_USER: AtomicUsize = AtomicUsize::new(0);
+
+/// Physical address of the empty table TTBR0 is parked on when no user
+/// tables are active (secondary CPUs park on it after boot too).
+pub(super) fn empty_user_table() -> PhysAddr {
+    PhysAddr(EMPTY_USER.load(Ordering::Relaxed))
 }

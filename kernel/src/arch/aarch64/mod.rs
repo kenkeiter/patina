@@ -16,6 +16,7 @@ mod gic;
 pub mod irq;
 pub mod paging;
 pub mod power;
+pub mod smp;
 pub mod timer;
 pub mod uspace;
 

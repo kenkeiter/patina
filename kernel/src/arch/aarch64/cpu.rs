@@ -116,6 +116,35 @@ read_sysreg!(read_midr, "midr_el1");
 read_sysreg!(read_id_aa64isar0, "id_aa64isar0_el1");
 read_sysreg!(read_id_aa64pfr0, "id_aa64pfr0_el1");
 
+/// A 64-bit value from FEAT_RNG (`RNDR`), if ID_AA64ISAR0_EL1.RNDR
+/// (bits 63:60) says it exists. `RNDR` reports failure (entropy not
+/// available right now) with PSTATE.Z set and a zero result; retried a few
+/// times before giving up.
+pub fn hw_random() -> Option<u64> {
+    if (read_id_aa64isar0() >> 60) & 0xf == 0 {
+        return None;
+    }
+    for _ in 0..16 {
+        let v: u64;
+        let ok: u64;
+        // SAFETY: RNDR (S3_3_C2_C4_0) is implemented (checked above); it only
+        // writes the destination register and NZCV.
+        unsafe {
+            asm!(
+                "mrs {v}, S3_3_C2_C4_0",
+                "cset {ok}, ne",
+                v = out(reg) v,
+                ok = out(reg) ok,
+                options(nomem, nostack)
+            )
+        };
+        if ok != 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// (AT_HWCAP, AT_HWCAP2) for auxv: the ID_AA64ISAR0_EL1-derived bits from
 /// `patina_abi`, plus FP/ASIMD (always), CPUID (EL0 `MRS` of ID registers is
 /// emulated, see `exceptions::emulate_mrs`), and from ID_AA64PFR0_EL1

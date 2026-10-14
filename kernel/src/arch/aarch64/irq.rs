@@ -2,7 +2,8 @@
 //!
 //! [`handle`] runs from the IRQ vectors (EL0 and EL1) with IRQs masked:
 //! acknowledge at the GIC, then either the timer path (rearm, EOI,
-//! `trap::timer_tick`) or a handler registered with [`register`] (then EOI).
+//! `trap::timer_tick`), an IPI (SGI 0/1: EOI, then `trap::ipi`), or a
+//! handler registered with [`register`] (then EOI).
 //! The timer's EOI happens before `trap::timer_tick` so the core may switch
 //! threads from the tick without leaving the interrupt active. Nothing here
 //! assumes the boot CPU: the GIC CPU interface is per-CPU and the
@@ -13,6 +14,7 @@ use core::arch::asm;
 use super::ctx::TrapFrame;
 use super::{gic, timer};
 use crate::sync::SpinLock;
+use crate::trap::IpiKind;
 
 /// Saved DAIF value.
 #[derive(Clone, Copy, Debug)]
@@ -87,13 +89,24 @@ pub fn register(intid: u32, handler: Handler) {
 
 /// IRQ entry from the vectors (IRQs masked). `from_user`: taken from EL0.
 pub(super) fn handle(tf: &mut TrapFrame, from_user: bool) {
-    let Some(intid) = gic::ack() else {
+    let Some((intid, token)) = gic::ack() else {
         return; // spurious
     };
     if intid == timer::intid() {
         timer::rearm();
-        gic::eoi(intid);
+        gic::eoi(token);
         crate::trap::timer_tick(tf, from_user);
+        return;
+    }
+    // IPIs: EOI first (`Stop` never returns).
+    let ipi = match intid {
+        gic::SGI_RESCHEDULE => Some(IpiKind::Reschedule),
+        gic::SGI_STOP => Some(IpiKind::Stop),
+        _ => None,
+    };
+    if let Some(kind) = ipi {
+        gic::eoi(token);
+        crate::trap::ipi(tf, kind);
         return;
     }
     let h = HANDLERS.lock().get(intid as usize).copied().flatten();
@@ -105,5 +118,5 @@ pub(super) fn handle(tf: &mut TrapFrame, from_user: bool) {
             super::cpu::id()
         ),
     }
-    gic::eoi(intid);
+    gic::eoi(token);
 }

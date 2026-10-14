@@ -68,7 +68,19 @@ pub struct Platform {
     /// INTID of the EL1 virtual timer (`arm,armv8-timer` `interrupts`, 3rd
     /// entry), if the DTB says.
     pub timer_virt_intid: Option<u32>,
+    /// PSCI CPU_ON function id (`/psci`: fixed 0xC400_0003 for PSCI 0.2+,
+    /// else the `cpu_on` property of a PSCI 0.1 node).
+    pub psci_cpu_on: Option<u32>,
+    /// MPIDR affinity values (`reg`) of the `/cpus/cpu@N` nodes that are
+    /// enabled and use `enable-method = "psci"` (or name none), in DT order.
+    pub cpus: [u64; MAX_DT_CPUS],
+    pub ncpus: usize,
 }
+
+/// CPU nodes recorded from the DTB (more are counted but ignored).
+pub const MAX_DT_CPUS: usize = 64;
+/// PSCI 0.2+ CPU_ON, SMC64 calling convention.
+pub const PSCI_0_2_CPU_ON_64: u32 = 0xC400_0003;
 
 /// GIC description from the DTB.
 #[derive(Clone, Copy, Debug)]
@@ -108,6 +120,9 @@ pub unsafe fn parse(va: usize) -> Result<Platform, DtbError> {
         psci: None,
         gic: None,
         timer_virt_intid: None,
+        psci_cpu_on: None,
+        cpus: [0; MAX_DT_CPUS],
+        ncpus: 0,
     };
 
     for node in fdt.all_nodes() {
@@ -182,7 +197,20 @@ pub unsafe fn parse(va: usize) -> Result<Platform, DtbError> {
             Some("hvc") => Some(Conduit::Hvc),
             _ => None,
         };
+        let v02 = psci
+            .compatible()
+            .map(|c| c.all().any(|c| c == "arm,psci-0.2" || c == "arm,psci-1.0"))
+            .unwrap_or(false);
+        p.psci_cpu_on = if v02 {
+            Some(PSCI_0_2_CPU_ON_64)
+        } else {
+            psci.property("cpu_on")
+                .and_then(|pr| be_uint(pr.value))
+                .map(|v| v as u32)
+                .or(Some(PSCI_0_2_CPU_ON_64))
+        };
     }
+    parse_cpus(&fdt, &mut p);
     p.gic = gic_from_fdt(&fdt);
     p.timer_virt_intid = fdt
         .find_compatible(&["arm,armv8-timer", "arm,armv7-timer"])
@@ -201,6 +229,43 @@ pub unsafe fn parse(va: usize) -> Result<Platform, DtbError> {
             }
         });
     Ok(p)
+}
+
+/// `/cpus/cpu@N`: `reg` is the MPIDR affinity in `#address-cells` (1 or 2)
+/// cells of `/cpus`. Disabled CPUs and ones with a non-PSCI enable-method
+/// (spin-table) are skipped.
+fn parse_cpus(fdt: &Fdt<'static>, p: &mut Platform) {
+    let Some(cpus) = fdt.find_node("/cpus") else {
+        return;
+    };
+    let cells = cpus
+        .property("#address-cells")
+        .and_then(|pr| be_uint(pr.value))
+        .unwrap_or(1);
+    for n in cpus.children() {
+        let is_cpu = n.property("device_type").map(|pr| cstr(pr.value)) == Some("cpu")
+            || n.name.starts_with("cpu@");
+        if !is_cpu || is_disabled(&n) {
+            continue;
+        }
+        if let Some(m) = n.property("enable-method").map(|pr| cstr(pr.value))
+            && m != "psci"
+        {
+            continue;
+        }
+        let Some(reg) = n.property("reg").map(|pr| pr.value) else {
+            continue;
+        };
+        let mpidr = match (cells, reg.len()) {
+            (1, l) if l >= 4 => u32::from_be_bytes([reg[0], reg[1], reg[2], reg[3]]) as u64,
+            (2, l) if l >= 8 => u64::from_be_bytes(reg[..8].try_into().unwrap_or([0; 8])),
+            _ => continue,
+        };
+        if p.ncpus < MAX_DT_CPUS {
+            p.cpus[p.ncpus] = mpidr;
+            p.ncpus += 1;
+        }
+    }
 }
 
 fn gic_from_fdt(fdt: &Fdt<'static>) -> Option<GicDesc> {
