@@ -97,11 +97,14 @@ impl Cred {
     /// `cap_emulate_setxuid` after a uid change from `old`.
     fn fix_caps(&mut self, old: &Ids) {
         let new = self.uid;
-        if (old.r == 0 || old.e == 0 || old.s == 0) && new.r != 0 && new.e != 0 && new.s != 0 {
-            if !self.keepcaps {
-                self.cap_prm = 0;
-                self.cap_eff = 0;
-            }
+        if (old.r == 0 || old.e == 0 || old.s == 0)
+            && new.r != 0
+            && new.e != 0
+            && new.s != 0
+            && !self.keepcaps
+        {
+            self.cap_prm = 0;
+            self.cap_eff = 0;
         }
         if old.e == 0 && new.e != 0 {
             self.cap_eff = 0;

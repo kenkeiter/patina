@@ -246,6 +246,7 @@ unsafe impl Sync for Thread {}
 unsafe impl Send for Thread {}
 
 impl Thread {
+    #[allow(clippy::too_many_arguments)] // one per inherited piece of state
     fn new(
         tid: u32,
         kind: ThreadKind,

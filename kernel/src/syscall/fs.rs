@@ -506,7 +506,7 @@ fn record_lock(fd: i32, cmd: i32, p: usize) -> SysResult {
         _ => return Err(Errno(EINVAL)),
     }
     let pos = of.file.lseek(0, SEEK_CUR).unwrap_or(0) as i64;
-    let size = of.file.stat().map(|st| st.st_size as i64).unwrap_or(0);
+    let size = of.file.stat().map(|st| st.st_size).unwrap_or(0);
     lock_range(fl.l_whence, fl.l_start, fl.l_len, pos, size).map_err(|e| match e {
         LockRangeError::Invalid => Errno(EINVAL),
         LockRangeError::Overflow => Errno(EOVERFLOW),
