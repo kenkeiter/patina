@@ -3,7 +3,7 @@
 //! `poll`, all over `File::poll` (see `fs/file.rs`, `fs/epoll.rs`).
 //!
 //! Signals: the waits are interruptible. `epoll_pwait` returns `EINTR`
-//! (never restarted, as Linux); `ppoll`/`poll` return `ERESTARTNOHAND`
+//! (never restarted, as Linux); `ppoll`/`poll`/`select` return `ERESTARTNOHAND`
 //! (`EINTR` when a handler runs, transparently re-executed with the
 //! original timeout otherwise). The temporary `sigmask` of
 //! `epoll_pwait`/`ppoll` stays installed when the wait was interrupted, so
@@ -16,10 +16,10 @@ use alloc::vec::Vec;
 
 use patina_abi::current::EpollEvent;
 use patina_abi::epoll::{EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EpollFlags};
-use patina_abi::errno::{EINTR, EINVAL, Errno};
+use patina_abi::errno::{EBADF, EINTR, EINVAL, Errno};
 use patina_abi::fs::{O_RDWR, POLLNVAL, PollFd};
 use patina_abi::signal::{SIGSET_SIZE, SigSet};
-use patina_abi::time::Timespec;
+use patina_abi::time::{Timespec, Timeval};
 use patina_abi::zerocopy::{FromZeros, IntoBytes};
 
 use super::fs::{get, install};
@@ -267,4 +267,157 @@ pub fn ppoll(fds: usize, nfds: usize, tmo: usize, sigmask: usize, sigsetsize: us
 /// x86_64 `poll(fds, nfds, timeout_ms)`.
 pub fn poll(fds: usize, nfds: usize, timeout_ms: i32) -> SysResult {
     do_poll(fds, nfds, Timeout::from_ms(timeout_ms), 0, 0)
+}
+
+/// `select` readiness classes (Linux `POLLIN_SET`, `POLLOUT_SET`,
+/// `POLLEX_SET`), indexed like the read / write / except `fd_set`s.
+const SELECT_SETS: [EpollFlags; 3] = [
+    EpollFlags::IN
+        .union(EpollFlags::RDNORM)
+        .union(EpollFlags::RDBAND)
+        .union(EpollFlags::HUP)
+        .union(EpollFlags::ERR),
+    EpollFlags::OUT
+        .union(EpollFlags::WRNORM)
+        .union(EpollFlags::WRBAND)
+        .union(EpollFlags::ERR),
+    EpollFlags::PRI,
+];
+
+/// The common part of `select` and `pselect6`: `sets` are the user
+/// read / write / except `fd_set` pointers (0 = none), each
+/// `nfds.div_ceil(64)` 64-bit words as on Linux (`unsigned long` bitmaps).
+/// Returns the number of set bits written back, as Linux.
+fn do_select(
+    nfds: i32,
+    sets: [usize; 3],
+    tmo: Timeout,
+    sigmask: usize,
+    sigsetsize: usize,
+) -> SysResult {
+    if nfds < 0 {
+        return Err(Errno(EINVAL));
+    }
+    // Linux clamps to the descriptor table size.
+    let nfds = (nfds as usize).min(proc::nofile_limit());
+    let nwords = nfds.div_ceil(64);
+    let mut inp: [Vec<u64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (k, &p) in sets.iter().enumerate() {
+        inp[k].resize(nwords, 0);
+        if p != 0 && nwords > 0 {
+            with_space(|s| s.copy_from_user(p, inp[k].as_mut_slice().as_mut_bytes()))?;
+        }
+        // Bits at or above nfds are ignored.
+        if !nfds.is_multiple_of(64) {
+            inp[k][nwords - 1] &= (1u64 << (nfds % 64)) - 1;
+        }
+    }
+    // The descriptors named in any set; one that is not open is EBADF.
+    let mut fds: Vec<(usize, Arc<OpenFile>)> = Vec::new();
+    for fd in 0..nfds {
+        let (w, b) = (fd / 64, 1u64 << (fd % 64));
+        if inp.iter().any(|v| v[w] & b != 0) {
+            fds.push((fd, get(fd as i32).map_err(|_| Errno(EBADF))?));
+        }
+    }
+    let mut out: [Vec<u64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for o in &mut out {
+        o.resize(nwords, 0);
+    }
+    let scan = |out: &mut [Vec<u64>; 3], hook: Option<&Arc<dyn PollHook>>| -> usize {
+        let mut n = 0;
+        for (fd, of) in &fds {
+            let (w, b) = (fd / 64, 1u64 << (fd % 64));
+            let ev = of.file.poll(hook);
+            for k in 0..3 {
+                if inp[k][w] & b != 0 && ev.intersects(SELECT_SETS[k]) {
+                    out[k][w] |= b;
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let r = with_sigmask(sigmask, sigsetsize, || {
+        let mut block = tmo.block;
+        loop {
+            if !block {
+                return Ok(scan(&mut out, None));
+            }
+            let w = PollWaiter::new();
+            let hook: Arc<dyn PollHook> = w.clone();
+            let n = scan(&mut out, Some(&hook));
+            if n > 0 {
+                return Ok(n);
+            }
+            match w.wait(tmo.deadline) {
+                WakeReason::TimedOut => block = false,
+                WakeReason::Interrupted => return Err(Errno(signal::ERESTARTNOHAND)),
+                WakeReason::Woken => {}
+            }
+        }
+    });
+    let n = r?;
+    for (k, &p) in sets.iter().enumerate() {
+        if p != 0 && nwords > 0 {
+            with_space(|s| s.copy_to_user(p, out[k].as_slice().as_bytes()))?;
+        }
+    }
+    Ok(n as isize)
+}
+
+/// Nanoseconds left until `tmo`'s deadline (0 once it has passed).
+fn remaining_ns(tmo: &Timeout) -> u64 {
+    tmo.deadline
+        .map_or(0, |d| d.saturating_sub(timer::now_ns()))
+}
+
+/// `pselect6(nfds, readfds, writefds, exceptfds, tmo_p, sig)`, where
+/// `sig` points at `{ const sigset_t *ss; size_t ss_len; }`. As Linux, the
+/// time left is written back to a non-zero `*tmo_p`, so a restarted call
+/// waits only for the remainder.
+pub fn pselect6(nfds: i32, r: usize, w: usize, e: usize, tmo_p: usize, sig: usize) -> SysResult {
+    let tmo = Timeout::from_timespec(tmo_p)?;
+    let (mask, size) = if sig == 0 {
+        (0, 0)
+    } else {
+        let v: [u64; 2] = with_space(|s| s.read_val(sig))?;
+        (v[0] as usize, v[1] as usize)
+    };
+    let res = do_select(nfds, [r, w, e], tmo, mask, size);
+    if tmo_p != 0 && tmo.block && tmo.deadline.is_some() {
+        let left = Timespec::from_nanos(remaining_ns(&tmo));
+        with_space(|s| s.write_val(tmo_p, &left))?;
+    }
+    res
+}
+
+/// x86_64 `select(nfds, readfds, writefds, exceptfds, struct timeval *)`.
+/// `tv_usec` of a million or more carries into seconds, as Linux; the
+/// time left is written back to a non-zero `*tv`.
+pub fn select(nfds: i32, r: usize, w: usize, e: usize, tv_p: usize) -> SysResult {
+    let tmo = if tv_p == 0 {
+        Timeout {
+            block: true,
+            deadline: None,
+        }
+    } else {
+        let tv: Timeval = with_space(|s| s.read_val(tv_p))?;
+        if tv.tv_sec < 0 || tv.tv_usec < 0 {
+            return Err(Errno(EINVAL));
+        }
+        let ns = (tv.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((tv.tv_usec as u64).saturating_mul(1000));
+        Timeout {
+            block: ns != 0,
+            deadline: Some(timer::now_ns().saturating_add(ns)),
+        }
+    };
+    let res = do_select(nfds, [r, w, e], tmo, 0, 0);
+    if tv_p != 0 && tmo.block {
+        let left = Timeval::from_nanos(remaining_ns(&tmo));
+        with_space(|s| s.write_val(tv_p, &left))?;
+    }
+    res
 }
