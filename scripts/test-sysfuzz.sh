@@ -118,7 +118,9 @@ for arch in "${arches[@]}"; do
   # (a rejected sigreturn frame with a bad stack), i.e. a program death.
   nofatal='!re:^\[patina\] panic|!re:panicked at|!re:^\[patina\] fatal: user |!re:^\[patina\] unhandled'
   # name|cpus|mem|rc spec|expect...|--|args
-  cases=("cases|1|512|0|re:PASS sysfuzz cases \([0-9]+\)|PASS sysfuzz|$nofatal|--|-mode|cases|-skip|${SYSFUZZ_SKIP:-}")
+  skip=
+  [[ -n ${SYSFUZZ_SKIP:-} ]] && skip="|-skip|$SYSFUZZ_SKIP"
+  cases=("cases|1|512|0|re:PASS sysfuzz cases \([0-9]+\)|PASS sysfuzz|$nofatal|--|-mode|cases$skip")
   for s in $seeds; do
     cases+=("fuzz-s$s-1cpu|1|512|0|PASS sysfuzz fuzz|PASS sysfuzz|$nofatal|--|-mode|fuzz|-seed|$s|-iters|$iters|-procs|2")
     cases+=("fuzz-s$s-4cpu|4|512|0|PASS sysfuzz fuzz|PASS sysfuzz|$nofatal|--|-mode|fuzz|-seed|$s|-iters|$iters|-procs|4")
