@@ -7,7 +7,9 @@
 # For each arch the kernel is built once (a build failure skips the arch),
 # then for each PATINA_CPUS in ${PATINA_CPUS_LIST:-1 2 4}:
 #   hello                      scripts/test-hello.sh (no args -> 0, `3 a b` -> 3)
-#   threads, fdtest, pproftest scripts/test-hello.sh --app <name>
+#   threads, smpstress         scripts/test-smp.sh --app <name> --cpus N
+#                              (both get `-cpus N`: GOMAXPROCS/NumCPU must match)
+#   fdtest, pproftest          scripts/test-hello.sh --app <name>
 #   signals / sigstress        scripts/test-signals.sh (signals handler and
 #                              nohandler -self, sigstress, sigstress -procs 2,
 #                              -crash, -breakpoint)
@@ -28,10 +30,11 @@ export PATINA_TIMEOUT=${PATINA_TIMEOUT:-120}
 out=$root/out/test/runtime
 mkdir -p "$out"
 
-# suite name -> command (arch appended)
+# suite name -> command (@N@ = the CPU count; arch appended)
 suites=(
   "hello|scripts/test-hello.sh"
-  "threads|scripts/test-hello.sh --app threads"
+  "threads|scripts/test-smp.sh --app threads --cpus @N@"
+  "smpstress|scripts/test-smp.sh --app smpstress --cpus @N@"
   "fdtest|scripts/test-hello.sh --app fdtest"
   "signals|scripts/test-signals.sh"
   "pproftest|scripts/test-hello.sh --app pproftest"
@@ -51,7 +54,8 @@ for arch in "${arches[@]}"; do
   for n in "${cpus_list[@]}"; do
     for s in "${suites[@]}"; do
       name=${s%%|*}
-      read -r -a cmd <<<"${s#*|}"
+      cmdline=${s#*|}
+      read -r -a cmd <<<"${cmdline//@N@/$n}"
       log=$out/$arch-cpus$n-$name.out
       echo "== $arch PATINA_CPUS=$n $name" >&2
       rc=0
@@ -67,11 +71,15 @@ for arch in "${arches[@]}"; do
         status=${line%% *}
         rest=${line#* }
         # Drop the arch word the sub-scripts include; "case: reason".
-        rest=${rest/$arch/}
+        # test-smp.sh adds "cpus=N run R" and a "(run-qemu exit N)" note.
+        rest=$(sed -E "s/ cpus=[0-9]+ run [0-9]+//" <<<"${rest/$arch/}")
         case_name=$rest detail=
         if [[ $rest == *:* ]]; then
           case_name=${rest%%:*}
           detail=${rest#*:}
+        elif [[ $rest == *" ("* ]]; then
+          case_name=${rest%% (*}
+          detail="(${rest#* (}"
         fi
         case_name=$(sed -E 's/^ +//; s/ +$//' <<<"$case_name")
         detail=$(sed -E 's/^ +//' <<<"$detail")

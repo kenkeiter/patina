@@ -11,8 +11,8 @@
 //     locked thread, periodic 5 ms for 100 ms: >= 5 deliveries,
 //     timer_gettime, timer_getoverrun, and timer_delete stops deliveries;
 //   - CLOCK_THREAD_CPUTIME_ID of a spinning and of a sleeping thread
-//     (values always printed; asserted only with -cputime, which needs real
-//     per-thread CPU accounting).
+//     (spinning >= 100 ms, sleeping < 50 ms over 200 ms; -cputime=false
+//     only prints the values).
 //
 // Prints "PASS pproftest" and exits 0.
 package main
@@ -35,7 +35,7 @@ import (
 	"unsafe"
 )
 
-var checkCPUTime = flag.Bool("cputime", false, "assert per-thread CPU time accounting")
+var checkCPUTime = flag.Bool("cputime", true, "assert per-thread CPU time accounting")
 
 func fail(format string, a ...any) {
 	fmt.Printf("FAIL pproftest: "+format+"\n", a...)
