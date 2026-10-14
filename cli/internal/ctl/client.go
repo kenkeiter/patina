@@ -19,6 +19,10 @@ const (
 	// KindFirecracker is a Firecracker / Cloud Hypervisor vsock Unix socket:
 	// the host sends "CONNECT <port>\n" and expects "OK <hostport>\n".
 	KindFirecracker = "fc-vsock"
+	// KindVZ is an Apple Virtualization.framework vsock device. It has no
+	// host path: only the `patina run` process that owns the VM can reach
+	// it (through Endpoint.Dialer); everyone else goes through the proxy.
+	KindVZ = "vz-vsock"
 )
 
 // Endpoint says how to reach a control channel.
@@ -26,11 +30,18 @@ type Endpoint struct {
 	Kind string `json:"kind"`
 	Path string `json:"path"`
 	Port uint32 `json:"port,omitempty"` // KindFirecracker only; default 4242
+
+	// Dialer, when set, opens the raw NDJSON stream instead of dialing Path
+	// (in-process VMMs such as Apple VZ). Not serialized.
+	Dialer func(timeout time.Duration) (net.Conn, error) `json:"-"`
 }
 
 func (e Endpoint) String() string {
 	if e.Kind == KindFirecracker {
 		return fmt.Sprintf("vsock %s port %d", e.Path, e.port())
+	}
+	if e.Kind == KindVZ {
+		return fmt.Sprintf("vz vsock port %d", e.port())
 	}
 	return "socket " + e.Path
 }
@@ -54,13 +65,22 @@ type Client struct {
 
 // Dial connects to ep, performing the vsock handshake when needed.
 func Dial(ep Endpoint, timeout time.Duration) (*Client, error) {
-	conn, err := net.DialTimeout("unix", ep.Path, timeout)
+	var conn net.Conn
+	var err error
+	switch {
+	case ep.Dialer != nil:
+		conn, err = ep.Dialer(timeout)
+	case ep.Kind == KindVZ:
+		err = errors.New("only reachable from the `patina run` process; use its proxy socket")
+	default:
+		conn, err = net.DialTimeout("unix", ep.Path, timeout)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("control channel %s: %w", ep, err)
 	}
 	c := &Client{conn: conn, r: bufio.NewReader(conn)}
 	switch ep.Kind {
-	case KindStream, "":
+	case KindStream, KindVZ, "":
 	case KindFirecracker:
 		if err := c.handshake(ep.port(), timeout); err != nil {
 			conn.Close()

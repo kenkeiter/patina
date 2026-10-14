@@ -136,9 +136,24 @@ func Run(o Options) (int, error) {
 		evMu    sync.Mutex
 		exitEv  *ctl.Event
 		gotExit = make(chan struct{})
+		hub     *ctl.Hub
+		hubSet  = make(chan struct{}) // closed once hub is assigned
 	)
-	hub, err := ctl.NewHub(filepath.Join(dir, runstate.ProxySocket), mach.Control(), func(e *ctl.Event) {
+	ts, ok := drv.(vmm.TimeSyncer)
+	timeSync := ok && ts.NeedsTimeSync()
+	hub, err = ctl.NewHub(filepath.Join(dir, runstate.ProxySocket), mach.Control(), func(e *ctl.Event) {
 		switch e.Ev {
+		case "ready":
+			// No RTC (Apple VZ): step the guest clock from patina.epoch's
+			// one-second resolution to the host's (design §3.3).
+			if timeSync {
+				go func() {
+					<-hubSet
+					if err := hub.Send(ctl.Time(time.Now())); err != nil {
+						fmt.Fprintf(o.Stderr, "patina: warning: cannot sync guest clock: %v\n", err)
+					}
+				}()
+			}
 		case "exit":
 			evMu.Lock()
 			if exitEv == nil {
@@ -157,6 +172,7 @@ func Run(o Options) (int, error) {
 		mach.Wait()
 		return 0, err
 	}
+	close(hubSet)
 	defer hub.Close()
 	go func() {
 		<-hub.Connected()

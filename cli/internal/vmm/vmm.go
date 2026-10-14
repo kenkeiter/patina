@@ -101,9 +101,7 @@ func init() {
 	register(&QEMU{})
 	// TODO: Firecracker (API socket: boot-source, drives none, vsock with
 	// uds_path -> ctl.KindFirecracker endpoint), Cloud Hypervisor (--api-socket,
-	// --vsock cid=,socket= -> same handshake), Apple VZ (cgo/ObjC shim,
-	// VZVirtioSocketDevice.connect(toPort: 4242), console hvc0).
+	// --vsock cid=,socket= -> same handshake). Apple VZ registers itself (vz.go).
 	register(unimplemented{name: target.Firecracker, console: "ttyS0"})
 	register(unimplemented{name: target.CloudHypervisor, console: "ttyS0"})
-	register(unimplemented{name: target.VZ, console: "hvc0"})
 }
