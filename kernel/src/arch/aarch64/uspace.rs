@@ -37,6 +37,26 @@ use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, frame, phys_to_virt};
 /// Lowest address above user space (47-bit user VA, as on x86_64).
 pub const USER_VA_END: usize = 0x0000_8000_0000_0000;
 
+/// `unmap`/`protect` invalidate with `TLBI ...IS` + `DSB ISH`, which
+/// completes on every CPU of the inner-shareable domain before returning,
+/// so a frame `unmap` returned can be freed at once: no shootdown IPIs.
+pub const NEEDS_SHOOTDOWN: bool = false;
+
+/// Flush this CPU's EL1&0 stage-1 TLB (local only; `IpiKind::TlbFlush` is
+/// never sent on aarch64 but handled for symmetry).
+pub fn flush_tlb_local() {
+    // SAFETY: TLB maintenance only.
+    unsafe {
+        asm!(
+            "dsb nshst",
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            options(nostack, preserves_flags)
+        )
+    };
+}
+
 /// Software bit (ignored by hardware in an invalid descriptor) marking a
 /// PROT_NONE page whose frame is still recorded in the descriptor.
 const SW_PROT_NONE: u64 = 1 << 58;

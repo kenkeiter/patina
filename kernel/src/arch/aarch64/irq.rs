@@ -102,6 +102,7 @@ pub(super) fn handle(tf: &mut TrapFrame, from_user: bool) {
     let ipi = match intid {
         gic::SGI_RESCHEDULE => Some(IpiKind::Reschedule),
         gic::SGI_STOP => Some(IpiKind::Stop),
+        gic::SGI_TLB_FLUSH => Some(IpiKind::TlbFlush),
         _ => None,
     };
     if let Some(kind) = ipi {

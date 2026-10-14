@@ -2,7 +2,7 @@
 //!
 //! Gates (all 64-bit interrupt gates, selector 0x08, so IF is clear on
 //! entry): vectors 0-31 (#BP with DPL 3 so `int3` works from ring 3, #DF on
-//! IST1), the LAPIC timer ([`TIMER_VECTOR`]), the two IPI vectors and spurious
+//! IST1), the LAPIC timer ([`TIMER_VECTOR`]), the three IPI vectors and spurious
 //! ([`SPURIOUS_VECTOR`]) vectors. Every other vector stays not-present
 //! (a stray one raises #NP / #GP, which is dumped or reported).
 //!
@@ -10,8 +10,8 @@
 //! every exception and IRQ:
 //! * timer: EOI, re-arm the one-shot (`timer::on_interrupt`), then
 //!   `trap::timer_tick` when a tick or deadline was due;
-//! * IPIs ([`IPI_RESCHEDULE_VECTOR`], [`IPI_STOP_VECTOR`]): EOI, then
-//!   `trap::ipi`;
+//! * IPIs ([`IPI_RESCHEDULE_VECTOR`], [`IPI_STOP_VECTOR`],
+//!   [`IPI_TLB_FLUSH_VECTOR`]): EOI, then `trap::ipi`;
 //! * spurious: nothing (no EOI);
 //! * any exception from ring 0, and NMI / #DF / #MC from anywhere: fatal
 //!   register dump through `console::panic_write_fmt`, then `panic!`;
@@ -26,7 +26,7 @@ use core::mem::size_of;
 use super::ctx::TrapFrame;
 use super::entry::{
     __isr_ipi, __isr_spurious, __isr_table, __isr_timer, IPI_RESCHEDULE_VECTOR, IPI_STOP_VECTOR,
-    SPURIOUS_VECTOR, TIMER_VECTOR,
+    IPI_TLB_FLUSH_VECTOR, SPURIOUS_VECTOR, TIMER_VECTOR,
 };
 use super::gdt::{IST_DOUBLE_FAULT, KERNEL_CS};
 use super::{cpu, irq, lapic, timer};
@@ -106,6 +106,7 @@ pub(super) fn init() {
         let ipi = &*core::ptr::addr_of!(__isr_ipi);
         idt[IPI_RESCHEDULE_VECTOR as usize] = Gate::interrupt(ipi[0], 0, 0);
         idt[IPI_STOP_VECTOR as usize] = Gate::interrupt(ipi[1], 0, 0);
+        idt[IPI_TLB_FLUSH_VECTOR as usize] = Gate::interrupt(ipi[2], 0, 0);
         load();
     }
 }
@@ -177,7 +178,10 @@ pub(super) extern "C" fn handle_trap(tf: &mut TrapFrame) {
         }
         return;
     }
-    if v == IPI_RESCHEDULE_VECTOR as u64 || v == IPI_STOP_VECTOR as u64 {
+    if v == IPI_RESCHEDULE_VECTOR as u64
+        || v == IPI_STOP_VECTOR as u64
+        || v == IPI_TLB_FLUSH_VECTOR as u64
+    {
         if tf.from_user() {
             tf.fs_base = cpu::read_fs_base();
         }
@@ -185,6 +189,8 @@ pub(super) extern "C" fn handle_trap(tf: &mut TrapFrame) {
         lapic::eoi();
         let kind = if v == IPI_STOP_VECTOR as u64 {
             IpiKind::Stop
+        } else if v == IPI_TLB_FLUSH_VECTOR as u64 {
+            IpiKind::TlbFlush
         } else {
             IpiKind::Reschedule
         };

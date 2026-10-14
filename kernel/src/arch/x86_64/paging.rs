@@ -251,7 +251,8 @@ pub fn map_device(pa: PhysAddr, len: usize) -> VirtAddr {
 }
 
 /// Flush all TLB entries on this CPU, including global ones (CR4.PGE toggle).
-/// Phase 0 is single-CPU; Phase 2 adds shootdown IPIs.
+/// This CPU only: user-space shootdowns are `mm::tlb`; kernel mappings are
+/// only ever added (`map_device`), never removed, so need none.
 pub fn flush_tlb_all() {
     let cr4 = cpu::read_cr4();
     // SAFETY: toggling PGE flushes the TLB; nothing else changes.

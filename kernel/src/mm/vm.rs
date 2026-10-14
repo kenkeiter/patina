@@ -19,6 +19,11 @@
 //! is `mprotect`ed to PROT_NONE keep their frame (contents survive a later
 //! `mprotect` back) via the arch's PROT_NONE entries.
 //!
+//! TLB: every operation that removes or reduces translations collects its
+//! frames in one [`Shootdown`] (`mm::tlb`), which on x86_64 SMP defers the
+//! frees until every CPU flushed (one `TlbFlush` IPI per operation) and
+//! frees at once on aarch64 / with one CPU.
+//!
 //! The kernel never dereferences user virtual addresses (PAN/SMAP): user
 //! memory is reached page by page through the direct map, see the uaccess
 //! methods at the end of this file.
@@ -34,6 +39,7 @@ use patina_abi::zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::arch::paging::MapFlags as PteFlags;
 use crate::arch::uspace::{USER_VA_END, UserTables};
+use crate::mm::tlb::{self, Shootdown};
 use crate::mm::{PAGE_SIZE, PhysAddr, frame, page_align_down, phys_to_virt};
 use crate::trap::Access;
 
@@ -222,26 +228,27 @@ impl AddressSpace {
         self.merge_around(vma.start);
     }
 
-    /// Unmap and free every resident frame in `[start, end)`.
-    fn release_frames(&mut self, start: usize, end: usize) {
+    /// Unmap every resident frame in `[start, end)`, handing the frames to
+    /// `sd` to free once no CPU can reach them.
+    fn release_frames(&mut self, start: usize, end: usize, sd: &mut Shootdown) {
         let pages: Vec<usize> = self.resident.range(start..end).copied().collect();
         for va in pages {
             self.resident.remove(&va);
             if let Some(pa) = self.tables.unmap(va) {
-                frame::free_frames(pa, 0);
+                sd.free_frame(pa);
             }
         }
     }
 
-    /// Remove every VMA (and frame) in `[start, end)`.
-    fn remove_range(&mut self, start: usize, end: usize) {
+    /// Remove every VMA (and frame, via `sd`) in `[start, end)`.
+    fn remove_range(&mut self, start: usize, end: usize, sd: &mut Shootdown) {
         self.split_at(start);
         self.split_at(end);
         let keys: Vec<usize> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
         for k in keys {
             self.vmas.remove(&k);
         }
-        self.release_frames(start, end);
+        self.release_frames(start, end, sd);
     }
 
     /// Highest free gap of `len` bytes below `MMAP_BASE` (top-down, like
@@ -322,7 +329,14 @@ impl AddressSpace {
             let (pa, _) = self.tables.translate(va).ok_or(Errno(EFAULT))?;
             return Ok(pa);
         }
-        let pa = frame::alloc_frames_zeroed(0).ok_or(Errno(ENOMEM))?;
+        let pa = match frame::alloc_frames_zeroed(0) {
+            Some(pa) => pa,
+            None => {
+                // Frames may be waiting for a TLB shootdown to complete.
+                tlb::reclaim();
+                frame::alloc_frames_zeroed(0).ok_or(Errno(ENOMEM))?
+            }
+        };
         if self.tables.map(va, pa, pte_flags(vma.prot)).is_err() {
             frame::free_frames(pa, 0);
             return Err(Errno(ENOMEM));
@@ -416,7 +430,7 @@ impl AddressSpace {
                 if noreplace && !fixed {
                     return Err(Errno(EEXIST));
                 }
-                self.remove_range(addr, addr + len);
+                self.remove_range(addr, addr + len, &mut Shootdown::new());
             }
             addr
         } else {
@@ -451,7 +465,7 @@ impl AddressSpace {
             return Err(Errno(EINVAL));
         }
         let len = page_len(addr, len).ok_or(Errno(EINVAL))?;
-        self.remove_range(addr, addr + len);
+        self.remove_range(addr, addr + len, &mut Shootdown::new());
         Ok(())
     }
 
@@ -475,14 +489,24 @@ impl AddressSpace {
         self.split_at(addr);
         self.split_at(end);
         let keys: Vec<usize> = self.vmas.range(addr..end).map(|(k, _)| *k).collect();
+        // Whether some permission is revoked (other CPUs must then drop
+        // their cached translations; adding permissions needs nothing).
+        let mut reduced = false;
         for k in &keys {
-            self.vmas.get_mut(k).unwrap().prot = prot;
+            let v = self.vmas.get_mut(k).unwrap();
+            reduced |= !prot.contains(v.prot);
+            v.prot = prot;
         }
         let pages: Vec<usize> = self.resident.range(addr..end).copied().collect();
+        let mut sd = Shootdown::new();
+        if reduced && !pages.is_empty() {
+            sd.flush();
+        }
         let f = pte_flags(prot);
         for va in pages {
             self.tables.protect(va, f);
         }
+        drop(sd);
         for k in keys {
             if self.vmas.contains_key(&k) {
                 self.merge_around(k);
@@ -505,7 +529,7 @@ impl AddressSpace {
                 if len == 0 {
                     return Ok(());
                 }
-                self.release_frames(addr, end);
+                self.release_frames(addr, end, &mut Shootdown::new());
                 if !self.is_covered(addr, end) {
                     return Err(Errno(ENOMEM));
                 }
@@ -567,7 +591,7 @@ impl AddressSpace {
             return Err(Errno(EFAULT));
         }
         if new_len <= old_len {
-            self.remove_range(old + new_len, old + old_len);
+            self.remove_range(old + new_len, old + old_len, &mut Shootdown::new());
             return Ok(old);
         }
         // Grow in place?
@@ -592,7 +616,13 @@ impl AddressSpace {
             end: new + new_len,
             ..vma
         });
+        // One shootdown for the whole move: the old translations are flushed
+        // on every CPU (IPI) when `sd` drops at the end of the operation.
+        let mut sd = Shootdown::new();
         let pages: Vec<usize> = self.resident.range(old..old_end).copied().collect();
+        if !pages.is_empty() {
+            sd.flush();
+        }
         for va in pages {
             self.resident.remove(&va);
             let Some((_, f)) = self.tables.translate(va) else {
@@ -603,12 +633,12 @@ impl AddressSpace {
             };
             let nva = new + (va - old);
             if self.tables.map(nva, pa, f).is_err() {
-                frame::free_frames(pa, 0);
+                sd.free_frame(pa);
             } else {
                 self.resident.insert(nva);
             }
         }
-        self.remove_range(old, old_end);
+        self.remove_range(old, old_end, &mut sd);
         Ok(new)
     }
 

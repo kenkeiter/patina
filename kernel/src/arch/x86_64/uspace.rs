@@ -18,6 +18,19 @@ use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, frame, phys_to_virt};
 /// Lowest address above user space (47-bit user VA).
 pub const USER_VA_END: usize = 0x0000_8000_0000_0000;
 
+/// `invlpg` only invalidates the executing CPU's TLB: other CPUs keep
+/// stale user translations until they flush, so a frame unmapped here must
+/// not be reused before every CPU flushed (`mm::tlb` defers its free and
+/// sends `IpiKind::TlbFlush`).
+pub const NEEDS_SHOOTDOWN: bool = true;
+
+/// Flush every user (non-global) TLB entry on this CPU: reload CR3 (no
+/// PCIDs, D34; kernel mappings are global and survive).
+pub fn flush_tlb_local() {
+    // SAFETY: re-loading the live root changes no mapping.
+    unsafe { cpu::write_cr3(cpu::read_cr3()) };
+}
+
 const ENTRIES: usize = 512;
 
 /// Software bit (AVL, ignored by the MMU in a not-present entry) marking a
@@ -116,8 +129,8 @@ impl UserTables {
         Ok(())
     }
 
-    /// Remove the translation for `va` (TLB-invalidated on this CPU);
-    /// returns the frame that was mapped.
+    /// Remove the translation for `va` (TLB-invalidated on this CPU only:
+    /// see [`NEEDS_SHOOTDOWN`]); returns the frame that was mapped.
     pub fn unmap(&mut self, va: usize) -> Option<PhysAddr> {
         let slot = self.pte(va, false).ok()??;
         // SAFETY: a PTE of this address space.
@@ -133,7 +146,8 @@ impl UserTables {
         Some(PhysAddr((e & ADDR_MASK) as usize))
     }
 
-    /// Change the permissions of a mapped page (TLB-invalidated on this CPU).
+    /// Change the permissions of a mapped page (TLB-invalidated on this CPU
+    /// only: see [`NEEDS_SHOOTDOWN`]).
     pub fn protect(&mut self, va: usize, flags: MapFlags) -> bool {
         let Ok(Some(slot)) = self.pte(va, false) else {
             return false;
