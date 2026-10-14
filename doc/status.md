@@ -22,7 +22,7 @@ scripts/test-signals.sh [aarch64] [x86_64]          # 6 signal cases per arch (s
 scripts/test-smp.sh [--app <name>] [--cpus "1 2 4"] [--repeat N] [arch...]
                                                     # app at each vCPU count (default smpstress; smpstress/threads get -cpus N)
 scripts/test-runtime.sh [aarch64] [x86_64]          # Phase 2 umbrella: hello, threads, smpstress, fdtest, signals, pproftest per CPU count
-scripts/test-hello.sh --app fileio [arch...]        # Phase 3 VFS/devfs/procfs/FIFO/os.Root coverage (48 checks)
+scripts/test-hello.sh --app fileio [arch...]        # Phase 3 VFS/devfs/procfs/FIFO/os.Root coverage (48 checks; 50 on x86_64)
 scripts/test-ctl.sh [aarch64] [x86_64]              # Phase 3 control channel over the patina.ctl port: 8 cases per arch
 scripts/test-os.sh [aarch64] [x86_64]               # Go's own `os` package tests under patina with testapps/skiplist/os.txt
 scripts/test-hello.sh --app sockets|unixsock [arch...] # Phase 4 AF_INET/AF_INET6 and AF_UNIX socket coverage over loopback
@@ -30,13 +30,18 @@ scripts/test-net.sh [aarch64] [x86_64]              # Phase 4 Milestone A on QEM
 scripts/test-gonet.sh [--pkg net/http] [arch...]    # Go's own `net` (or net/http) package tests with testapps/skiplist/net.txt
 scripts/test-gopkg.sh <pkg>... [--arch aarch64|x86_64|both] [--cpus N] [--run RE] [--no-short] [--mem MiB]
                                                     # Milestone B: any Go std package's tests with testapps/skiplist/<pkg>.txt (D74); test-os.sh/test-gonet.sh wrap it
+                                                    # x86_64 (TCG) is slow: raise PATINA_TIMEOUT / GOPKG_TEST_TIMEOUT when the host is busy
 scripts/bench.sh [arch...] [--cpus 1,2] [--runs 3] [--novdso] [-n F] [--only L]
                                                     # Phase 5 per-syscall benchmarks (testapps/bench): table of medians per arch (D79)
+scripts/test-robust.sh [aarch64] [x86_64]           # Phase 5 robustness (testapps/robust): tickless idle, sub-tick timers, fault -> signal,
+                                                    # stack/page-table reclaim, OOM, signal/fd edge cases; 12 cases per arch (D77, D78, D80)
+scripts/run-qemu.sh <arch> <cpio> -- patina.stats=1 -- <args>
+                                                    # per-CPU timer IRQs / ticks / idle waits / switches + memory line at exit
 GO=go1.26.9 scripts/build-testapp.sh <name> <arch> <out>  # build a testapp with another Go toolchain (default GO=go)
 PATINA_NET=user scripts/run-qemu.sh <arch> -- patina.selftest=net   # virtio-net driver self-test (ARP against slirp)
 cargo test --workspace --exclude patina-kernel      # host tests
 scripts/test-vz.sh                                  # Milestone A on Apple VZ (patina run --vmm vz): hello, ctl, stop modes, NAT serve, Phase 2-4 subset
-PATINA_VMM=vz <any of the above aarch64 runs>       # the same kernel + initrd under Apple VZ via scripts/run-vz.sh (D81)
+PATINA_VMM=vz <any of the above aarch64 runs>       # the same kernel + initrd under Apple VZ via scripts/run-vz.sh (D84)
 cli/scripts/vztest.sh [--e2e]                       # in-process VZ driver tests; --e2e = TestVZE2E (hello, ctl, --net user HTTP)
 ```
 
@@ -169,7 +174,7 @@ booted) · `—` not applicable.
 | Firecracker x86_64 | U | U | U i8042 reset (last in the D64 order) | U | U (MP table / MADT) | U `virtio_mmio.device=` cmdline entries, DSDT, vsock |
 | Cloud Hypervisor aarch64 | U | U PL011 | U PSCI | U | U | U virtio-pci (D70): DTB ECAM bus 0, MSI-X only via the GICv3 ITS (KVM, 64 KiB ITS pages) or GICv2m (MSHV) |
 | Cloud Hypervisor x86_64 | U | U | U ACPI S5 at port 0x600 (D64) | U | U | U virtio-pci (D70): MCFG ECAM 0xe8000000 bus 0, MSI-X, 64-bit BARs above RAM |
-| Apple VZ aarch64 (`patina run --vmm vz`, macOS 26) | V **vz-hello** (RAM base 0x7000_0000, unaligned initrd, DTB) | V `hvc0` = virtio-console port 0 over virtio-pci INTx, early ring replayed (**vz-hello**, **test-vz**; D80 sacrificial buffer) | V PSCI HVC (**vz-hello**) | V **vz-hello** | V **vz-runtime** (1/2/4 vCPUs), `selftest=smp` (**vz-timing**) | V ECAM DTB discovery, BAR assignment, INTx auto-selected (no ITS/v2m), rng, **vsock 4242** control channel (**test-vz**, **vz-ctl**), virtio-net-pci + VZ NAT DHCP (**test-vz**, **vz-e2e**) |
+| Apple VZ aarch64 (`patina run --vmm vz`, macOS 26) | V **vz-hello** (RAM base 0x7000_0000, unaligned initrd, DTB) | V `hvc0` = virtio-console port 0 over virtio-pci INTx, early ring replayed (**vz-hello**, **test-vz**; D83 sacrificial buffer) | V PSCI HVC (**vz-hello**) | V **vz-hello** | V **vz-runtime** (1/2/4 vCPUs), `selftest=smp` (**vz-timing**) | V ECAM DTB discovery, BAR assignment, INTx auto-selected (no ITS/v2m), rng, **vsock 4242** control channel (**test-vz**, **vz-ctl**), virtio-net-pci + VZ NAT DHCP (**test-vz**, **vz-e2e**) |
 
 ## Phase 1 — Hello
 
@@ -252,8 +257,8 @@ Runtime and scheduling:
 - [x] `sched_getaffinity` reports all vCPUs → `GOMAXPROCS` = `NumCPU` = vCPUs — **test-smp**, **threads-smp** (`GOMAXPROCS=4 NumCPU=4`)
 - [x] Per-thread CPU time (`Thread::cpu_time_ns`, `CLOCK_THREAD_CPUTIME_ID`, the process CPU clock) — **pproftest** (spinning thread +198.9–200.0 ms, sleeping thread +3.6–104 µs over 200 ms)
 - [x] x86_64 SMP memory safety: TLB shootdown IPIs with deferred frame reclaim (D52, `mm/tlb.rs`) — **tlbstress** (reproduced the stale-TLB free-list corruption before the fix, 8/8 after), **test-runtime**; aarch64 user-page invalidation broadcasts (`tlbi vale1is`) and needs no shootdown. Limits: a stopped CPU never advances its generation (pending batches stay pending after exit), remote flushes complete asynchronously (mprotect/munmap return before other CPUs flush)
-- [~] More than 4 vCPUs under the scheduler — untested (the arch self-tests ran 8 CPUs)
-- [~] Tickless idle — not implemented: idle CPUs keep the 100 Hz tick
+- [x] More than 4 vCPUs under the scheduler: Go's `runtime` tests at 8 vCPUs, 0 failed (aarch64 3 identical runs, x86_64 one run; also `sync`, `os/signal`, `runtime/pprof` at 8 on aarch64) — **test-gopkg-8cpu** (Phase 5); also **robust-8cpu** (`test-smp.sh --cpus 8` smpstress / threads / sigstress on both arches, `test-signals.sh aarch64` and `test-robust.sh aarch64` at `PATINA_CPUS=8`)
+- [x] Tickless idle: idle CPUs stop the periodic tick and arm only the deadlines they own (D77) — **test-robust** `idle` (0–42 timer IRQs per CPU over a ~7 s mostly idle run at 4 and 8 vCPUs, ~700 with a 100 Hz tick)
 
 Signals (D42–D45):
 
@@ -261,20 +266,21 @@ Signals (D42–D45):
 - [x] `kill` (process) and `tgkill`/`tkill` (thread); Go's `SIGURG` async preemption — **test-signals**, **threads-p2**
 - [x] Linux `rt_sigframe` + `rt_sigreturn` on x86_64 (XSAVE fpstate) and aarch64 (`fpsimd_context`, kernel-mapped `rt_sigreturn` trampoline since Go sets no `SA_RESTORER`) — **test-signals** (1528 `rt_sigreturn` round trips, Go reading `siginfo`/`ucontext` for its crash line)
 - [x] Go's `SA_ONSTACK` handlers on its per-M `sigaltstack` — **test-signals**
-- [~] `sigaltstack` edge cases: `EPERM` while on the stack, `SS_AUTODISARM`, `ENOMEM` — implemented, untested
+- [~] `sigaltstack` edge cases: `ENOMEM` below `MINSIGSTKSZ`, `EINVAL` for bad flags, `SS_AUTODISARM` accepted and read back — **test-robust** `default`; `EPERM` while on the stack and the auto-disarm on delivery need a handler of our own (not reachable from Go): untested
 - [x] `SIG_DFL` termination: `[patina] exit signal NAME`, exit 128+signo — **test-signals** (`SIGTERM`, 143)
-- [~] `SIGKILL` (always terminates, 137) — implemented, untested
+- [x] `SIGKILL` (always terminates, 137) — **test-robust** `sigkill` (`kill(getpid(), SIGKILL)` → `[patina] exit signal SIGKILL`, 137) and `oomfault`
 - [x] Fault → `SIGSEGV` `SEGV_MAPERR` (nil dereference, both arches) — **test-signals** (recovered ×200; `-crash`: `code=0x1 addr=0x0`, exit 2)
 - [x] x86 `#DE` → `SIGFPE` `FPE_INTDIV` — **test-signals** (x86_64; arm64 does not trap, Go checks explicitly)
 - [x] `BRK` / `int3` → `SIGTRAP` — **test-signals** (`-breakpoint`: `SIGTRAP: trace trap`, exit 2 on both arches; D43)
-- [~] `SIGBUS` (`BUS_ADRALN`), `SIGILL` (`#UD` / undefined instruction), `#GP` → `SIGSEGV` `SI_KERNEL`, `SEGV_ACCERR`, `FPE_FLTINV` — implemented, untested
+- [x] `SIGBUS` `BUS_ADRALN` (aarch64 unaligned `LDAXR` crossing a 16-byte granule: `[signal SIGBUS: bus error code=0x1 addr=<the address> pc=…]`; HVF tolerates unaligned exclusives inside a granule), `SIGILL` (`UDF #0` → `sigcode=1`, `UD2` → `sigcode=2`), x86 `#GP` → `SIGSEGV` `SI_KERNEL` (non-canonical load: `code=0x80 addr=0x0`), `SEGV_ACCERR` (store to `PROT_READ`: `code=0x2`, `addr` = the address) — **test-robust** `sigbus`, `sigill`, `gp`, `accerr` (decoding matches arm64 `fault_info` / x86 `traps.c`)
+- [~] `FPE_FLTINV`: QEMU TCG raises no `#XM` for unmasked SSE exceptions (robust prints `skip`), arm64 FP traps are not implemented by the hardware here — unverifiable on this host
 - [x] Syscall restart: `ERESTARTSYS` under `SA_RESTART` (blocking pipe read) — **test-signals** (strace `read = -errno 512` ×7, then success)
 - [x] `nanosleep` → `EINTR` with `rem` when a handler runs (`ERESTART_RESTARTBLOCK`) — **test-signals** (`nanosleep interrupted after 81ms, rem 4.92s`)
-- [~] `restart_syscall` continuation when no handler runs (ignored/`SIG_DFL`-ignore signal during a sleep) — implemented, untested
-- [~] `rt_sigsuspend`, x86 `pause`, `rt_sigpending` — implemented, untested
-- [~] `epoll_pwait` `EINTR`; the temporary-sigmask (`saved_mask`) path of `epoll_pwait`/`ppoll` — implemented, untested
-- [~] `SIGPIPE` to the writer on `EPIPE` — implemented; **fdtest** `ok EPIPE` exercises the `EPIPE` return but does not check the signal
-- [~] x86_64 FXSAVE-only frames (CPU without XSAVE) — implemented, untested (**selftest-smp-x86** ran `-xsave` but no signals)
+- [x] `restart_syscall` continuation when no handler runs — **test-robust** `restart` (a 200 ms `nanosleep` woken by SIGUSR1 whose disposition became `SIG_IGN` before delivery: strace `nanosleep = -errno 516`, `restart_syscall = 0`, 205–208 ms in total; an ignored SIGUSR1 is dropped at send, as Linux)
+- [x] `rt_sigsuspend` (EINTR after the handler), x86 `pause`, `rt_sigpending` (a blocked timer signal shows up) — **test-robust** `default`
+- [x] `epoll_pwait` `EINTR` (not restarted under Go's `SA_RESTART`) and its temporary sigmask (a blocked SIGUSR2 waits out the timeout, delivered afterwards) — **test-robust** `default`; the `ppoll` sigmask path shares `set_temp_mask` but is not exercised
+- [x] `SIGPIPE` to the writer on `EPIPE` (pipe on fd ≥ 3, `signal.Notify(SIGPIPE)` receives it) and `SIG_DFL` SIGPIPE → 141 — **test-robust** `default`, `sigpipe`
+- [x] x86_64 FXSAVE-only frames — **fxsave-only**: `test-signals.sh x86_64` and `test-smp.sh --app smpstress --cpus 2 x86_64` with `PATINA_QEMU_EXTRA="-cpu max,-xsave"` and with `-cpu Nehalem` (no XSAVE/AVX/FSGSBASE/SMEP/SMAP: `fp state fxsave (512 bytes)`), robust `default`/`gp`/`sigill` on Nehalem; nothing needed fixing
 - [ ] `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo` — `ENOSYS` by design (D42)
 
 File descriptors (D46; design §8 had these in Phase 3, the netpoller needs them now):
@@ -285,8 +291,8 @@ File descriptors (D46; design §8 had these in Phase 3, the netpoller needs them
 - [x] epoll: `epoll_create1`/`epoll_ctl`/`epoll_pwait`, LT, ET, `ONESHOT` + `MOD`, timeouts, HUP/ERR, auto-removal on close; Go's netpoller — **fdtest**, **threads-p2**
 - [x] `ppoll` — **fdtest**
 - [x] `fstat` on pipes (`S_IFIFO`) — **fdtest**
-- [~] `readv`/`writev`, `pread64`/`pwrite64`/`lseek` (`ESPIPE`), `epoll_pwait2`, `FIONBIO`/`FIONREAD`/`FIOCLEX`/`FIONCLEX` — implemented, untested
-- [~] x86_64-only entry points `poll`, `epoll_wait`, `epoll_create`, `dup2`, `pipe`, `eventfd` — implemented, not exercised by any test
+- [x] `readv`/`writev`, `pread64`/`pwrite64`/`lseek` (`ESPIPE` on pipes; offsets on a file), `epoll_pwait2`, `FIONBIO`/`FIONREAD`/`FIOCLEX`/`FIONCLEX` — **test-robust** `default`
+- [x] x86_64-only entry points `poll`, `epoll_wait`, `epoll_create` (+ `EINVAL` for 0), `dup2` (incl. onto itself), `pipe`, `eventfd` — **test-robust** `default` (x86_64)
 
 SMP and timers (arch layer, D47/D48):
 
@@ -297,7 +303,7 @@ SMP and timers (arch layer, D47/D48):
 - [x] Sub-tick deadlines: the sleep list arms the per-CPU one-shot timer (`sched::arm_deadline`); sleeps and timeouts are never early (D50) — **sleep-latency** (200 × `Sleep(500µs)` 2.001 s → 248 ms), **test-smp**
 - [x] `setitimer`/`getitimer`, `timer_create`/`settime`/`gettime`/`getoverrun`/`delete` (`SIGEV_THREAD_ID`, `SI_TIMER` / `SI_KERNEL`), CPU-clock timers (D51) — **pproftest** (SIGALRM after 21–31 ms, 10–17 SIGUSR1 per 100 ms from a 5 ms timer, Go's per-M `timer_create(0x3, …)` in strace)
 - [x] pprof CPU profiles (Go's per-M `CLOCK_THREAD_CPUTIME_ID` SIGPROF timers and `ITIMER_PROF`) — **pproftest** (94–200 samples per run at 100 Hz)
-- [~] `alarm`, `getrusage`, `times`, `clock_nanosleep` on CPU clocks (`EINVAL`/`ENOTSUP`), `TIMER_ABSTIME`, `ITIMER_VIRTUAL`, overrun accounting under load — implemented, untested
+- [x] `alarm` (x86_64; Linux rounding), `getrusage` (self and thread grow by the spin), `times`, `clock_nanosleep` `TIMER_ABSTIME` on `MONOTONIC` and `REALTIME` (never early, sub-tick on average), on the thread CPU clock (`EINVAL`), `ITIMER_VIRTUAL`, sub-tick `timer_settime`/`setitimer(ITIMER_REAL)` (D77), overrun accounting (fixed in D77: it read ≤ 1) — **test-robust** `default`; the process-CPU-clock `ENOTSUP` is untested
 - [x] `getrandom`/`AT_RANDOM` seeded from `cpu::hw_random` (RNDR / RDSEED / RDRAND), logged as `[patina] random: seeded from …` (D50) — every **test-smp** log shows the line; HVF on this host has no RNDR, only TCG `-cpu max` does. Since Phase 3 the generator is a ChaCha20 DRBG seeded from virtio-rng as well (D60, **rng-seed**)
 - [~] x2APIC IPIs, APIC ids > 254, > 8 CPUs, PSCI SMC on real firmware — implemented, untested
 - [~] Firecracker x86_64 + aarch64, KVM / Cloud Hypervisor: SMP and scheduler code written to the spec, never booted (needs a KVM host)
@@ -342,10 +348,10 @@ Devices and control channel (D58–D64):
 - [x] IRQ routing: GIC SPIs on aarch64; x86_64 I/O APIC (MADT, level/edge from the DSDT) with LAPIC EOI, device IRQs on CPU 0 — **test-ctl** at `PATINA_CPUS=2`, **selftests-p3**
 - [x] virtio-rng feeding a ChaCha20 DRBG (BLAKE2s entropy pool, periodic reseed; `getrandom`, `AT_RANDOM`, `/dev/urandom`) — **rng-seed**, host tests (RFC 8439/7693 vectors)
 - [x] virtio-console multiport: `patina.ctl` found by name through the control-queue handshake, PORT_OPEN tracked; port 0 as `hvc0` console with an early ring flushed when the device comes up — **test-ctl**, **hvc0**
-- [x] virtio-vsock listener on port 4242 (D62): first run on Apple VZ (Phase 5): CONNECT handshake, `ready`/`exit`/`log`/`pong` events, stop/signal/dump/time ops, reconnects — **test-vz**, **vz-ctl**, **vz-e2e** (no driver bug surfaced; the ctl misses on fast programs were the CLI's 100 ms dial, D82). Firecracker/Cloud Hypervisor's vsock-over-Unix-socket path remains unverified
+- [x] virtio-vsock listener on port 4242 (D62): first run on Apple VZ (Phase 5): CONNECT handshake, `ready`/`exit`/`log`/`pong` events, stop/signal/dump/time ops, reconnects — **test-vz**, **vz-ctl**, **vz-e2e** (no driver bug surfaced; the ctl misses on fast programs were the CLI's 100 ms dial, D85). Firecracker/Cloud Hypervisor's vsock-over-Unix-socket path remains unverified
 - [x] Control channel (D63): one kernel thread; `ping`→`pong(uptime_ms)`, `signal` (SIGTERM INT HUP USR1 USR2 QUIT), `stop` (SIGTERM + grace → forced 137), `time` (steps `CLOCK_REALTIME`, VFS timestamps follow), `dump` (SIGQUIT); events `ready` (go version from `.go.buildinfo`, cpus, mem_mb), `exit` (code, signal, forced; flushed before poweroff), `panic`, `log` (ENOSYS); pending buffer until a host connects; one connection at a time — **test-ctl**
 - [x] x86_64 poweroff order isa-debug-exit → ACPI S5 (hardware-reduced sleep control register, else PM1a) → i8042 reset (D64) — **poweroff-order** (QEMU paths); Cloud Hypervisor S5 at port 0x600 and Firecracker i8042 untested
-- [~] Firecracker (cmdline discovery, 16550 MMIO, i8042), Cloud Hypervisor (virtio-pci: Phase 4): code written to the spec, no host to run them. Apple VZ (`hvc0`, vsock, virtio-pci INTx): verified in Phase 5 (**test-vz**, D80–D82)
+- [~] Firecracker (cmdline discovery, 16550 MMIO, i8042), Cloud Hypervisor (virtio-pci: Phase 4): code written to the spec, no host to run them. Apple VZ (`hvc0`, vsock, virtio-pci INTx): verified in Phase 5 (**test-vz**, D83–D85)
 
 CLI and `os` tests:
 
@@ -393,33 +399,64 @@ CLI and Milestone A:
 
 - [x] CLI `build` / `run` / `ctl` with `--net user --publish` on QEMU, both arches — **test-net**, **test-cli** (Phase 3)
 - [x] **Milestone A on QEMU**, both arches: `net/http` hello served to host `curl` through `patina run --net user --publish`, concurrent requests and a 4 MiB body, `patina ctl stop` → clean `{"ev":"exit","code":0}` (signal.Notify variant) and 143 + `SIGTERM` (no-handler variant), `-selftest` over loopback with DNS through slirp, DHCP and the q35/PCI variant — **test-net**
-- [x] **Milestone A on Apple VZ** (Phase 5, D80–D82): `net/http` hello served to host `curl` at the guest's VZ NAT address (DHCP, no port forwarding), concurrent requests, 4 MiB body, DNS through the NAT resolver, `patina ctl stop` → clean `{"ev":"exit","code":0}` and 143 + `SIGTERM`, vsock control channel — **test-vz**, **vz-e2e** (see Phase 5)
+- [x] **Milestone A on Apple VZ** (Phase 5, D83–D85): `net/http` hello served to host `curl` at the guest's VZ NAT address (DHCP, no port forwarding), concurrent requests, 4 MiB body, DNS through the NAT resolver, `patina ctl stop` → clean `{"ev":"exit","code":0}` and 143 + `SIGTERM`, vsock control channel — **test-vz**, **vz-e2e** (see Phase 5)
 - [ ] Milestone A on Firecracker and Cloud Hypervisor (both arches): the CLI drivers exist (Phase 3, tested against fakes) and the kernel paths are written to doc/cli-contract.md (virtio-mmio + vsock on Firecracker; virtio-pci/MSI-X + vsock on Cloud Hypervisor), but neither has booted here (no KVM on this host). Specifically unverified: vsock over the VMM's Unix socket (the driver itself now runs on VZ), Cloud Hypervisor's ITS with 64 KiB table pages and 64-bit BARs, Firecracker's `virtio_mmio.device=` net device, tap DHCP against a real server
 
 ## Phase 5 — Hardening
 
 Milestone B (D74): Go 1.27.1 `go test -c` binaries, `-test.short`, aarch64
-= QEMU `virt` HVF, release kernel. Command for every row:
-`scripts/test-gopkg.sh <pkg> --arch aarch64 [--cpus 4]` (logs in
-`out/test/gopkg/`). Counts are top-level tests: passed / skipped (of which
-by our skip list) / failed.
+= QEMU `virt` HVF, x86_64 = QEMU `microvm` TCG, release kernel. Command for
+every cell: `scripts/test-gopkg.sh <pkg> --arch <arch> [--cpus N]` (logs in
+`out/test/gopkg/`; the x86_64 and 8-vCPU runs used `GOPKG_NO_KERNEL_BUILD=1
+PATINA_TIMEOUT=3600..7200 GOPKG_TEST_TIMEOUT=55m..115m` because the host was
+shared with other QEMU runs). Counts are top-level tests: passed / skipped
+(of which by our skip list) / failed. "—" = not run (not in the plan).
 
-| Name | Package | aarch64, 1 vCPU | aarch64, 4 vCPUs |
+| Name | Package | aarch64, 1 vCPU | aarch64, 4 vCPUs | x86_64, 1 vCPU | x86_64, 4 vCPUs |
+|---|---|---|---|---|---|
+| **test-gopkg** | `runtime` | 378 / 148 (11) / 0 | 385 / 141 (11) / 0 (3 runs identical; `--no-short`, 2 GiB: 399 passed, 1 failed — `TestPanicSystemstack`, needs exec, since listed) | 379 / 150 (11) / 0 | 386 / 143 (11) / 0 |
+| **test-gopkg** | `os` | 248 / 33 (10) / 0 | 248 / 33 (10) / 0 | 248 / 33 (10) / 0 | 248 / 33 (10) / 0 |
+| **test-gopkg** | `net` | 254 / 55 (1) / 0 | 254 / 55 (1) / 0 | 254 / 55 (1) / 0 | 254 / 55 (1) / 0 |
+| **test-gopkg** | `os/signal` | 18 / 3 (2) / 0 | 18 / 3 (2) / 0 | 18 / 3 (2) / 0 | 18 / 3 (2) / 0 |
+| **test-gopkg** | `time` | 180 / 4 (0) / 0 | 180 / 4 (0) / 0 | 180 / 4 (0) / 0 | — |
+| **test-gopkg** | `sync` | 51 / 2 (2) / 0 | 51 / 2 (2) / 0 | 51 / 2 (2) / 0 | — |
+| **test-gopkg** | `syscall` | 25 / 28 (10) / 0 | 25 / 28 (10) / 0 | 25 / 28 (10) / 0 | 25 / 28 (10) / 0 |
+| **test-gopkg** | `io` | 72 / 0 / 0 | 72 / 0 / 0 | 72 / 0 / 0 | — |
+| **test-gopkg** | `bufio` | 88 / 0 / 0 | 88 / 0 / 0 | 88 / 0 / 0 | — |
+| **test-gopkg** | `context` | 46 / 0 / 0 | 46 / 0 / 0 | 46 / 0 / 0 | — |
+| **test-gopkg** | `net/http` | 612 / 9 (0) / 0 | 611 / 10 (0) / 0 (before the go.mod change) | 612 / 9 (0) / 0 | — |
+| **test-gopkg** | `runtime/pprof` | 44 / 3 (0) / 0 | 44 / 3 (0) / 0 | 46 / 1 (0) / 0 | — |
+| **test-gopkg** | `os/user` | 12 / 0 / 0 | 12 / 0 / 0 | 12 / 0 / 0 | — |
+
+8 vCPUs (`--cpus 8`; QEMU `-smp 8`):
+
+| Name | Package | aarch64, 8 vCPUs | x86_64, 8 vCPUs |
 |---|---|---|---|
-| **test-gopkg** | `runtime` | 378 / 148 (11) / 0 | 385 / 141 (11) / 0 (3 runs identical; `--no-short`, 2 GiB: 399 passed, 1 failed — `TestPanicSystemstack`, needs exec, since listed) |
-| **test-gopkg** | `os` | 248 / 33 (10) / 0 | 248 / 33 (10) / 0 |
-| **test-gopkg** | `net` | 254 / 55 (1) / 0 | 254 / 55 (1) / 0 |
-| **test-gopkg** | `os/signal` | 18 / 3 (2) / 0 | 18 / 3 (2) / 0 |
-| **test-gopkg** | `time` | 180 / 4 (0) / 0 | 180 / 4 (0) / 0 |
-| **test-gopkg** | `sync` | 51 / 2 (2) / 0 | 51 / 2 (2) / 0 |
-| **test-gopkg** | `syscall` | 25 / 28 (10) / 0 | 25 / 28 (10) / 0 |
-| **test-gopkg** | `io` | 72 / 0 / 0 | 72 / 0 / 0 |
-| **test-gopkg** | `bufio` | 88 / 0 / 0 | 88 / 0 / 0 |
-| **test-gopkg** | `context` | 46 / 0 / 0 | 46 / 0 / 0 |
-| **test-gopkg** | `net/http` | 612 / 9 (0) / 0 | 611 / 10 (0) / 0 (before the go.mod change) |
-| **test-gopkg** | `runtime/pprof` | 44 / 3 (0) / 0 | 44 / 3 (0) / 0 |
-| **test-gopkg** | `os/user` | 12 / 0 / 0 | 12 / 0 / 0 |
-| **test-gopkg-x86** | `runtime`, x86_64 (microvm, TCG), 1 vCPU | 379 / 150 (11) / 0 | not run |
+| **test-gopkg-8cpu** | `runtime` | 385 / 141 (11) / 0, 3 runs with identical pass/skip sets; `--no-short --mem 4096`: 399 / 127 (11) / 0 (with the default 2 GiB `--no-short` ran the guest out of memory, see below) | 386 / 143 (11) / 0, 2 runs (before and after the select/utime commits) |
+| **test-gopkg-8cpu** | `sync` | 51 / 2 (2) / 0 | — |
+| **test-gopkg-8cpu** | `os/signal` | 18 / 3 (2) / 0 | — |
+| **test-gopkg-8cpu** | `runtime/pprof` | 46 / 1 (0) / 0 | — |
+
+No x86_64-only failure and no 8-vCPU failure: no skip-list entry was
+added, and the x86_64 legacy paths, XSAVE frames under preemption and the
+D52 shootdown held at 8 vCPUs. `runtime/pprof` now reports 46 passed / 1
+skipped (`TestMapping`) on both arches; an aarch64 1-vCPU re-run on this
+branch gives the same, so the 44 / 3 cells above are older numbers, not a
+difference between arches. `runtime
+--no-short` at 8 vCPUs with 2 GiB: about 20 parallel tests (`TestGcPacer`,
+the `TestSmhasher*` set, large `TestMemmove*`) exhausted guest RAM
+(`[patina] out of memory filling user page`, then Go's `fatal error:
+unexpected signal` — the OOM-to-signal path, not a crash in our code); with
+4 GiB it passes and exits with 3.8 GiB free, so this is capacity, not a
+leak. The `-short` default needs well under 2 GiB at 8 vCPUs.
+
+Regression on the tree with the `select`/`utime`/`time` commits:
+`scripts/test-gopkg.sh syscall os/signal --arch aarch64` (0 failed, counts
+as above), `scripts/test-signals.sh aarch64 x86_64` (12/12),
+`PATINA_CPUS_LIST="1 4" scripts/test-runtime.sh x86_64` (`all passed`,
+22 rows), `scripts/test-hello.sh --app fdtest|fileio aarch64 x86_64`,
+x86_64 `syscall` and `os` at 1 vCPU and `runtime` at 8 vCPUs (counts as
+above), host tests, clippy both targets 0 warnings.
 
 `ENOSYS` lines across all runs: `pidfd_open` (D57; Go's os/exec probe, falls
 back) and `clone3` (syscall tests that ask for a namespace or pidfd; Go
@@ -430,21 +467,21 @@ change (time then had 179 passed, 5 skipped).
 ### Apple Virtualization.framework (`patina run --vmm vz`)
 
 macOS 26 on Apple Silicon, the ad-hoc signed CLI (`cli/scripts/build.sh`),
-release kernel, 2 vCPUs / 512 MiB unless noted. Decisions D80 (the VZ
-console start quirk, `VIRTIO_NET_F_MTU`), D81 (`PATINA_VMM=vz`,
-`patina image pack`, timing check), D82 (NAT networking, guest address,
+release kernel, 2 vCPUs / 512 MiB unless noted. Decisions D83 (the VZ
+console start quirk, `VIRTIO_NET_F_MTU`), D84 (`PATINA_VMM=vz`,
+`patina image pack`, timing check), D85 (NAT networking, guest address,
 gateway ARP, NIC tx backpressure, fast control attach). The full VZ
 device layout is in doc/cli-contract.md.
 
 | Name | Command | Observed |
 |---|---|---|
-| **vz-hello** | `patina run out/vz/hello.patina --vmm vz -v -- 3 a b` (`patina build --target vz-aarch64`) | boot log on hvc0 from `[patina] early: final page tables live` on (RAM 0x7000_0000, initrd right after the image, DTB at 0x7040_0000), `gic: v3 dist @ 0x10000000, redist @ 0x10010000`, `virtio: pci 0000:00:05.0 irq 69 device-id 3 (console) [ecam dtb, modern virtio-pci, vendor 0x1af4, apple host, intx irq]` (+ 06.0 vsock irq 70, 07.0 rng irq 71, 01.0 net irq 65 with `--net user`), `virtio-console: single port, ports: 0(console)`, `console: hvc0 (virtio-console port 0)`, `virtio-vsock: guest cid 3`, `ctl: virtio-vsock port 4242`, `random: seeded from virtio-rng (64 bytes)`, `patina: control channel attached (vz vsock port 4242)`, `control: ready: go1.27.1, 2 cpus, 512 MiB`, `PASS hello (exit 3)`, `control: exit code 3`, `[patina] exit code 3`, `vz: guest stopped the VM`; `patina run` exit 3. 40/40 runs attach the channel and deliver `ready` + `exit`, ~125–185 ms wall; 200 + 40 consecutive runs with 0 silent boots after D80 (before: ~15% printed nothing) |
+| **vz-hello** | `patina run out/vz/hello.patina --vmm vz -v -- 3 a b` (`patina build --target vz-aarch64`) | boot log on hvc0 from `[patina] early: final page tables live` on (RAM 0x7000_0000, initrd right after the image, DTB at 0x7040_0000), `gic: v3 dist @ 0x10000000, redist @ 0x10010000`, `virtio: pci 0000:00:05.0 irq 69 device-id 3 (console) [ecam dtb, modern virtio-pci, vendor 0x1af4, apple host, intx irq]` (+ 06.0 vsock irq 70, 07.0 rng irq 71, 01.0 net irq 65 with `--net user`), `virtio-console: single port, ports: 0(console)`, `console: hvc0 (virtio-console port 0)`, `virtio-vsock: guest cid 3`, `ctl: virtio-vsock port 4242`, `random: seeded from virtio-rng (64 bytes)`, `patina: control channel attached (vz vsock port 4242)`, `control: ready: go1.27.1, 2 cpus, 512 MiB`, `PASS hello (exit 3)`, `control: exit code 3`, `[patina] exit code 3`, `vz: guest stopped the VM`; `patina run` exit 3. 40/40 runs attach the channel and deliver `ready` + `exit`, ~125–185 ms wall; 200 + 40 consecutive runs with 0 silent boots after D83 (before: ~15% printed nothing) |
 | **vz-ctl** | `PATINA_VMM=vz scripts/test-ctl.sh aarch64` | 8/8 (ready-ping, stop-handler, stop-nohandler, stop-forced, dump, usr1-time, hvc0 — `[patina] ctl: virtio-vsock port 4242` —, panic → 255); the early `log` event is checked on serial only (a late proxy client gets just `ready`) |
 | **test-vz** | `scripts/test-vz.sh` | 12/12 PASS: hello-exit (3), console (banner + sentinel), ctl (ping/pong, SIGUSR1, `time`, fixed-epoch time op → `9466848xx`), ctl-dump (goroutine dump, 2), stop-handler → 0, stop-nohandler → 143 + `"signal":"SIGTERM"`, stop-forced (`-mode ignore`, `--grace 1s`) → 137 `forced:true`, net-serve (`--net user`: `[patina] net: dhcp lease 192.168.64.182/24 via 192.168.64.1, dns 192.168.64.1`, `patina: guest address 192.168.64.182 (gateway 192.168.64.1)`, GET / = `hello from patina`, 20 concurrent GETs, `/big` 4 MiB sha256, `ctl stop` → `{"ev":"exit","code":0,"forced":false}`, run exit 0), threads, signals-self, signals-nohandler-self, sockets at 2 vCPUs |
 | **vz-e2e** | `PATINA_NET_EXTERNAL=1 cli/scripts/vztest.sh --e2e` (`TestVZE2E`, cli/vz_integration_test.go) | hello-exit ×3 (rc 3, attach, ready, exit event), stop-handler/nohandler/forced, ping, net-serve (address line + `state.json` `net`, 5 GETs with #2–4 < 500 ms, 20 concurrent, `/big` sha256 ×2: 4 MiB in 13–21 ms, ~200–310 MB/s, first byte 0.3–1.5 ms; GET / connect 2.6–7 ms), net-nohandler (143), net-selftest (`-dns example.com` → `ok dns example.com -> …` via 192.168.64.1); ping RTT from the host 0.3–1.3 ms (INTx delivery) |
 | **vz-runtime** | `PATINA_VMM=vz PATINA_CPUS_LIST="1 2 4" scripts/test-runtime.sh aarch64` | 33/33 rows PASS (hello 0/3, threads, smpstress, fdtest, signals handler/nohandler, sigstress, sigstress-procs2/-crash/-breakpoint, pproftest × 1/2/4 vCPUs), `test-runtime: all passed`; `PATINA_VMM=vz PATINA_CPUS=N scripts/test-hello.sh --app fileio\|sockets\|unixsock aarch64` 9/9 at 1/2/4 vCPUs. smpstress on VZ: 8×1250×Sleep(100µs) 1.55–1.60 s, 200×Sleep(500µs) 249–264 ms (QEMU hvf: ~1.5 s / 248 ms) |
 | **vz-gopkg** | `PATINA_VMM=vz scripts/test-gopkg.sh os net --arch aarch64 --cpus 2` (also 1 and 4) | `os aarch64 (cpus=2): 248 passed, 33 skipped (10 by our list), 0 failed`, `net aarch64 (cpus=2): 254 passed, 55 skipped (1 by our list), 0 failed` — the QEMU counts — with the net run over a real VZ NAT lease (`virtio-net: mac …, queues rx 128 / tx 32, link up, mtu 1500 (pci 0000:00:01.0, hdr 12 B)`) |
-| **vz-timing** | `testapps/sleeper` and `patina.selftest=smp\|timer` on VZ vs QEMU hvf at 1/2/4 vCPUs, 3 runs each (D81) | no VZ anomaly: kernel to `main` 3–4 ms, `Sleep(1s)` 1000.3–1001.0 ms everywhere, secondaries up in 75–95 µs (2 vCPUs) / 236–257 µs (4), +2 ms deadline at 2003–2005 µs, `timer: ok (5 ticks in 51–52 ms)`; WFI-idle wake from its own timer is ~20–25% late below 2 ms on both VMMs (host-side); at 1 vCPU a sleeper competing with a spinner wakes up to a quantum late on both (scheduler, noted) |
+| **vz-timing** | `testapps/sleeper` and `patina.selftest=smp\|timer` on VZ vs QEMU hvf at 1/2/4 vCPUs, 3 runs each (D84) | no VZ anomaly: kernel to `main` 3–4 ms, `Sleep(1s)` 1000.3–1001.0 ms everywhere, secondaries up in 75–95 µs (2 vCPUs) / 236–257 µs (4), +2 ms deadline at 2003–2005 µs, `timer: ok (5 ticks in 51–52 ms)`; WFI-idle wake from its own timer is ~20–25% late below 2 ms on both VMMs (host-side); at 1 vCPU a sleeper competing with a spinner wakes up to a quantum late on both (scheduler, noted) |
 
 Not verified on VZ: console rx (VZ attaches no guest input), `--cpus` > 4
 under the scheduler, memory sizes other than 512 MiB / 1 GiB, more than
@@ -454,7 +491,10 @@ accepted handshake (D82) is unexplained.
 
 - [x] Milestone B harness `scripts/test-gopkg.sh` (D74): per-package defaults (RAM, timeouts, extra files), skip lists `testapps/skiplist/<pkg>.txt`, summary/failure rules of D65; `test-os.sh`/`test-gonet.sh` are wrappers — **test-gopkg** (reproduced test-os-p4 248/0 and test-gonet 254/0)
 - [x] **Milestone B on aarch64** (QEMU, 1 and 4 vCPUs): the design §13 packages (`runtime`, `os`, `net`, `os/signal`, `time`, `sync`, `syscall`) plus `io`, `bufio`, `context`, `net/http`, `runtime/pprof`, `os/user`, 0 failed; 36 listed tests, all "needs os/exec" or "GODEBUG re-exec" — **test-gopkg**
-- [~] Milestone B on x86_64: only `runtime` at 1 vCPU was run (379 / 150 (11) / 0) — **test-gopkg-x86**
+- [x] **Milestone B on x86_64** (QEMU microvm, TCG): all 13 packages at 1 vCPU and `runtime`, `os`, `net`, `syscall`, `os/signal` at 4 vCPUs, 0 failed, same 36 listed tests as aarch64 — **test-gopkg**
+- [x] **8 vCPUs**: `runtime` on aarch64 (3 runs, identical) and x86_64, `sync`, `os/signal`, `runtime/pprof` on aarch64, 0 failed; `runtime --no-short` at 8 vCPUs passes with 4 GiB — **test-gopkg-8cpu**
+- [x] `select` (x86_64) and `pselect6` (both arches) were `ENOSYS`: now over `File::poll` with Linux semantics (nfds clamped, `EBADF` for an unopened fd, `POLLIN/OUT/EX` sets, `ERESTARTNOHAND`, time left written back); Go's `syscall.Select` uses them — **fdtest** `ok select` (strace shows `select` on x86_64, `pselect6` on aarch64)
+- [x] x86_64 `utime` and `time` were `ENOSYS` (Go's `syscall.Utime` issues `SYS_UTIME` on amd64) — **fileio** `ok utime (x86_64 SYS_UTIME)`, `ok time (x86_64 SYS_TIME)`
 - [x] `recvmsg` reports `MSG_CMSG_CLOEXEC` back in `msg_flags` — **test-gopkg** syscall `TestSCMCredentials`
 - [x] Per-thread credentials (`set*uid`/`set*gid`/`setfs*`/`setgroups`/`getgroups`/`getres*` with Linux's rules and capability fix-ups, `patina_abi::cred` host-tested), `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS`, `capget` reports the sets, `/proc/1/status` `Uid`/`Gid`/`Groups`/`CapPrm`/`CapEff`, `/proc/1/task/<tid>/{status,stat,comm}` — **test-gopkg** syscall `TestSetuidEtc`, `TestAllThreadsSyscall`; os/signal `TestAllThreadsSyscallSignals`
 - [x] `fcntl` record locks (`F_GETLK`/`F_SETLK`/`F_SETLKW`, `F_OFD_*`): validated like Linux, granted — **test-gopkg** syscall `TestFcntlFlock` (parent half; the child half needs exec and the test is listed)
@@ -540,3 +580,30 @@ by-design ones).
 
 - [x] Two-version matrix (go1.26.9, go1.27.1): same ENOSYS set, no behavioural difference — **gomatrix-1.26**, **gomatrix-os-1.26**
 - [x] Go 1.27.1 syscall numbers (`runtime/sys_linux_{amd64,arm64}.s`, `internal/runtime/syscall/linux`, `internal/syscall/unix`, `syscall`, `os`, `net`, `internal/poll`, `crypto/rand`, `time`) diffed against `kernel/src/syscall/mod.rs`: nothing on a normal path is missing; the unimplemented ones are listed in D79
+
+### Robustness
+
+Decisions D77 (tickless idle, sub-tick wall timers, overrun fix), D78
+(commit accounting, OOM), D80 (kernel stack and page-table reclaim).
+`scripts/test-robust.sh [aarch64] [x86_64]` runs testapps/robust per arch
+(logs in `out/test/robust/`; vCPUs from `PATINA_CPUS`, `idle` uses at
+least 4, `reclaim-4cpu` 4, `oom`/`oomfault` `PATINA_MEM=256`).
+
+| Name | Command | Observed |
+|---|---|---|
+| **test-robust** | `scripts/test-robust.sh aarch64 x86_64` (also `PATINA_CPUS=4`) | 24/24 PASS (12 cases per arch: default, idle, restart, reclaim, reclaim-4cpu, sigill, accerr, sigkill, sigpipe, oom, oomfault, sigbus on aarch64 / gp on x86_64). Sub-tick timers (100 sequential 500 µs expiries, never early): `timer_settime` 63.5 ms (aarch64) / 138–173 ms (x86_64 TCG), `CLOCK_REALTIME` absolute timer and `setitimer(ITIMER_REAL)` the same; abs `clock_nanosleep` 130–160 µs late on aarch64, ~1.2 ms on TCG; `timer_getoverrun 19` after 40 ms blocked at 2 ms (was 1); `ITIMER_VIRTUAL` after 24–40 ms of CPU; `time.Sleep(1s)` 1.0004–1.004 s on idle 4 vCPUs |
+| **tickless-idle** | `test-robust.sh` case `idle` (`patina.stats=1`, 4 vCPUs: 3 × `Sleep(1s)` then 3 s idle, ~7 s uptime) | timer IRQs per CPU: aarch64 `1, 33, 10, 0`, x86_64 `14, 42, 2, 26`; at 8 vCPUs (aarch64) `4, 34, 1, 0, 0, 0, 7, 0` — a 100 Hz tick would give ~700 each. The busiest CPU is the one running sysmon / the timer goroutine |
+| **reclaim** | `test-robust.sh` cases `reclaim` (1 vCPU) and `reclaim-4cpu` | kernel-held frames (MemTotal − MemFree − VmRSS) over 5 × 2000 thread exits after a warm-up round: aarch64 +5 / −3, x86_64 +6 / −10 (4 vCPUs: deferred shootdown path); before D80 every stack stayed pooled (2000 × 8 frames). 1 GiB `MAP_NORESERVE` touched every 2 MiB: 513 page-table frames, all returned by `munmap` (delta 0). `patina.selftest=vm`: `1 frames held by page tables` (was 7) |
+| **oom** | `test-robust.sh` cases `oom` / `oomfault` (`PATINA_MEM=256`) | `[patina] memory: commit limit 226 MiB (15 MiB kernel reserve)`; the third 64 MiB chunk: `[patina] mmap: 65536 KiB refused, commit limit reached (184400 of 232344 KiB committed, D78)`, Go prints `fatal error: runtime: out of memory`, exit 2 (both arches). Before: `out of memory filling user page`, `SIGSEGV code=0x2`, `fatal error: fault`. `oomfault`: `[patina] out of memory: no free frame for user page 0x7eff8836d000 (0 of 64211 frames free, 12158 of 58086 pages committed); killing the program (SIGKILL)`, `[patina] exit signal SIGKILL`, 137 |
+| **robust-8cpu** | `PATINA_CPUS=8`: `test-smp.sh --cpus 8 --app smpstress` / `threads` / `sigstress` on `aarch64 x86_64`, `test-signals.sh aarch64`, `test-robust.sh aarch64` | all PASS: `[patina] smp: 8 cpus online`, `GOMAXPROCS=8 NumCPU=8`, smpstress `200 x Sleep(500us) 252 ms` (aarch64) / `285 ms` (x86_64), 6/6 signal cases, 12/12 robust cases |
+| **fxsave-only** | `PATINA_QEMU_EXTRA="-cpu max,-xsave"` and `"-cpu Nehalem"`: `test-signals.sh x86_64`, `test-smp.sh --app smpstress --cpus 2 x86_64`; robust `default`/`gp`/`sigill` on Nehalem | all PASS; `[patina] early: cpu: no fsgsbase (FS_BASE msr), no smep/smap, fp state fxsave (512 bytes)` on Nehalem; `AT_HWCAP2` 0 there (Linux: `HWCAP2_FSGSBASE` only when enabled) |
+| **p5-robust-merge** | on main after merging the robustness branch: `scripts/test-robust.sh aarch64 x86_64`, `PATINA_CPUS_LIST="1 4" scripts/test-runtime.sh aarch64 x86_64`, `scripts/test-smp.sh --cpus "2 4 8" aarch64 x86_64`, `scripts/test-gopkg.sh runtime --cpus 4`, `scripts/test-gopkg.sh time sync os/signal`, `scripts/test-hello.sh --app pproftest` / `--app vdsobench`, `scripts/test-ctl.sh aarch64 x86_64`, `scripts/test-net.sh aarch64 x86_64`, host tests, clippy both targets; plus a scratch program on `PATINA_MEM=256` doing anonymous `mmap` of 64 MiB / 1 GiB / 4 GiB | all PASS: robust 24/24 (idle timer IRQs per CPU aarch64 `10, 35, 0, 0`, x86_64 `31, 42, 2, 2`; kstack reclaim kernel-held delta +4 over 10000 thread exits at 1 vCPU, +43 / +7 at 4 vCPUs; page tables delta 0 after `munmap`), `test-runtime: all passed` (44 rows), smpstress 6/6 (2/4/8 vCPUs), `runtime aarch64 (cpus=4): 385 passed, 141 skipped (11 by our list), 0 failed`, `runtime x86_64 (cpus=4): 386 passed, 143 skipped (11 by our list), 0 failed`, time 180/4/0, sync 51/2/0, os/signal 18/3/0 on both arches, pproftest and vdsobench both arches, test-ctl 16/16, test-net 14/14, 200 host tests, clippy 0 warnings. Scratch `mmap`: 64 MiB succeeds (`Committed_AS` 48632 → 114168 kB of `CommitLimit` 232660 kB, back after `munmap`), 1 GiB and 4 GiB → `ENOMEM` on both arches |
+
+- [x] Tickless idle (D77) — **tickless-idle**, **test-robust**; pproftest, sleep latency and the signal suite unchanged (**p5-robust-regression**)
+- [x] Sub-tick POSIX/itimer wall-clock timers, overrun accounting fix (D77) — **test-robust** `default`
+- [x] Fault → signal paths: SIGBUS `BUS_ADRALN`, SIGILL, `#GP` → `SI_KERNEL`, `SEGV_ACCERR` with the right `si_addr`/`si_code` — **test-robust**
+- [x] Kernel stacks and user page tables returned to the frame allocator (D80) — **reclaim**
+- [x] `mmap` beyond RAM → ENOMEM through commit accounting; fault-time OOM → SIGKILL with a clear line (D78) — **oom**
+- [x] > 4 vCPUs (8) — **robust-8cpu**
+- [x] x86_64 FXSAVE-only CPUs — **fxsave-only**
+- [~] `FPE_FLTINV`, `sigaltstack` `EPERM`/auto-disarm on delivery, `ppoll`'s temporary sigmask, `clock_nanosleep` on the process CPU clock: not reachable on this host or from Go

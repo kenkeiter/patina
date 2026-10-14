@@ -32,6 +32,10 @@ bitflags! {
         const DEVICE = 1 << 3;
         /// Accessible from ring 3.
         const USER = 1 << 4;
+        /// Kernel mapping that may be removed again (`unmap_page`): not
+        /// global (no PTE_G), so a CR3 reload flushes it and the
+        /// `mm::tlb` shootdown generations cover it.
+        const LOCAL = 1 << 5;
     }
 }
 
@@ -71,7 +75,7 @@ pub(super) fn leaf_attrs(flags: MapFlags) -> u64 {
     }
     if flags.contains(MapFlags::USER) {
         d |= PTE_US;
-    } else {
+    } else if !flags.contains(MapFlags::LOCAL) {
         d |= PTE_G;
     }
     if !flags.contains(MapFlags::EXEC) || flags.contains(MapFlags::DEVICE) {
@@ -210,6 +214,39 @@ pub fn kernel_root() -> PhysAddr {
 /// Map `[va, va+len)` -> `[pa, pa+len)` in the kernel tables.
 pub fn map_range(va: VirtAddr, pa: PhysAddr, len: usize, flags: MapFlags) -> Result<(), MapError> {
     map_in(kernel_root(), va.0, pa.0, len, flags)
+}
+
+/// Remove the kernel 4 KiB page mapping at `va` (made by [`map_range`],
+/// with `MapFlags::LOCAL` if other CPUs may cache it) and `invlpg` it on
+/// this CPU; other CPUs drop it at their next CR3 reload (`mm::tlb`).
+/// Returns the frame that was mapped. The caller serializes kernel
+/// map/unmap of the same region.
+pub fn unmap_page(va: VirtAddr) -> Option<PhysAddr> {
+    let mut table = kernel_root().0 as u64;
+    for level in 0..4 {
+        let idx = (va.0 >> (39 - 9 * level)) & (ENTRIES - 1);
+        // SAFETY: `table` is a live kernel table frame.
+        let slot = unsafe { table_ptr(table).add(idx) };
+        // SAFETY: as above.
+        let e = unsafe { slot.read_volatile() };
+        if e & PTE_P == 0 {
+            return None;
+        }
+        if level == 3 {
+            // SAFETY: clears a leaf nobody uses any more; invlpg only
+            // drops a TLB entry.
+            unsafe {
+                slot.write_volatile(0);
+                core::arch::asm!("invlpg [{}]", in(reg) va.0, options(nostack, preserves_flags));
+            }
+            return Some(PhysAddr((e & ADDR_MASK) as usize));
+        }
+        if e & PTE_PS != 0 {
+            return None; // a large page: never created for kernel stacks
+        }
+        table = e & ADDR_MASK;
+    }
+    None
 }
 
 const MAX_DEVICE_MAPS: usize = 32;

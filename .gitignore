@@ -4,3 +4,4 @@
 /out/
 *.patina
 /cli/patina
+/cli/bin/

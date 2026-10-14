@@ -33,6 +33,13 @@ pub fn flush_tlb_local() {
 
 const ENTRIES: usize = 512;
 
+/// After [`UserTables::prune`] cleared table entries: drop this CPU's
+/// paging-structure caches (CR3 reload). Other CPUs are covered by the
+/// `mm::tlb::Shootdown` the freed tables go through.
+pub fn flush_table_walks() {
+    flush_tlb_local();
+}
+
 /// Software bit (AVL, ignored by the MMU in a not-present entry) marking a
 /// PROT_NONE page: the entry is not present, so every access faults, but it
 /// still records the frame so `translate` reports it (with empty
@@ -188,6 +195,43 @@ impl UserTables {
             f |= MapFlags::USER;
         }
         Some((PhysAddr((e & ADDR_MASK) as usize), f))
+    }
+
+    /// Free the page tables on the path to `va` that no longer map
+    /// anything (bottom-up: the PT, then the PD and PDPT; never the PML4),
+    /// clearing their parent entries. The freed table frames are pushed on
+    /// `freed`; the caller must call [`flush_table_walks`] and then hand
+    /// them to an `mm::tlb::Shootdown` (other CPUs' paging-structure caches
+    /// may still hold the cleared entries until their next CR3 reload).
+    pub fn prune(&mut self, va: usize, freed: &mut alloc::vec::Vec<PhysAddr>) {
+        if va >= USER_VA_END {
+            return;
+        }
+        let mut tables = [self.root.0 as u64, 0, 0, 0];
+        let mut slots = [core::ptr::null_mut::<u64>(); 3];
+        for level in 0..3 {
+            let idx = (va >> (39 - 9 * level)) & (ENTRIES - 1);
+            // SAFETY: `tables[level]` is a live table frame.
+            let slot = unsafe { table(tables[level]).add(idx) };
+            // SAFETY: as above.
+            let e = unsafe { slot.read_volatile() };
+            if e & PTE_P == 0 || e & PTE_PS != 0 {
+                return;
+            }
+            slots[level] = slot;
+            tables[level + 1] = e & ADDR_MASK;
+        }
+        for level in (1..4).rev() {
+            let t = table(tables[level]);
+            // SAFETY: a live table frame of this address space.
+            if (0..ENTRIES).any(|i| unsafe { t.add(i).read_volatile() } != 0) {
+                break;
+            }
+            // SAFETY: the parent entry (a user-half slot: `va` is a user
+            // address, so the PML4's kernel half is never touched).
+            unsafe { slots[level - 1].write_volatile(0) };
+            freed.push(PhysAddr((tables[level] & ADDR_MASK) as usize));
+        }
     }
 
     /// Make these the live user tables on this CPU (CR3; kernel mappings are

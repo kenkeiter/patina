@@ -75,6 +75,19 @@ fn immediate() -> bool {
     !NEEDS_SHOOTDOWN || crate::task::sched::online_cpus() <= 1
 }
 
+/// The current shootdown generation: translations removed before a
+/// [`Shootdown`] that has been dropped are gone from every CPU once
+/// [`generation_reached`] says so for the value read after the drop.
+pub fn generation() -> u64 {
+    FLUSH_GEN.load(Ordering::SeqCst)
+}
+
+/// Whether every online CPU has flushed its TLB for generation `g` (always
+/// true where unmaps are complete on return: aarch64, one CPU).
+pub fn generation_reached(g: u64) -> bool {
+    immediate() || min_gen() >= g
+}
+
 /// Frames waiting for other CPUs' TLB flushes (diagnostics).
 pub fn pending_frames() -> usize {
     PENDING.load(Ordering::Relaxed)

@@ -24,6 +24,18 @@
 //! frees until every CPU flushed (one `TlbFlush` IPI per operation) and
 //! frees at once on aarch64 / with one CPU.
 //!
+//! Commit accounting (D78): `committed` counts the pages of writable
+//! private mappings (not `MAP_NORESERVE`, not the vvar page) whether
+//! resident or not. `mmap`, `mprotect` adding write access and `mremap`
+//! growth fail with `ENOMEM` when they would take it past `commit_limit`
+//! (set by the loader: the frames available to the program minus a kernel
+//! reserve), so a program sees ENOMEM at the call (Go: `fatal error:
+//! runtime: out of memory`) instead of a fault it cannot handle. Go's huge
+//! `PROT_NONE` reservations cost nothing until made writable. A page fault
+//! that still finds no free frame (kernel allocations took them) is
+//! [`Fault::OutOfMemory`]: the program is killed with SIGKILL and a clear
+//! `[patina] out of memory` line.
+//!
 //! The kernel never dereferences user virtual addresses (PAN/SMAP): user
 //! memory is reached page by page through the direct map, see the uaccess
 //! methods at the end of this file.
@@ -49,6 +61,24 @@ pub const MMAP_MIN_ADDR: usize = 0x1_0000;
 pub const MMAP_BASE: usize = 0x7f00_0000_0000;
 
 pub type Result<T> = core::result::Result<T, Errno>;
+
+/// Outcome of [`AddressSpace::handle_fault`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// Resolved (page filled in, or a spurious fault): retry the access.
+    Resolved,
+    /// A real access violation: SIGSEGV.
+    Segv,
+    /// Allowed, but no frame could be found for the page (D78 backstop).
+    OutOfMemory,
+}
+
+/// Whether a VMA's pages count against the commit limit (D78).
+fn charged(v: &Vma) -> bool {
+    v.prot.contains(ProtFlags::WRITE)
+        && !v.flags.contains(MmapFlags::NORESERVE)
+        && v.kind != VmaKind::Vvar
+}
 
 /// What a VMA was created for (diagnostics; all are anonymous memory).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +174,10 @@ pub struct AddressSpace {
     resident: BTreeSet<usize>,
     /// Program break (end of the highest ELF segment); never moves.
     brk: usize,
+    /// Pages of charged (writable private) VMAs (D78).
+    committed: usize,
+    /// Most pages `committed` may reach (`usize::MAX`: no limit).
+    commit_limit: usize,
 }
 
 impl AddressSpace {
@@ -153,7 +187,49 @@ impl AddressSpace {
             vmas: BTreeMap::new(),
             resident: BTreeSet::new(),
             brk: 0,
+            committed: 0,
+            commit_limit: usize::MAX,
         })
+    }
+
+    /// (committed pages, commit limit in pages) — `/proc/meminfo`.
+    pub fn commit(&self) -> (usize, usize) {
+        (self.committed, self.commit_limit)
+    }
+
+    /// Set the commit limit (loader, once the image is mapped).
+    pub fn set_commit_limit(&mut self, pages: usize) {
+        self.commit_limit = pages;
+    }
+
+    /// Charged pages of the VMAs overlapping `[start, end)`.
+    fn charged_pages(&self, start: usize, end: usize) -> usize {
+        let first = match self.vmas.range(..start).next_back() {
+            Some((&k, v)) if v.end > start => k,
+            _ => start,
+        };
+        self.vmas
+            .range(first..end)
+            .filter(|(_, v)| charged(v))
+            .map(|(_, v)| (v.end.min(end) - v.start.max(start)) / PAGE_SIZE)
+            .sum()
+    }
+
+    /// ENOMEM unless `add` more charged pages (after releasing `release`)
+    /// stay within the commit limit.
+    fn commit_check(&self, add: usize, release: usize, what: &str) -> Result<()> {
+        let after = self.committed.saturating_sub(release).saturating_add(add);
+        if add > release && after > self.commit_limit {
+            crate::kprintln!(
+                "[patina] {}: {} KiB refused, commit limit reached ({} of {} KiB committed, D78)",
+                what,
+                (add - release) * PAGE_SIZE / 1024,
+                self.committed * PAGE_SIZE / 1024,
+                self.commit_limit.saturating_mul(PAGE_SIZE) / 1024
+            );
+            return Err(Errno(ENOMEM));
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -166,6 +242,11 @@ impl AddressSpace {
             .next_back()
             .map(|(_, v)| v)
             .filter(|v| addr < v.end)
+    }
+
+    /// User pages that currently have a frame (`VmRSS`).
+    pub fn resident_pages(&self) -> usize {
+        self.resident.len()
     }
 
     /// Iterate the VMAs in address order.
@@ -229,6 +310,9 @@ impl AddressSpace {
     /// Insert a VMA over a free range and merge it with its neighbours.
     fn insert(&mut self, vma: Vma) {
         debug_assert!(self.is_free(vma.start, vma.end));
+        if charged(&vma) {
+            self.committed += (vma.end - vma.start) / PAGE_SIZE;
+        }
         self.vmas.insert(vma.start, vma);
         self.merge_around(vma.start);
     }
@@ -237,9 +321,30 @@ impl AddressSpace {
     /// `sd` to free once no CPU can reach them.
     fn release_frames(&mut self, start: usize, end: usize, sd: &mut Shootdown) {
         let pages: Vec<usize> = self.resident.range(start..end).copied().collect();
+        let mut last_region = usize::MAX;
+        let mut regions = Vec::new();
         for va in pages {
             self.resident.remove(&va);
             if let Some(pa) = self.tables.unmap(va) {
+                sd.free_frame(pa);
+            }
+            if va >> 21 != last_region {
+                last_region = va >> 21;
+                regions.push(va);
+            }
+        }
+        // Free the page tables that became empty (D80): one walk per
+        // 2 MiB region that had resident pages. Their frames are freed
+        // only after the walk caches were invalidated (aarch64: broadcast,
+        // complete on return; x86_64: local here, other CPUs through the
+        // shootdown).
+        let mut tables = Vec::new();
+        for va in regions {
+            self.tables.prune(va, &mut tables);
+        }
+        if !tables.is_empty() {
+            crate::arch::uspace::flush_table_walks();
+            for pa in tables {
                 sd.free_frame(pa);
             }
         }
@@ -249,6 +354,9 @@ impl AddressSpace {
     fn remove_range(&mut self, start: usize, end: usize, sd: &mut Shootdown) {
         self.split_at(start);
         self.split_at(end);
+        self.committed = self
+            .committed
+            .saturating_sub(self.charged_pages(start, end));
         let keys: Vec<usize> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
         for k in keys {
             self.vmas.remove(&k);
@@ -360,11 +468,12 @@ impl AddressSpace {
         Ok(pa)
     }
 
-    /// Resolve a user fault at `addr`. Returns true if the access can be
+    /// Resolve a user fault at `addr`: `Resolved` if the access can be
     /// retried (a page was filled in, or it was already mapped with
-    /// sufficient permissions: a spurious fault); false if the fault is a
-    /// real SIGSEGV.
-    pub fn handle_fault(&mut self, addr: usize, access: Access) -> bool {
+    /// sufficient permissions: a spurious fault), `Segv` for a real access
+    /// violation, `OutOfMemory` if the access was allowed but no frame
+    /// could be had (D78).
+    pub fn handle_fault(&mut self, addr: usize, access: Access) -> Fault {
         let va = page_align_down(addr);
         let was_resident = self.resident.contains(&va);
         match self.fault_in(va, access) {
@@ -377,14 +486,10 @@ impl AddressSpace {
                     let prot = self.find(va).map(|v| v.prot).unwrap_or(ProtFlags::empty());
                     self.tables.protect(va, pte_flags(prot));
                 }
-                true
+                Fault::Resolved
             }
-            Err(e) => {
-                if e.0 == ENOMEM {
-                    crate::kprintln!("[patina] out of memory filling user page {:#x}", va);
-                }
-                false
-            }
+            Err(e) if e.0 == ENOMEM => Fault::OutOfMemory,
+            Err(_) => Fault::Segv,
         }
     }
 
@@ -434,6 +539,11 @@ impl AddressSpace {
         let fixed = mf.contains(MmapFlags::FIXED);
         let noreplace = mf.contains(MmapFlags::FIXED_NOREPLACE);
         let len = len.checked_add(PAGE_SIZE - 1).ok_or(Errno(ENOMEM))? & !(PAGE_SIZE - 1);
+        let charge = if prot.contains(ProtFlags::WRITE) && !mf.contains(MmapFlags::NORESERVE) {
+            len / PAGE_SIZE
+        } else {
+            0
+        };
         let start = if fixed || noreplace {
             if !addr.is_multiple_of(PAGE_SIZE) {
                 return Err(Errno(EINVAL));
@@ -445,7 +555,10 @@ impl AddressSpace {
                 if noreplace && !fixed {
                     return Err(Errno(EEXIST));
                 }
+                self.commit_check(charge, self.charged_pages(addr, addr + len), "mmap")?;
                 self.remove_range(addr, addr + len, &mut Shootdown::new());
+            } else {
+                self.commit_check(charge, 0, "mmap")?;
             }
             addr
         } else {
@@ -459,6 +572,9 @@ impl AddressSpace {
                 self.find_free_top_down(len).ok_or(Errno(ENOMEM))?
             }
         };
+        if !(fixed || noreplace) {
+            self.commit_check(charge, 0, "mmap")?;
+        }
         let keep = MmapFlags::PRIVATE
             | MmapFlags::SHARED
             | MmapFlags::ANONYMOUS
@@ -504,6 +620,25 @@ impl AddressSpace {
         self.split_at(addr);
         self.split_at(end);
         let keys: Vec<usize> = self.vmas.range(addr..end).map(|(k, _)| *k).collect();
+        let before = self.charged_pages(addr, end);
+        let after: usize = keys
+            .iter()
+            .map(|k| Vma {
+                prot,
+                ..self.vmas[k]
+            })
+            .filter(charged)
+            .map(|v| (v.end - v.start) / PAGE_SIZE)
+            .sum();
+        if let Err(e) = self.commit_check(after, before, "mprotect") {
+            for k in keys {
+                if self.vmas.contains_key(&k) {
+                    self.merge_around(k);
+                }
+            }
+            return Err(e);
+        }
+        self.committed = self.committed - before + after;
         // Whether some permission is revoked (other CPUs must then drop
         // their cached translations; adding permissions needs nothing).
         let mut reduced = false;
@@ -611,6 +746,12 @@ impl AddressSpace {
         }
         // Grow in place?
         let old_end = old + old_len;
+        let grow = if charged(&vma) {
+            (new_len - old_len) / PAGE_SIZE
+        } else {
+            0
+        };
+        self.commit_check(grow, 0, "mremap")?;
         if old.checked_add(new_len).is_some_and(|e| e <= USER_VA_END)
             && old_end == vma.end
             && self.is_free(old_end, old + new_len)

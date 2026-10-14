@@ -1009,7 +1009,8 @@ signal reports. `timer_settime` and `setitimer` run the same pass at once,
 so an already-expired value fires immediately. Granularity is the 10 ms tick
 plus any one-shot deadline tick: never early, up to one tick late. Timers do
 not arm deadlines themselves; that is a follow-up through
-`sched::arm_deadline`. Lock order: `TABLE` → `THREADS` (process CPU clock);
+`sched::arm_deadline`. (Done in D77: wall-clock timers are sub-tick deadlines;
+D77 also fixed the overrun accounting described below.) Lock order: `TABLE` → `THREADS` (process CPU clock);
 no signal is sent under `TABLE`.
 
 Notifications: `SIGEV_SIGNAL` signals the process, `SIGEV_THREAD_ID` a live
@@ -2184,6 +2185,22 @@ on purpose: Go falls back to `clone`, which cannot create a process (D57).
 mod}.rs` and `kernel/src/drivers/virtio/pci.rs`. Those paths belong to
 another change and were left alone.
 
+x86_64 and 8-vCPU runs. All 13 packages pass on x86_64 (microvm, TCG) at
+1 vCPU, and `runtime`, `os`, `net`, `syscall` and `os/signal` at 4 vCPUs,
+with the aarch64 skip lists unchanged: no x86_64-only failure, so nothing
+was added to a list. `runtime` passes at 8 vCPUs on both arches (aarch64
+three times with identical pass/skip sets), as do `sync`, `os/signal` and
+`runtime/pprof` on aarch64. `runtime --no-short` at 8 vCPUs needs more than
+the 2 GiB default (about 20 tests run in parallel; the guest ran out of
+frames) and passes with `--mem 4096`; the default stays, since the
+`-short` run is the gate. Three syscalls that are `ENOSYS` only on a path
+Go's `syscall` package reaches directly were cheap to add, though no
+package test needed them: `select` (x86_64) and `pselect6` (both; Go's
+`syscall.Select`), as a third client of `File::poll` with Linux's
+`fd_set` rules (fdtest `ok select`), and x86_64 `utime` (`syscall.Utime`
+issues `SYS_UTIME` on amd64) and `time` (fileio). The `ENOSYS` lines in
+the x86_64 runs are the aarch64 ones: `pidfd_open` and `clone3`.
+
 ## D75: vDSO (clock_gettime, gettimeofday, getrandom) and the vvar page
 *2026-10-14 · Phase 5*
 
@@ -2413,7 +2430,169 @@ ENOSYS by design and handled by Go: `pidfd_open`, `pidfd_send_signal`,
 `clone3`, `openat2`, `copy_file_range`, `execve`, `rseq`, `membarrier`,
 `set_robust_list` (D57).
 
-## D80: Apple VZ drops the first console tx buffer available at device start; VZ virtio-net needs F_MTU
+## D77: Tickless idle
+*2026-10-14 · Phase 5*
+
+An idle CPU no longer takes the 100 Hz tick. When `sched::idle_loop` is
+about to wait with nothing runnable (`enter_tickless`), it runs a deferred
+TLB `reclaim()`, turns its periodic tick off (`timer::set_periodic(false)`:
+aarch64 programs CNTV_CVAL only for the deadline and disables the timer
+when there is none; x86_64 re-arms the LAPIC one-shot for the deadline or
+writes a zero initial count) and arms its one-shot for the earliest
+deadline it *owns*. It turns the tick back on, on its own `TICK_HZ` grid,
+when it switches to a thread. Running threads keep the tick, so the
+20 ms quantum, `need_resched` and tick-granular CPU-clock timers are
+unchanged.
+
+Ownership is what keeps every deadline covered without waking every idle
+CPU for every deadline. A sleep-list entry records the CPU that added it
+(`sleep::next_deadline_for`). A wall-clock POSIX timer and `ITIMER_REAL`
+record the CPU that last armed them (`timers::next_wall_deadline_for`).
+A busy CPU keeps ticking and arms the global earliest deadline
+(`sched::earliest_deadline`: sleepers and wall timers), as before; an idle
+CPU arms only its own. Since every deadline has an owner that is either
+busy (ticking, armed for the global earliest) or idle (armed for it), each
+one is honoured at its first timer interrupt or after, never early. A
+periodic timer that another CPU re-armed costs its idle owner at most one
+early wake-up, after which it re-arms for the new expiry.
+
+Nothing else needs an idle CPU's tick: per-thread CPU time is accounted at
+context switches (`run_start`); CPU-clock timers and `ITIMER_PROF` /
+`ITIMER_VIRTUAL` only advance while some thread runs, and that CPU ticks;
+the deferred TLB reclaim (D52) also runs at every vm operation, before
+going idle and from `/proc/meminfo`, and idle CPUs still get `TlbFlush`
+IPIs; wake-ups, signals and stops reach an idle CPU by IPI.
+
+Wall-clock timers became sub-tick deadlines in the same change, which D51
+listed as a follow-up. `timers::WALL_NEXT` (the earliest wall-clock expiry,
+in monotonic ns) is recomputed whenever the table changes, and
+`timer_settime`/`setitimer` arm it on the calling CPU
+(`sched::arm_deadline`). A 500 µs `timer_settime`, `CLOCK_REALTIME`
+absolute timer or `setitimer(ITIMER_REAL)` now fires within about 0.6 ms
+(1.4 ms on TCG) instead of at the next 10 ms tick. aarch64's
+`ns_to_count` rounds up, so a deadline interrupt never arrives before
+`now_ns() >= deadline`.
+
+Overrun accounting was also fixed. The expiry pass used to reset the
+accumulated overrun and set `timer_getoverrun`'s value before it knew
+whether the signal was queued, so every refused send left the count at 1.
+Now both are settled after the send: a queued signal resets the
+accumulation and becomes the `timer_getoverrun` value, and a refused one
+adds 1 + the missed intervals. patina still reports the overrun of the
+last *queued* signal, where Linux reports the last delivered one.
+
+`patina.stats=1` prints per-CPU counters at exit (timer interrupts, ticks
+and how many were taken in the idle loop, idle waits, switches) and a
+memory line (heap, kernel stack slots, TLB-pending frames, threads).
+Measured with **test-robust** `idle` (4 vCPUs, three 1 s sleeps then 3 s
+idle, about 7 s of uptime): 0–42 timer interrupts per CPU on aarch64 and
+x86_64, against about 700 per CPU with the old tick. Verified by
+**test-robust** (`default`, `idle`, `restart`), **test-signals**,
+**pproftest** (94–201 samples) and **test-smp** (sleep-latency unchanged:
+200 × `Sleep(500µs)` in 249–264 ms).
+
+## D78: Memory commit accounting and ENOMEM
+*2026-10-14 · Phase 5*
+
+Design §15 asks that `mmap` beyond RAM fail with ENOMEM. Before this
+change, all anonymous memory was lazy: a Go program allocating past RAM got
+`[patina] out of memory filling user page`, then SIGSEGV `SEGV_ACCERR`
+(the address is inside a VMA), and Go printed a misleading
+`fatal error: fault`. Fault time is too late to report ENOMEM, and Go
+cannot recover from a fault there.
+
+`mm::vm::AddressSpace` now keeps a commit charge: the pages of every
+writable private VMA, resident or not. `MAP_NORESERVE` mappings and the
+vvar page are not charged, and neither are `PROT_NONE` and read-only
+mappings, so Go's huge `PROT_NONE` arena reservations cost nothing until
+`sysMap` makes them writable. The charge changes when a VMA is inserted
+or removed and when `mprotect` changes permissions. `mmap` (including a
+`MAP_FIXED` replacement, net of what it replaces), `mprotect` adding write
+access and `mremap` growth fail with ENOMEM if they would push the charge
+past `commit_limit`. A refusal logs one line:
+`[patina] mmap: N KiB refused, commit limit reached (X of Y KiB committed, D78)`.
+The loader sets the limit after mapping the image: the free frames plus
+the image pages the program already holds, minus a kernel reserve of 1/16
+of RAM clamped to 4–64 MiB. The reserve covers page tables, kernel stacks,
+pipe and socket buffers and heap growth. `/proc/meminfo` reports
+`CommitLimit` and `Committed_AS`. This is close to Linux's strict mode
+(`vm.overcommit_memory=2`) with a high ratio. Unlike that mode,
+`MAP_NORESERVE` is honoured, as in Linux's default heuristic mode. A
+program that maps more than RAM on purpose has to say so, which it would
+also have to do on a Linux machine of that size.
+
+Go hits the limit during heap growth, gets ENOMEM from `mmap`, and dies
+through its own path: `runtime: out of memory: cannot allocate …` and
+`fatal error: runtime: out of memory`, exit 2. A page fault can still find
+no free frame, for example when a `MAP_NORESERVE` mapping is touched past
+RAM or when kernel allocations used the reserve. That backstop
+(`vm::Fault::OutOfMemory`) kills the program like Linux's OOM killer: one
+`[patina] out of memory: no free frame for user page … (free/total frames,
+committed/limit pages); killing the program (SIGKILL)` line, then a forced
+SIGKILL, `[patina] exit signal SIGKILL`, exit 137, reported through the
+normal exit path and control-channel event. Kernel-mode user accesses
+(uaccess) that cannot fill a page still return EFAULT/ENOMEM to the
+syscall.
+
+`VmRSS` in `/proc/self/status` now counts the program's resident pages.
+It used to count every frame in use, kernel ones included.
+
+Verified by **test-robust** `oom` (`PATINA_MEM=256`: the third 64 MiB
+chunk is refused, `fatal error: runtime: out of memory`, exit 2; both
+arches) and `oomfault` (1 GiB `MAP_NORESERVE` touched page by page: the
+`[patina] out of memory` line, SIGKILL, 137). Mappings larger than RAM
+in tests must now use `MAP_NORESERVE`, as robust's page-table reclaim
+check does.
+
+## D80: Kernel stack and page-table frame reclaim
+*2026-10-14 · Phase 5*
+
+Before this change, kernel stacks were never returned to the frame
+allocator (D39): freed slots stayed mapped on a free list, so a burst of
+2000 threads pinned 64 MiB for the life of the VM. User page tables were
+never freed (D36/`uspace` docs): `munmap` of a large, sparsely touched
+range kept every PT/PD page. `selftest vm` reported 7 frames held by page
+tables.
+
+Kernel stacks: `kstack::free` (run by `sched::finish_switch` on the CPU
+that switched away from the dead thread, so nothing runs on the stack any
+more) keeps up to `POOL_KEEP` = 32 slots mapped for cheap reuse. Past that
+it unmaps the stack pages (`paging::unmap_page`) and frees the frames:
+* aarch64: `TLBI VAAE1IS` + `DSB ISH` invalidates the page on every CPU
+  before `unmap_page` returns, so frames and slot are reusable at once.
+* x86_64: kernel pages are global, and the D52 shootdown (a CR3 reload)
+  does not flush global entries. Stack pages are therefore mapped with
+  the new `MapFlags::LOCAL` (no `PTE_G`). The frames go through a
+  `Shootdown` and are freed once every CPU flushed, and the slot records
+  the shootdown generation. It is reused only once
+  `tlb::generation_reached(g)`: a CPU still caching the old stack VA
+  would otherwise reach the old frame through the new stack.
+Kernel page-table changes in the window are serialized by a `KMAP` lock;
+`map_in` has none of its own. Page tables of the window are kept,
+bounded by the peak number of stacks.
+
+User page tables: `release_frames` (munmap, `MAP_FIXED` replacement,
+madvise `DONTNEED`/`FREE`, mremap shrink) prunes, for each 2 MiB region
+that had resident pages, the level-3 table and then its parents while
+they are all-zero, never the root (`UserTables::prune`). PROT_NONE
+entries carry their frame and are not zero. Before the freed table frames
+are handed to the `Shootdown`, `uspace::flush_table_walks` runs: on
+aarch64 `TLBI ASIDE1IS` (all user ASID-0 entries and walk caches, all
+CPUs) makes immediate freeing safe; on x86_64 a local CR3 reload, with
+other CPUs covered by the deferred free (D52 ordering: entries cleared →
+generation bump → frees after every CPU's CR3 reload, which also drops
+paging-structure caches).
+
+Verified by **test-robust** `reclaim` at 1 and 4 vCPUs on both arches.
+Over 5 × 2000 thread exits, after a warm-up round, the frames the kernel
+holds (MemTotal − MemFree − VmRSS) moved by −10 to +8. MemFree alone
+drifts with what Go's allocator keeps resident. A 1 GiB `MAP_NORESERVE`
+range touched every 2 MiB held 513 page-table frames, and all of them came
+back on `munmap` (kernel-held delta 0). `selftest vm` now reports 1 frame
+held by page tables, the root. `selftest sched` counts slots relative to
+background kernel threads: it had failed since the RNG reseeder (D60)
+took a slot, and nobody re-ran it.
+## D83: Apple VZ drops the first console tx buffer available at device start; VZ virtio-net needs F_MTU
 *2026-10-14 · Phase 5 (Milestone A on VZ)*
 
 `drivers/virtio/console.rs`, `virtio/pci.rs`, `virtio/net.rs`. The first
@@ -2466,7 +2645,7 @@ also accepts `F_MTU` (amending D69), reads the device MTU at config offset
 when it is below the stack's 1500. QEMU's devices do not offer it. On VZ
 NAT, DHCP leases arrive in 0.2–0.5 s.
 
-## D81: `PATINA_VMM=vz` for the test scripts, `patina image pack`, the VZ timing check
+## D84: `PATINA_VMM=vz` for the test scripts, `patina image pack`, the VZ timing check
 *2026-10-14 · Phase 5 (Milestone A on VZ)*
 
 Every suite script goes through `scripts/run-qemu.sh`, so the VMM switch
@@ -2492,7 +2671,7 @@ forwarding on VZ: the host reaches the guest at its leased address — an
 error), `PATINA_CONSOLE` (always `hvc0`), `PATINA_CTL_WAIT`, `PATINA_ACCEL`,
 `PATINA_MACHINE`, `PATINA_VIRTIO`, `PATINA_QEMU_EXTRA`. `test-net.sh` stays
 QEMU-only (`--publish`, socket netdevs); `scripts/test-vz.sh` is the VZ
-milestone script (D82). Results on VZ: see doc/status.md (test-runtime
+milestone script (D85). Results on VZ: see doc/status.md (test-runtime
 33/33 at 1/2/4 vCPUs, fileio/sockets/unixsock, test-ctl 8/8, os 248/33/0,
 net 254/55/0 — the same counts as QEMU).
 
@@ -2519,7 +2698,7 @@ Noted for the scheduler (not VZ-specific, identical on QEMU): at 1 vCPU a
 thread woken from `nanosleep` while a CPU-bound thread runs is late by up
 to a quantum (500 µs → 1.1 ms avg, 12 ms worst; 10 ms → 16.5 ms avg).
 
-## D82: Milestone A on Apple VZ: NAT networking, guest-address reporting, gateway ARP, no NIC tx drops, fast control attach
+## D85: Milestone A on Apple VZ: NAT networking, guest-address reporting, gateway ARP, no NIC tx drops, fast control attach
 *2026-10-14 · Phase 5 (Milestone A on VZ)*
 
 `--net user` on VZ attaches virtio-net (00:01.0, modern 0x1041) on

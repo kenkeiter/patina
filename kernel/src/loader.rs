@@ -142,6 +142,9 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
 
     let strace = matches!(c.get("patina.strace"), Some(None) | Some(Some("1")));
     let novdso = matches!(c.get("patina.novdso"), Some(None) | Some(Some("1")));
+    if matches!(c.get("patina.stats"), Some(None) | Some(Some("1"))) {
+        crate::STATS.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     let epoch_ns = c.epoch_ns.unwrap_or(0);
     crate::random::seed_boot(arch::timer::now_ns() ^ epoch_ns.rotate_left(32));
 
@@ -278,6 +281,20 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
         },
         argv_show,
         if strace { ", strace on" } else { "" }
+    );
+
+    // Commit limit (D78): the frames the program can still get (free now
+    // plus the image pages it already holds) minus a kernel reserve of
+    // 1/16 of RAM, at least 4 MiB and at most 64 MiB (page tables, kernel
+    // stacks, pipe/socket buffers, heap growth).
+    let (free, total) = frame::stats();
+    let reserve = (total / 16).clamp(1024, 16384);
+    let limit = (free + space.resident_pages()).saturating_sub(reserve);
+    space.set_commit_limit(limit);
+    crate::kprintln!(
+        "[patina] memory: commit limit {} MiB ({} MiB kernel reserve)",
+        (limit * PAGE_SIZE) >> 20,
+        (reserve * PAGE_SIZE) >> 20
     );
 
     let frame = ctx::TrapFrame::new_user(img.entry, image.sp);

@@ -101,6 +101,9 @@ fn kb(frames: usize) -> usize {
 }
 
 fn meminfo() -> Vec<u8> {
+    // Free whatever deferred TLB-shootdown batches are already safe, so
+    // MemFree does not count frames merely waiting for a flush round.
+    crate::mm::tlb::reclaim();
     let (free, total) = crate::mm::frame::stats();
     let mut s = String::new();
     let _ = writeln!(s, "MemTotal:       {:>8} kB", kb(total));
@@ -113,6 +116,12 @@ fn meminfo() -> Vec<u8> {
     let _ = writeln!(s, "SwapFree:       {:>8} kB", 0);
     let _ = writeln!(s, "Shmem:          {:>8} kB", 0);
     let _ = writeln!(s, "Hugepagesize:   {:>8} kB", 2048);
+    // D78 commit accounting (Linux reports these under any overcommit mode).
+    if let Some(p) = task::try_process() {
+        let (committed, limit) = p.space.lock().commit();
+        let _ = writeln!(s, "CommitLimit:    {:>8} kB", kb(limit.min(total)));
+        let _ = writeln!(s, "Committed_AS:   {:>8} kB", kb(committed));
+    }
     s.into_bytes()
 }
 
@@ -214,16 +223,11 @@ fn maps() -> Vec<u8> {
     s.into_bytes()
 }
 
-/// (VmSize, VmRSS) in kB, approximated: mapped VMAs, and frames in use.
+/// (VmSize, VmRSS) in kB: mapped VMAs, and user pages with a frame.
 fn vm_kb() -> (usize, usize) {
-    let size: usize = task::process()
-        .space
-        .lock()
-        .vmas()
-        .map(|v| v.end - v.start)
-        .sum();
-    let (free, total) = crate::mm::frame::stats();
-    (size / 1024, kb(total - free))
+    let space = task::process().space.lock();
+    let size: usize = space.vmas().map(|v| v.end - v.start).sum();
+    (size / 1024, kb(space.resident_pages()))
 }
 
 /// (pending, blocked, ignored, caught) signal masks.

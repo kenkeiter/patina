@@ -95,7 +95,12 @@ struct CpuTimer {
     fires: AtomicU64,
     /// How late (ns) the last deadline was handled, measured in the IRQ.
     late: AtomicU64,
+    /// Every timer interrupt taken (including early/spurious ones).
+    irqs: AtomicU64,
     running: AtomicBool,
+    /// Whether the periodic grid is armed (false while the CPU idles
+    /// tickless, D77).
+    periodic: AtomicBool,
 }
 
 impl CpuTimer {
@@ -107,7 +112,9 @@ impl CpuTimer {
             ticks: AtomicU64::new(0),
             fires: AtomicU64::new(0),
             late: AtomicU64::new(0),
+            irqs: AtomicU64::new(0),
             running: AtomicBool::new(false),
+            periodic: AtomicBool::new(true),
         }
     }
 }
@@ -120,10 +127,18 @@ fn this_cpu() -> &'static CpuTimer {
 
 /// Program this CPU's one-shot for min(next tick, deadline). IRQs masked.
 fn arm(t: &CpuTimer, now: u64) {
-    let target = t
-        .next_tick
-        .load(Ordering::Relaxed)
-        .min(t.deadline.load(Ordering::Relaxed));
+    let tick = if t.periodic.load(Ordering::Relaxed) {
+        t.next_tick.load(Ordering::Relaxed)
+    } else {
+        NONE
+    };
+    let target = tick.min(t.deadline.load(Ordering::Relaxed));
+    if target == NONE {
+        // Tickless idle, no deadline: stop the count-down.
+        t.armed.store(NONE, Ordering::Relaxed);
+        lapic::write(REG_TIMER_INIT, 0);
+        return;
+    }
     let delta = target.saturating_sub(now) as u128;
     let hz = LAPIC_HZ.load(Ordering::Relaxed) as u128;
     let count = (delta * hz)
@@ -189,10 +204,11 @@ pub(super) fn on_interrupt() -> bool {
     if !t.running.load(Ordering::Relaxed) {
         return false;
     }
+    t.irqs.fetch_add(1, Ordering::Relaxed);
     let now = now_ns();
     let mut due = false;
     let nt = t.next_tick.load(Ordering::Relaxed);
-    if now >= nt {
+    if t.periodic.load(Ordering::Relaxed) && now >= nt {
         due = true;
         t.ticks.fetch_add(1, Ordering::Relaxed);
         // Next grid point strictly after `now` (missed ticks are skipped,
@@ -228,6 +244,39 @@ pub fn set_deadline(ns: Option<u64>) {
         }
     }
     irq::restore(f);
+}
+
+/// Turn this CPU's periodic tick on or off (tickless idle, D77; the
+/// one-shot deadline is unaffected). Back on, the next tick is the next
+/// point of this CPU's grid.
+pub fn set_periodic(on: bool) {
+    let f = irq::save_disable();
+    let t = this_cpu();
+    if t.periodic.load(Ordering::Relaxed) != on {
+        t.periodic.store(on, Ordering::Relaxed);
+        if t.running.load(Ordering::Relaxed) {
+            let now = now_ns();
+            if on {
+                let nt = t.next_tick.load(Ordering::Relaxed);
+                if now >= nt {
+                    let next = nt + ((now - nt) / PERIOD_NS + 1) * PERIOD_NS;
+                    t.next_tick.store(next, Ordering::Relaxed);
+                }
+                if t.next_tick.load(Ordering::Relaxed) < t.armed.load(Ordering::Relaxed) {
+                    arm(t, now);
+                }
+            } else if t.armed.load(Ordering::Relaxed) != t.deadline.load(Ordering::Relaxed) {
+                // Counting down to a tick: retarget to the deadline (or stop).
+                arm(t, now);
+            }
+        }
+    }
+    irq::restore(f);
+}
+
+/// Timer interrupts taken on `cpu` so far (periodic, deadline, early).
+pub fn irq_count(cpu: usize) -> u64 {
+    TIMERS[cpu.min(MAX_CPUS - 1)].irqs.load(Ordering::Relaxed)
 }
 
 /// (periodic ticks, deadlines fired) on `cpu` so far (self-tests).
