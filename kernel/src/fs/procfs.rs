@@ -181,6 +181,8 @@ fn maps() -> Vec<u8> {
         let (ino, path) = match v.kind {
             VmaKind::Elf => (app_ino, "/app"),
             VmaKind::Stack => (0, "[stack]"),
+            VmaKind::Vdso => (0, "[vdso]"),
+            VmaKind::Vvar => (0, "[vvar]"),
             VmaKind::Anon => (0, ""),
         };
         let line = format!(

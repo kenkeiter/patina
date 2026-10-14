@@ -167,6 +167,10 @@ impl Shootdown {
     /// `pa` (one 4 KiB frame) was just unmapped from the live user tables:
     /// free it once no CPU can still reach it.
     pub fn free_frame(&mut self, pa: PhysAddr) {
+        if crate::vdso::is_vvar_frame(pa) {
+            // Kernel-owned and shared (D75): only the mapping goes away.
+            return;
+        }
         if self.immediate {
             frame::free_frames(pa, 0);
         } else {
