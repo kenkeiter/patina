@@ -100,6 +100,24 @@ pub trait Transport: Send + Sync {
     fn apple_vz(&self) -> bool {
         false
     }
+    /// A further interrupt vector for queues (a virtio-pci MSI-X table
+    /// entry from 1 up, its message targeting the boot CPU): `(vector,
+    /// line)`.
+    /// `None` (the default; virtio-mmio, INTx, a full table): queues share
+    /// the device's interrupt ([`Device::irq`]).
+    fn alloc_vector(&self) -> Option<(u16, IrqLine)> {
+        None
+    }
+    /// Signal queue `q`'s completions on `vector` (from
+    /// [`alloc_vector`](Self::alloc_vector)) instead of the shared one.
+    /// Call before the queue is set up; it survives device resets.
+    fn set_queue_vector(&self, _q: u16, _vector: u16) {}
+    /// Deliver `vector` to logical CPU `cpu` (which must be online). False
+    /// when the platform cannot target it (GICv3 ITS LPIs stay on the boot
+    /// CPU, D88).
+    fn set_vector_affinity(&self, _vector: u16, _cpu: usize) -> bool {
+        false
+    }
     fn config_read8(&self, off: usize) -> u8;
     fn config_read32(&self, off: usize) -> u32;
     fn config_read64(&self, off: usize) -> u64 {
@@ -178,11 +196,20 @@ pub fn unclaimed() -> usize {
 /// Leaves the device in ACKNOWLEDGE | DRIVER | FEATURES_OK; the caller sets
 /// up its queues and then calls [`driver_ok`]. Returns the accepted set.
 pub fn negotiate(t: &dyn Transport, wanted: u64) -> Result<u64, &'static str> {
+    negotiate_with(t, |_| wanted)
+}
+
+/// [`negotiate`] with the wanted set computed from the offered one (for
+/// features that only go together, e.g. virtio-net MQ + CTRL_VQ).
+pub fn negotiate_with(
+    t: &dyn Transport,
+    wanted: impl FnOnce(u64) -> u64,
+) -> Result<u64, &'static str> {
     t.set_status(0);
     t.set_status(STATUS_ACKNOWLEDGE);
     t.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
     let offered = t.device_features();
-    let mut accept = offered & wanted;
+    let mut accept = offered & wanted(offered);
     if t.modern() {
         if offered & F_VERSION_1 == 0 {
             t.set_status(STATUS_FAILED);

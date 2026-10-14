@@ -16,17 +16,22 @@
 //!   then `MAPC` collection 0 -> the boot CPU's redistributor (physical
 //!   address or processor number, per `GITS_TYPER.PTA`) and `SYNC`.
 //!
-//! Each [`alloc`] maps one event: `MAPD` (device id = PCI requester id
-//! through `msi-map`, an ITT page, 2 event ids), `MAPTI` event 0 -> the
-//! next free LPI in collection 0, `INV`, `SYNC`. The MSI message is
-//! address = `GITS_TRANSLATER`, data = 0 (the event id). Commands are
+//! Each [`alloc`] maps one event: on a device's first, `MAPD` (device id =
+//! PCI requester id through `msi-map`, an ITT of 32 event ids); then
+//! `MAPTI` the device's next event id -> the next free LPI in collection
+//! 0, `INV`, `SYNC`. The MSI message is address = `GITS_TRANSLATER`, data
+//! = the event id (one per MSI-X vector, D88). Commands are
 //! polled to completion (`GITS_CREADR` catches up with `GITS_CWRITER`).
-//! Every LPI targets the boot CPU, like the SPIs (D59).
+//! Every LPI starts on the boot CPU (collection 0), like the SPIs (D59);
+//! [`set_affinity`] moves one to another CPU (D88): collection ICID = that
+//! logical CPU, mapped on first use after enabling LPIs on its
+//! redistributor (shared configuration table, own pending table), then
+//! `MOVI`.
 
 use core::sync::atomic::{Ordering, fence};
 
-use super::paging::map_device;
 use super::gic;
+use super::paging::map_device;
 use crate::mm::{PAGE_SIZE, PhysAddr, frame, phys_to_virt};
 use crate::sync::SpinLock;
 
@@ -65,6 +70,7 @@ const BASER_VALID: u64 = 1 << 63;
 const BASER_TYPE_DEVICE: u64 = 1;
 const BASER_TYPE_COLLECTION: u64 = 4;
 
+const CMD_MOVI: u64 = 0x01;
 const CMD_SYNC: u64 = 0x05;
 const CMD_MAPD: u64 = 0x08;
 const CMD_MAPC: u64 = 0x09;
@@ -86,7 +92,23 @@ struct Its {
     /// Device ids covered by the device table.
     max_devid: u32,
     itt_entry: usize,
+    /// Mapped devices: (device id, event ids used). Each has an ITT of
+    /// [`EVENTS`] events, so a device can have several MSI-X vectors
+    /// (multi-queue virtio-net, D88).
+    devs: alloc::vec::Vec<(u32, u32)>,
+    /// (device id, event id) of each LPI handed out (index = LPI - 8192).
+    lpis: alloc::vec::Vec<(u32, u32)>,
+    /// `GITS_TYPER.PTA`: collections target redistributor addresses.
+    pta: bool,
+    /// The boot CPU's `GICR_PROPBASER` (shared by every redistributor).
+    propbaser: u64,
+    /// Bit per CPU whose collection (ICID = logical CPU) is mapped.
+    collections: u64,
 }
+
+/// Event ids per device (ITT size): 2^EVENT_BITS.
+const EVENT_BITS: u32 = 5;
+const EVENTS: u32 = 1 << EVENT_BITS;
 
 /// `None` inside: not tried yet; `Some(None)`: no usable ITS.
 static ITS: SpinLock<Option<Option<Its>>> = SpinLock::new(None);
@@ -145,15 +167,8 @@ impl Its {
         let prop = alloc_zeroed(n_lpis).ok_or("no memory")?;
         let pend = alloc_zeroed(64 * 1024).ok_or("no memory")?; // 64 KiB aligned
         publish();
-        w64(
-            rd + GICR_PROPBASER,
-            prop as u64 | SH_INNER | (CACHE_RAWAWB << 7) | (ID_BITS as u64 - 1),
-        );
-        w64(
-            rd + GICR_PENDBASER,
-            (1 << 62) | pend as u64 | SH_INNER | (CACHE_RAWAWB << 7),
-        );
-        w32(rd + GICR_CTLR, r32(rd + GICR_CTLR) | 1); // EnableLPIs
+        let propbaser = prop as u64 | SH_INNER | (CACHE_RAWAWB << 7) | (ID_BITS as u64 - 1);
+        enable_lpis(rd, propbaser, pend);
 
         // ITS: disabled while programming.
         w32(va + GITS_CTLR, 0);
@@ -234,6 +249,11 @@ impl Its {
             next_lpi: LPI_BASE,
             max_devid,
             itt_entry,
+            devs: alloc::vec::Vec::new(),
+            lpis: alloc::vec::Vec::new(),
+            pta,
+            propbaser,
+            collections: 1,
         };
         its.cmd([CMD_MAPC, 0, (1 << 63) | target, 0]); // ICID 0
         its.sync()?;
@@ -263,7 +283,12 @@ impl Its {
 
     /// `SYNC` and wait until the ITS consumed every queued command.
     fn sync(&mut self) -> Result<(), &'static str> {
-        self.cmd([CMD_SYNC, 0, self.target, 0]);
+        self.sync_to(self.target)
+    }
+
+    /// `SYNC` for the redistributor `target` (RDbase field) and wait.
+    fn sync_to(&mut self, target: u64) -> Result<(), &'static str> {
+        self.cmd([CMD_SYNC, 0, target, 0]);
         for _ in 0..10_000_000 {
             let r = r64(self.va + GITS_CREADR);
             if r & 1 != 0 {
@@ -285,24 +310,42 @@ impl Its {
             return Err("device id beyond the device table");
         }
         let lpi = self.next_lpi;
+        let known = self.devs.iter().position(|d| d.0 == devid);
+        let event = known.map_or(0, |i| self.devs[i].1);
+        if event >= EVENTS {
+            return Err("out of event ids for the device");
+        }
         // The LPI's configuration byte before it is mapped.
         let p = phys_to_virt(PhysAddr(self.prop + (lpi - LPI_BASE) as usize)).as_usize();
         // SAFETY: a byte of the LPI configuration table we own.
         unsafe { (p as *mut u8).write_volatile(LPI_PROP) };
         publish();
-        // ITT: 2 events (Size = event id bits - 1 = 0), 256-byte aligned.
-        let itt = alloc_zeroed((2 * self.itt_entry).max(256)).ok_or("no memory")?;
-        publish();
         let dev = (devid as u64) << 32;
-        self.cmd([CMD_MAPD | dev, 0, (1 << 63) | itt as u64, 0]);
-        self.cmd([CMD_MAPTI | dev, (lpi as u64) << 32, 0, 0]); // event 0, ICID 0
-        self.cmd([CMD_INV | dev, 0, 0, 0]);
+        if known.is_none() {
+            // ITT: EVENTS events (Size = event id bits - 1), 256-byte aligned.
+            let itt =
+                alloc_zeroed((EVENTS as usize * self.itt_entry).max(256)).ok_or("no memory")?;
+            publish();
+            self.cmd([
+                CMD_MAPD | dev,
+                EVENT_BITS as u64 - 1,
+                (1 << 63) | itt as u64,
+                0,
+            ]);
+        }
+        self.cmd([CMD_MAPTI | dev, (lpi as u64) << 32 | event as u64, 0, 0]); // ICID 0
+        self.cmd([CMD_INV | dev, event as u64, 0, 0]);
         self.sync()?;
+        match known {
+            Some(i) => self.devs[i].1 += 1,
+            None => self.devs.push((devid, 1)),
+        }
+        self.lpis.push((devid, event));
         self.next_lpi += 1;
         Ok(crate::drivers::pci::MsiMsg {
             irq: lpi,
             addr: (self.pa + GITS_TRANSLATER) as u64,
-            data: 0,
+            data: event,
         })
     }
 }
@@ -332,3 +375,78 @@ pub fn alloc(devid: u32) -> Option<crate::drivers::pci::MsiMsg> {
     }
 }
 
+/// Enable LPIs on the redistributor at `rd` (RD_base VA): the shared
+/// configuration table, a fresh pending table, `GICR_CTLR.EnableLPIs`.
+fn enable_lpis(rd: usize, propbaser: u64, pend: usize) {
+    publish();
+    w64(rd + GICR_PROPBASER, propbaser);
+    w64(
+        rd + GICR_PENDBASER,
+        (1 << 62) | pend as u64 | SH_INNER | (CACHE_RAWAWB << 7),
+    );
+    w32(rd + GICR_CTLR, r32(rd + GICR_CTLR) | 1); // EnableLPIs
+}
+
+impl Its {
+    /// RDbase field (shifted, as MAPC/SYNC take it) of `cpu`'s redistributor.
+    fn target_of(&self, cpu: usize) -> Option<u64> {
+        let rd = gic::rd_base_va(cpu)?;
+        Some(if self.pta {
+            (gic::rd_base_pa(cpu)? as u64 >> 16) << 16
+        } else {
+            ((r64(rd + GICR_TYPER) >> 8) & 0xffff) << 16
+        })
+    }
+
+    /// Collection `cpu` (ICID = logical CPU) -> `cpu`'s redistributor,
+    /// enabling LPIs there first. Returns the target.
+    fn collection(&mut self, cpu: usize) -> Result<u64, &'static str> {
+        let target = self.target_of(cpu).ok_or("redistributor unknown")?;
+        if self.collections & (1 << cpu) != 0 {
+            return Ok(target);
+        }
+        let rd = gic::rd_base_va(cpu).ok_or("redistributor unknown")?;
+        if r64(rd + GICR_TYPER) & 1 == 0 {
+            return Err("GICR_TYPER.PLPIS = 0");
+        }
+        if r32(rd + GICR_CTLR) & 1 == 0 {
+            let pend = alloc_zeroed(64 * 1024).ok_or("no memory")?;
+            enable_lpis(rd, self.propbaser, pend);
+        }
+        self.cmd([CMD_MAPC, 0, (1 << 63) | target | cpu as u64, 0]);
+        self.sync_to(target)?;
+        self.collections |= 1 << cpu;
+        Ok(target)
+    }
+
+    fn move_lpi(&mut self, lpi: u32, cpu: usize) -> Result<(), &'static str> {
+        let (devid, event) = *lpi
+            .checked_sub(LPI_BASE)
+            .and_then(|i| self.lpis.get(i as usize))
+            .ok_or("not an LPI of ours")?;
+        let target = self.collection(cpu)?;
+        self.cmd([CMD_MOVI | (devid as u64) << 32, event as u64, cpu as u64, 0]);
+        self.sync_to(target)
+    }
+}
+
+/// Deliver LPI `lpi` (from [`alloc`]) to logical CPU `cpu` (online, D88):
+/// a collection per CPU (mapped, and that CPU's redistributor given LPIs,
+/// on first use) and `MOVI`. False without an ITS or on a command error
+/// (logged).
+pub fn set_affinity(lpi: u32, cpu: usize) -> bool {
+    if cpu >= 64 {
+        return false;
+    }
+    let mut g = ITS.lock();
+    let Some(Some(its)) = g.as_mut() else {
+        return false;
+    };
+    match its.move_lpi(lpi, cpu) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::kprintln!("[patina] gic: its: lpi {} -> cpu {}: {}", lpi, cpu, e);
+            false
+        }
+    }
+}

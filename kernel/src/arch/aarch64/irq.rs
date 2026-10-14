@@ -99,6 +99,22 @@ pub fn alloc_msi(requester: u32) -> Option<crate::drivers::pci::MsiMsg> {
     its::alloc(requester).or_else(super::v2m::alloc)
 }
 
+/// The message that delivers MSI `msg` (from [`alloc_msi`]) to logical CPU
+/// `cpu` (online), keeping its IRQ number (D88): the message itself never
+/// changes. A GICv2m SPI is re-routed at the distributor, an ITS LPI moved
+/// to that CPU's collection (`MOVI`). `None` if that failed.
+pub fn msi_affinity(
+    msg: crate::drivers::pci::MsiMsg,
+    cpu: usize,
+) -> Option<crate::drivers::pci::MsiMsg> {
+    let moved = if lpi_index(msg.irq).is_some() {
+        its::set_affinity(msg.irq, cpu)
+    } else {
+        gic::route_spi(msg.irq, cpu)
+    };
+    moved.then_some(msg)
+}
+
 /// Set the trigger mode of device interrupt `intid` (an SPI; from the
 /// DTB `interrupts` flags) before [`register`]. GIC SPIs are active-high
 /// only, so `active_low` is ignored. Initializes the GIC if needed.

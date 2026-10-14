@@ -21,7 +21,12 @@
 //!   `msix_config` with `DRIVER_OK` (a device reset clears both), each
 //!   read back (`0xffff` = rejected). The [`IrqLine`](super::IrqLine) the
 //!   drivers get names the arch IRQ number the message was bound to, so
-//!   `attach_irq` routes it like any other line.
+//!   `attach_irq` routes it like any other line. A driver may take further
+//!   vectors for some queues (multi-queue virtio-net, D88):
+//!   [`Transport::alloc_vector`] writes a fresh `alloc_msi` message to the
+//!   next table entry, `set_queue_vector` makes `queue_setup` program it,
+//!   and `set_vector_affinity` re-targets it (`arch::irq::msi_affinity`;
+//!   the entry is masked while a changed message is written).
 //! * INTx (aarch64 without an ITS, or `patina.pci.irq=intx`): the
 //!   interrupt pin through the DTB `interrupt-map` to a level-triggered
 //!   GIC SPI; reading the ISR register in `ack_interrupt` deasserts it.
@@ -34,8 +39,9 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use super::{Device, INT_VRING, IrqLine, STATUS_DRIVER_OK, Transport};
-use crate::drivers::pci::{self, BarAlloc, Bdf, Function, Host};
+use crate::drivers::pci::{self, BarAlloc, Bdf, Function, Host, MsiMsg};
 use crate::mm::PhysAddr;
+use crate::sync::SpinLock;
 
 pub const VENDOR: u16 = 0x1af4;
 /// PCI vendor id of Apple's host bridge (Virtualization.framework: 0x106b:0x1a05).
@@ -65,6 +71,11 @@ const QUEUE_DESC: usize = 0x20;
 const QUEUE_DRIVER: usize = 0x28;
 const QUEUE_DEVICE: usize = 0x30;
 
+/// Queues whose notify offset / MSI-X vector is cached at least (a
+/// multi-queue virtio-net has more queues once MQ is negotiated than
+/// `num_queues` says at probe).
+const QUEUE_CACHE: u16 = 64;
+
 /// No MSI-X vector / vector rejected.
 pub const NO_VECTOR: u16 = 0xffff;
 
@@ -93,13 +104,24 @@ pub struct PciTransport {
     isr: usize,
     device: usize,
     device_len: usize,
-    num_queues: u16,
-    /// `queue_notify_off` per queue, read at `queue_setup`.
+    /// `queue_notify_off` per queue (the first max(num_queues at probe,
+    /// [`QUEUE_CACHE`])), read at `queue_setup`.
     notify_off: Vec<AtomicU16>,
     /// MSI-X vector 0 is routed: program it into the device.
     msix: bool,
     /// The host bridge is Apple's: the device is Virtualization.framework's.
     apple: bool,
+    /// MSI-X table VA and entry count (0 without MSI-X).
+    msix_table: usize,
+    msix_entries: u16,
+    /// MSI requester id (`arch::irq::alloc_msi`).
+    requester: u32,
+    /// MSI-X vector per queue (0 unless `set_queue_vector`; as many as
+    /// `notify_off`).
+    queue_vector: Vec<AtomicU16>,
+    /// Messages of vectors 1.. handed out by `alloc_vector` (index =
+    /// vector - 1).
+    vectors: SpinLock<Vec<MsiMsg>>,
 }
 
 impl PciTransport {
@@ -141,6 +163,24 @@ impl PciTransport {
         self.w16(reg, vector);
         self.r16(reg) == vector
     }
+
+    /// Write MSI-X table entry `v` (masked while the message changes) and
+    /// unmask it.
+    fn write_entry(&self, v: u16, m: MsiMsg) {
+        debug_assert!(v < self.msix_entries && self.msix_table != 0);
+        let e = self.msix_table + 16 * v as usize;
+        // SAFETY: entry `v` (16 bytes) of the MSI-X table, inside the BAR
+        // mapped at probe (the whole table was bounds-checked there):
+        // message address lo/hi, data, vector control.
+        unsafe {
+            let c = ((e + 12) as *const u32).read_volatile();
+            ((e + 12) as *mut u32).write_volatile(c | MSIX_ENTRY_CTRL_MASKED);
+            (e as *mut u32).write_volatile(m.addr as u32);
+            ((e + 4) as *mut u32).write_volatile((m.addr >> 32) as u32);
+            ((e + 8) as *mut u32).write_volatile(m.data);
+            ((e + 12) as *mut u32).write_volatile(c & !MSIX_ENTRY_CTRL_MASKED);
+        }
+    }
 }
 
 impl Transport for PciTransport {
@@ -172,6 +212,49 @@ impl Transport for PciTransport {
         Some(if self.msix { "msi-x" } else { "intx" })
     }
 
+    fn alloc_vector(&self) -> Option<(u16, IrqLine)> {
+        if !self.msix {
+            return None;
+        }
+        let mut vs = self.vectors.lock();
+        let v = vs.len() as u16 + 1;
+        if v >= self.msix_entries {
+            return None;
+        }
+        let m = crate::arch::irq::alloc_msi(self.requester)?;
+        self.write_entry(v, m);
+        vs.push(m);
+        Some((
+            v,
+            IrqLine {
+                irq: m.irq,
+                edge: true,
+                active_low: false,
+            },
+        ))
+    }
+
+    fn set_queue_vector(&self, q: u16, vector: u16) {
+        if let Some(e) = self.queue_vector.get(q as usize) {
+            e.store(vector, Ordering::Relaxed);
+        }
+    }
+
+    fn set_vector_affinity(&self, vector: u16, cpu: usize) -> bool {
+        let mut vs = self.vectors.lock();
+        let Some(m) = vector.checked_sub(1).and_then(|i| vs.get_mut(i as usize)) else {
+            return false;
+        };
+        let Some(n) = crate::arch::irq::msi_affinity(*m, cpu) else {
+            return false;
+        };
+        if (n.addr, n.data) != (m.addr, m.data) {
+            self.write_entry(vector, n);
+            *m = n;
+        }
+        true
+    }
+
     fn modern(&self) -> bool {
         true
     }
@@ -181,10 +264,7 @@ impl Transport for PciTransport {
     }
 
     fn set_status(&self, s: u32) {
-        if s & STATUS_DRIVER_OK != 0
-            && self.msix
-            && !self.set_vector(MSIX_CONFIG, 0)
-        {
+        if s & STATUS_DRIVER_OK != 0 && self.msix && !self.set_vector(MSIX_CONFIG, 0) {
             crate::kprintln!("[patina] virtio-pci: device refused msix_config vector 0");
         }
         self.w8(DEVICE_STATUS, s as u8);
@@ -210,7 +290,9 @@ impl Transport for PciTransport {
     }
 
     fn queue_max(&self, q: u16) -> u16 {
-        if q >= self.num_queues {
+        // Read live: virtio-net's queue count grows once MQ is negotiated
+        // (QEMU adds the further pairs then).
+        if q >= self.r16(NUM_QUEUES) {
             return 0;
         }
         self.w16(QUEUE_SELECT, q);
@@ -223,11 +305,22 @@ impl Transport for PciTransport {
     fn queue_setup(&self, q: u16, size: u16, desc: u64, avail: u64, used: u64) {
         self.w16(QUEUE_SELECT, q);
         self.w16(QUEUE_SIZE, size);
-        if self.msix && !self.set_vector(QUEUE_MSIX_VECTOR, 0) {
+        let v = self
+            .queue_vector
+            .get(q as usize)
+            .map_or(0, |v| v.load(Ordering::Relaxed));
+        if self.msix && !self.set_vector(QUEUE_MSIX_VECTOR, v) {
             crate::kprintln!(
-                "[patina] virtio-pci: device refused msi-x vector 0 for queue {}",
+                "[patina] virtio-pci: device refused msi-x vector {} for queue {}",
+                v,
                 q
             );
+            if v != 0 && !self.set_vector(QUEUE_MSIX_VECTOR, 0) {
+                crate::kprintln!(
+                    "[patina] virtio-pci: device refused msi-x vector 0 for queue {}",
+                    q
+                );
+            }
         }
         self.w64(QUEUE_DESC, desc);
         self.w64(QUEUE_DRIVER, avail);
@@ -239,10 +332,16 @@ impl Transport for PciTransport {
     }
 
     fn notify(&self, q: u16) {
-        let off = self
-            .notify_off
-            .get(q as usize)
-            .map_or(0, |n| n.load(Ordering::Relaxed)) as usize
+        let off = match self.notify_off.get(q as usize) {
+            Some(n) => n.load(Ordering::Relaxed),
+            // Beyond the cache (a virtio-net control queue at 2 × a large
+            // max_virtqueue_pairs): only kicked during init, when nothing
+            // else selects this device's queues.
+            None => {
+                self.w16(QUEUE_SELECT, q);
+                self.r16(QUEUE_NOTIFY_OFF)
+            }
+        } as usize
             * self.notify_mult as usize;
         if off + 2 > self.notify_len {
             return;
@@ -355,7 +454,10 @@ pub fn probe(h: &Host, f: &mut Function, alloc: &mut BarAlloc, pref: IrqPref) ->
         return false;
     };
     if common.len < 0x38 {
-        crate::kprintln!("[patina] virtio: pci {} common cfg too short, skipped", name);
+        crate::kprintln!(
+            "[patina] virtio: pci {} common cfg too short, skipped",
+            name
+        );
         return false;
     }
 
@@ -396,15 +498,17 @@ pub fn probe(h: &Host, f: &mut Function, alloc: &mut BarAlloc, pref: IrqPref) ->
         let cpu = pci::bus_to_cpu(h, b.addr);
         va[i] = crate::arch::paging::map_device(PhysAddr(cpu as usize), b.size as usize).as_usize();
     }
-    let within = |c: Cap| {
-        f.bars[c.bar as usize].is_some_and(|b| c.off as u64 + c.len as u64 <= b.size)
-    };
+    let within =
+        |c: Cap| f.bars[c.bar as usize].is_some_and(|b| c.off as u64 + c.len as u64 <= b.size);
     if ![Some(common), Some(notify), Some(isr), device]
         .into_iter()
         .flatten()
         .all(within)
     {
-        crate::kprintln!("[patina] virtio: pci {} capability outside its BAR, skipped", name);
+        crate::kprintln!(
+            "[patina] virtio: pci {} capability outside its BAR, skipped",
+            name
+        );
         return false;
     }
     let at = |c: Cap| va[c.bar as usize] + c.off as usize;
@@ -415,12 +519,14 @@ pub fn probe(h: &Host, f: &mut Function, alloc: &mut BarAlloc, pref: IrqPref) ->
     // Interrupts.
     let mut irq = None;
     let mut msix = false;
+    let (mut table_va, mut entries) = (0usize, 0u16);
+    let requester = bdf.rid().wrapping_add(h.desc.msi_devid_offset);
     if pref == IrqPref::Auto
         && let (Some(p), Some((bir, toff, n))) = (msix_cap, msix_table)
         && (bir as usize) < 6
         && va[bir as usize] != 0
         && f.bars[bir as usize].is_some_and(|b| toff as u64 + 16 * n as u64 <= b.size)
-        && let Some(m) = crate::arch::irq::alloc_msi(bdf.rid().wrapping_add(h.desc.msi_devid_offset))
+        && let Some(m) = crate::arch::irq::alloc_msi(requester)
     {
         let ctrl = h.read16(bdf, p + 2);
         // Enable with the function masked while the entry is written.
@@ -439,6 +545,7 @@ pub fn probe(h: &Host, f: &mut Function, alloc: &mut BarAlloc, pref: IrqPref) ->
         cmd |= pci::CMD_INTX_DISABLE;
         h.write16(bdf, pci::CFG_COMMAND, cmd);
         msix = true;
+        (table_va, entries) = (e, n);
         irq = Some(IrqLine {
             irq: m.irq,
             edge: true,
@@ -462,7 +569,11 @@ pub fn probe(h: &Host, f: &mut Function, alloc: &mut BarAlloc, pref: IrqPref) ->
             "[patina] virtio: pci {} device-id {}: no usable interrupt (msi-x {}, intx pin {}); registered without one",
             name,
             device_type,
-            if msix_cap.is_some() { "present but not routable" } else { "absent" },
+            if msix_cap.is_some() {
+                "present but not routable"
+            } else {
+                "absent"
+            },
             h.read8(bdf, pci::CFG_INT_PIN)
         );
     }
@@ -478,7 +589,6 @@ pub fn probe(h: &Host, f: &mut Function, alloc: &mut BarAlloc, pref: IrqPref) ->
         isr: at(isr),
         device: device.map_or(0, at),
         device_len: device.map_or(0, |d| d.len as usize),
-        num_queues: 0,
         notify_off: Vec::new(),
         msix,
         apple: h.read16(
@@ -489,11 +599,16 @@ pub fn probe(h: &Host, f: &mut Function, alloc: &mut BarAlloc, pref: IrqPref) ->
             },
             pci::CFG_VENDOR,
         ) == APPLE_VENDOR,
+        msix_table: table_va,
+        msix_entries: entries,
+        requester,
+        queue_vector: Vec::new(),
+        vectors: SpinLock::new(Vec::new()),
     };
-    let nq = t.r16(NUM_QUEUES);
+    let nq = t.r16(NUM_QUEUES).max(QUEUE_CACHE);
     let t = PciTransport {
-        num_queues: nq,
         notify_off: (0..nq).map(|_| AtomicU16::new(0)).collect(),
+        queue_vector: (0..nq).map(|_| AtomicU16::new(0)).collect(),
         ..t
     };
     super::register_transport(

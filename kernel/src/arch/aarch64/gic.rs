@@ -376,8 +376,36 @@ pub fn set_trigger(intid: u32, edge: bool) {
 
 /// This CPU's affinity in GICD_IROUTER format (Aff3 at [39:32]).
 fn my_affinity_router() -> u64 {
-    let m = cpu::mpidr();
+    affinity_router(cpu::mpidr())
+}
+
+/// An MPIDR in GICD_IROUTER format (Aff3 at [39:32], Interrupt_Routing_Mode 0).
+fn affinity_router(m: u64) -> u64 {
     (m & 0xff_ffff) | (m & (0xff << 32))
+}
+
+/// Route SPI `intid` to logical CPU `cpu` (D88): GICv3 `GICD_IROUTER` =
+/// that CPU's affinity, GICv2 `GICD_ITARGETSR` = its CPU-interface mask
+/// (known once it ran [`init_cpu`]). False for SGIs/PPIs/LPIs or an
+/// unknown target. Safe while the SPI is enabled (the next assertion goes
+/// to the new target).
+pub fn route_spi(intid: u32, cpu: usize) -> bool {
+    if !(32..SPECIAL_INTID).contains(&intid) || cpu >= cpu::MAX_CPUS || !is_initialized() {
+        return false;
+    }
+    let g = gic();
+    let i = intid as usize;
+    if g.version == 3 {
+        let m = super::smp::mpidr_of(cpu);
+        wr64(g.dist + GICD_IROUTER + 8 * i, affinity_router(m));
+    } else {
+        let mask = V2_TARGET[cpu].load(Ordering::Relaxed);
+        if mask == 0 {
+            return false;
+        }
+        wr8(g.dist + GICD_ITARGETSR + i, mask);
+    }
+    true
 }
 
 /// Acknowledge the highest-priority pending interrupt on this CPU:

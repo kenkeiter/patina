@@ -1819,7 +1819,8 @@ thread's 250 ms poll.
 capabilities and the MSI-X table, the KVM ITS with 64 KiB table pages, the
 MSHV v2m DTB override, and `msi-map` offsets for segment > 0. Not done:
 x86 INTx (`_PRT`), bridge renumbering, the swizzle for INTx behind bridges,
-per-queue MSI-X vectors, and LPIs targeted at CPUs other than the boot CPU.
+per-queue MSI-X vectors, and LPIs targeted at CPUs other than the boot CPU
+(both done for multi-queue virtio-net in D88).
 
 ## D71: AF_UNIX sockets: one table, names by id, fds in flight as `OpenFile`s
 *2026-10-14 · Phase 4*
@@ -2943,3 +2944,118 @@ the kernel before in every case: pipes until `write` ENOMEM (2875), UDP
 sockets until ENOBUFS (2787), 4096 listening sockets (then ENFILE), epolls
 until ENOMEM (734186), and tmpfs writes after committing all memory
 (ENOSPC); each exits 0.
+
+## D88: Multi-queue virtio-net: a queue pair per vCPU, per-pair MSI-X vectors on their CPU, one interface
+*2026-10-14 · Phase 5*
+
+`drivers/virtio/net.rs` (amends D69), `virtio/pci.rs`, `virtio/mod.rs`,
+`arch/aarch64/{its,gic,irq}.rs`, `arch/x86_64/irq.rs`.
+**Negotiation.** With more than one vCPU the driver also accepts
+`VIRTIO_NET_F_MQ` (22) + `VIRTIO_NET_F_CTRL_VQ` (17) when both are offered
+(`virtio::negotiate_with` computes the wanted set from the offered one),
+reads `max_virtqueue_pairs` (config offset 8) and sets up P = min(vCPUs,
+max pairs, `patina.net.queues`, 8) pairs (receiveq*k* = 2*k*,
+transmitq*k* = 2*k*+1) plus the control queue at 2 × max pairs. After
+`DRIVER_OK` it sends `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` P (class 4, command
+0; header, le16, device-writable ack) and polls the used ring for at most
+100 ms — the one device round trip the driver now waits for (QEMU answers
+inside the notify). Anything but `VIRTIO_NET_OK` leaves pair 0 alone in
+use. `patina.net.queues=1`, one vCPU, or a device without MQ give exactly
+D69's single pair. The boot line gains `pairs P[ of MAX][, msi-x vector
+per pair]`; `patina.stats=1` adds `[patina] stats net: virtio-net pairs P,
+rx frames a/b/…, tx frames …, irqs per cpu …, irq cpus …` (lock-free
+counters, printed at exit).
+
+**Data path.** D67 holds: one smoltcp `Interface`, and the
+`net::device::NetDevice` trait, `net/mux.rs` and `net/stack.rs` are
+unchanged. All pairs live in the driver's one `SpinLock<Option<Net>>`
+(every call already comes from under the stack lock). `recv` takes the
+next used buffer from the pairs round robin (resuming after the pair that
+delivered last, so a busy queue cannot starve the others). `send` uses
+pair `cpu % P` — the net task's CPU, or the CPU of a syscall that polls
+inline — and the next pair with a free slot when that one is full;
+`can_send` is false only when every pair is full, which keeps D85's "no
+transmit token while the NIC cannot take a frame". A flow whose segments
+are sent from different CPUs uses different transmit queues, so a device
+may reorder them across queues (TCP tolerates it; Linux XPS has the same
+property).
+
+**Interrupts.** On virtio-pci with MSI-X and P > 1, each pair gets its own
+vector: `Transport::alloc_vector` takes the next MSI-X table entry with a
+fresh `arch::irq::alloc_msi` message (boot CPU), `set_queue_vector` makes
+`queue_setup` program it for both queues of the pair, and vector 0 keeps
+config changes and the control queue. When the table is too small for P
+vectors (QEMU's default `vectors` is 2P + 2), every queue shares vector 0.
+Pair *k*'s vector is moved to CPU *k* once that CPU is online, checked on
+the receive path (`arch::smp::is_online`): drivers start before the
+secondaries, and `net::wait_dhcp` runs before them too, so an interrupt
+aimed at a CPU that is not up yet would be lost (x86: a LAPIC in
+wait-for-SIPI) or left pending. `Transport::set_vector_affinity` →
+`arch::irq::msi_affinity(msg, cpu)`: x86_64 rewrites the entry's message
+address with that CPU's APIC id (the entry masked while it changes);
+aarch64 re-routes a GICv2m SPI at the distributor (`gic::route_spi`:
+GICv3 `GICD_IROUTER` = the CPU's affinity, GICv2 `GICD_ITARGETSR` = its
+CPU-interface mask) or moves an ITS LPI (`its::set_affinity`: collection
+ICID = logical CPU, mapped on first use after enabling LPIs on that CPU's
+redistributor with the shared `GICR_PROPBASER` and its own pending table,
+then `MOVI` and `SYNC`). The ITS now gives each device an ITT of 32 event
+ids (`MAPD` once per device; vector *n* is event *n*, the MSI data) — D70
+remapped the device on every allocation, which would have dropped vector
+0's mapping. virtio-mmio and INTx (Apple VZ) have one line per device: all
+queues share it, on the boot CPU. The PCI transport reads `num_queues` live
+in `queue_max` (QEMU adds the further pairs only once MQ is negotiated: at
+probe a 4-pair device reports 3 queues) and caches notify offsets and
+vectors for at least 64 queues; a queue beyond that (a control queue of a
+device with > 31 pairs) is notified through `queue_select` (init only).
+
+One bug found on the way, in D69's order: interrupts are now attached
+before `DRIVER_OK`. QEMU `virt`'s DTB declares virtio-mmio interrupts
+edge-triggered, but QEMU drives the line as a level (InterruptStatus ≠
+0); an interrupt raised between the first receive kick and `attach_irq`
+was never acknowledged, the line stayed high and no edge ever came again,
+so the NIC ran on the net task's 1 s poll. It showed with 4 pairs on a
+tap whose host side sends IPv6 neighbour discovery at once (`/big` 2 s).
+
+**Offloads stay off.** QEMU's user network has no vnet-header peer, so
+QEMU withdraws `CSUM`/`GUEST_CSUM`/TSO: nothing to measure on QEMU here.
+VZ offers `CSUM`, `GUEST_CSUM` and TSO (features 0x5300119ab), but
+smoltcp has one checksum capability per device (the mux serves the NIC
+and loopback with it), no per-packet "data valid" and no partial
+(pseudo-header-seeded) transmit checksums, which `NEEDS_CSUM` requires —
+and its capabilities live in `net/mux.rs`/`stack.rs`. `MRG_RXBUF` only
+pays with GSO/TSO; 1514-byte frames fit the 2 KiB buffers.
+
+**Where it negotiates (QEMU 11.1.2 on macOS, Apple VZ on macOS 26).**
+QEMU's network backends on macOS are all single-queue: `-netdev
+user|socket|stream|dgram` have no `queues=`; `tap` with `fds=` and
+several queues aborts in `virtio_net_set_queue_pairs` (BSD's
+`tap_fd_disable` fails); Homebrew's QEMU has no vhost-user netdev. So with
+`mq=on` QEMU offers MQ with `max_virtqueue_pairs` 1: virtio-mmio and
+virtio-pci (aarch64 hvf, x86_64 TCG microvm/q35) log `pairs 1 of 1` and
+`VQ_PAIRS_SET 1` is answered OK. VZ offers no MQ (and no control queue):
+unchanged, one pair, INTx. Real multi-queue was exercised with a Linux
+QEMU (Debian trixie, QEMU 10.0, TCG) in a privileged Docker container on
+this Mac: `-netdev tap,queues=4,vhost=off` with `mq=on` (and `vectors=10`
+on PCI), Linux tun steering each flow to the queue the guest last sent it
+on. Recipe: an image `FROM debian:trixie-slim` with `qemu-system-arm
+qemu-system-x86 python3 curl iproute2 procps`, then `docker run --rm
+--privileged -v $PWD:/patina -w /patina <image> scripts/test-netmq.sh
+<arch> --no-build --backend tap` (kernels and `out/test/netmq/
+httphello-<arch>.cpio` built on the host first). Results: P = min(vCPUs,
+4) on both transports and arches, every pair carrying frames in both
+directions, NIC interrupts on every CPU with x86 q35 (MSI), aarch64 ITS
+(TCG default) and aarch64 GICv2m (`-M virt,gic-version=2`); virtio-mmio
+and aarch64 GICv3 with `its=off` (INTx) keep one shared line on CPU 0.
+Untested: GICv3 `GICD_IROUTER` routing of a GICv2m SPI (that is QEMU hvf,
+where no multi-queue backend exists), Cloud Hypervisor (`num_queues`),
+Firecracker (no MQ).
+
+**Measurements** (`scripts/test-netmq.sh`, median of 5; `scripts/bench.sh`'s
+`tcp-*` rows only use loopback and do not reach the NIC). MEASUREMENTS
+
+**CLI.** Unchanged: the QEMU argv keeps `virtio-net-device,netdev=net0`
+without `mq=on`. With `-netdev user` the device can only offer one pair
+(the flag would add just a control queue), and a tap netdev would need
+`queues=N` and a tap created `multi_queue` (QEMU fails on a persistent
+single-queue tap), so multi-queue is for hand-written VMM command lines and
+hosts that provide it (doc/cli-contract.md).

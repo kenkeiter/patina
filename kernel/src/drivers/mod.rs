@@ -63,7 +63,7 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     virtio::console::init(cmdline);
     virtio::vsock::init();
     // virtio-net registers itself with `net::device` for the stack.
-    virtio::net::init();
+    virtio::net::init(cmdline);
     let left = virtio::unclaimed();
     if left > 0 {
         crate::kprintln!("[patina] virtio: {} device(s) left undriven", left);

@@ -11,7 +11,8 @@
 //! MSI / MSI-X (Phase 4, D70): [`alloc_msi`] takes a vector from the same
 //! range and names it with the IRQ number [`MSI_IRQ_BASE`] + vector, which
 //! [`configure`] ignores and [`register`] binds without touching the I/O
-//! APIC. The message targets the boot CPU's LAPIC (fixed delivery, edge).
+//! APIC. The message targets the boot CPU's LAPIC (fixed delivery, edge);
+//! [`msi_affinity`] gives the message for another CPU (D88).
 
 use core::arch::asm;
 
@@ -102,6 +103,24 @@ pub fn alloc_msi(_requester: u32) -> Option<crate::drivers::pci::MsiMsg> {
         irq,
         addr: 0xfee0_0000 | ((dest as u64) << 12),
         data: vector,
+    })
+}
+
+/// The message that delivers MSI `msg` (from [`alloc_msi`]) to logical CPU
+/// `cpu` (online): the same vector, physical destination = that CPU's
+/// APIC id (D88). The device must be given the new message. `None` for a
+/// GSI or an APIC id that does not fit xAPIC format.
+pub fn msi_affinity(
+    msg: crate::drivers::pci::MsiMsg,
+    cpu: usize,
+) -> Option<crate::drivers::pci::MsiMsg> {
+    if msg.irq < MSI_IRQ_BASE || cpu >= super::smp::cpu_count() {
+        return None;
+    }
+    let dest = super::smp::apic_id(cpu);
+    (dest < 0xff).then_some(crate::drivers::pci::MsiMsg {
+        addr: 0xfee0_0000 | ((dest as u64) << 12),
+        ..msg
     })
 }
 
