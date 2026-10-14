@@ -12,6 +12,9 @@
 //!
 //! * [`netlink`]: `NETLINK_ROUTE` request parsing and the link/address
 //!   dump replies (`net.Interfaces`).
+//! * [`vsock`]: AF_VSOCK stream sockets — the virtio-vsock header codec,
+//!   connection state machine, credit accounting and port table (D76,
+//!   not wired into the kernel yet).
 //!
 //! The kernel (`kernel/src/net/`) wires these to smoltcp.
 
@@ -21,6 +24,7 @@ extern crate alloc;
 
 pub mod netlink;
 pub mod unix;
+pub mod vsock;
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
