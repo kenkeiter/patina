@@ -811,6 +811,26 @@ impl AddressSpace {
         self.brk
     }
 
+    /// How many bytes from `va` (at most `len`) a kernel copy-out could
+    /// write: the length of the run of writable VMAs starting at `va`.
+    /// Syscalls that consume data (pipe/socket reads, epoll events,
+    /// directory positions) size their read by this before consuming
+    /// anything, so a bad buffer cannot make them drop data (D86). Walks
+    /// VMAs only: O(VMAs in range), no faults, no allocation.
+    pub fn writable_prefix(&self, va: usize, len: usize) -> usize {
+        let Some(end) = va.checked_add(len) else {
+            return 0;
+        };
+        let mut cur = va;
+        while cur < end {
+            match self.find(cur) {
+                Some(v) if v.allows(Access::Write) => cur = v.end,
+                _ => break,
+            }
+        }
+        cur.min(end) - va
+    }
+
     /// One step of `mincore` (Linux `mm/mincore.c do_mincore`): the
     /// residency (1/0 per page) of the pages from `addr` (page aligned) to
     /// the end of the VMA containing it, at most `pages` and `out.len()`

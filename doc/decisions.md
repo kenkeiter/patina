@@ -2759,3 +2759,38 @@ addresses (the guest answers in < 1 ms); the e2e test treats the first
 request as informational. Also noted: every accepted TCP connection sends
 one 1-byte segment right after the handshake (smoltcp keep-alive
 handling, harmless, not fixed).
+
+## D86: User buffers are checked before data is consumed
+*2026-10-14 · Phase 5*
+
+Reads that consume something (pipe and socket data, eventfd counters,
+directory positions, edge-triggered and one-shot epoll events) used to
+consume it into a kernel bounce buffer and only then copy it out; a bad
+buffer gave EFAULT after the data was gone, and a huge count with a
+kernel-half pointer was not refused up front. Now `read`, `readv`,
+`pread64`, `getdents64` (directories), `recvfrom`, `recvmsg` and
+`epoll_pwait`/`epoll_pwait2`/`epoll_wait` first do Linux's `access_ok`
+(`vm::access_ok`: the range is in the user half and does not overflow →
+otherwise EFAULT, at the point in the argument checks where Linux does
+it), then size the operation to `AddressSpace::writable_prefix`: the run of
+writable VMAs starting at the buffer (iovec arrays are trimmed the same
+way, `fs::clamp_iov_out`). Not one writable byte is EFAULT with nothing
+consumed. `recvmsg` also requires the `msghdr` and the name buffer to be
+writable before receiving, and offers control data only the writable part
+of `msg_control`; `recvfrom` checks `addrlen` and the address buffer. An
+epoll event whose copy-out still fails (a page that cannot be filled) is
+put back on the ready list (`Epoll::unreport`, Linux `ep_send_events`),
+`EPOLLONESHOT` items re-armed.
+
+Divergences. When a buffer is only partly valid, patina returns a short
+count sized to the valid part *before* reading, and leaves the rest of the
+data queued. Linux copies until the fault and returns the partial count for
+pipes, streams and files (the same result), but for a datagram it returns
+EFAULT and drops the datagram; patina delivers the valid prefix with
+`MSG_TRUNC` semantics (the rest of that datagram is lost, as with any short
+datagram read). A buffer with no writable byte at all (unmapped or
+read-only) is EFAULT at once, whereas Linux would first block until data
+arrives (and for epoll requeue the event); the errno is the same, the
+blocking is not. The check walks VMAs only (no faults, no allocation), so a
+page that is mapped but cannot be filled (out of memory, D78) can still
+fail the copy after consumption; that returns ENOMEM/EFAULT as before.

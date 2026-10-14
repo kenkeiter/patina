@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use patina_abi::current::EpollEvent;
 use patina_abi::epoll::{EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EpollFlags};
-use patina_abi::errno::{EBADF, EINTR, EINVAL, Errno};
+use patina_abi::errno::{EBADF, EFAULT, EINTR, EINVAL, ENOMEM, Errno};
 use patina_abi::fs::{O_RDWR, POLLNVAL, PollFd};
 use patina_abi::signal::{SIGSET_SIZE, SigSet};
 use patina_abi::time::{Timespec, Timeval};
@@ -27,6 +27,7 @@ use super::{SysResult, proc, with_space};
 use crate::arch::timer;
 use crate::fs::epoll::Epoll;
 use crate::fs::file::{OpenFile, PollHook, PollWaiter};
+use crate::mm::vm::access_ok;
 use crate::task::{WakeReason, signal};
 
 /// How long to wait: `block == false` → return at once.
@@ -146,6 +147,12 @@ pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: usize) -> SysResult {
     Ok(0)
 }
 
+/// `epoll_pwait`/`epoll_pwait2` after the timeout was read, in Linux's
+/// order (`fs/eventpoll.c do_epoll_pwait`, `do_epoll_wait`): the signal
+/// mask (`sigsetsize` → EINVAL, copy → EFAULT), `maxevents` → EINVAL,
+/// `access_ok(events)` → EFAULT, the fd → EBADF, not an epoll → EINVAL.
+/// Events are collected only for the writable part of `events` (D86); one
+/// that still cannot be copied out is put back on the ready list.
 fn epoll_wait_common(
     epfd: i32,
     events: usize,
@@ -154,18 +161,39 @@ fn epoll_wait_common(
     sigmask: usize,
     sigsetsize: usize,
 ) -> SysResult {
-    if maxevents <= 0 || maxevents as usize > i32::MAX as usize / size_of::<EpollEvent>() {
-        return Err(Errno(EINVAL));
-    }
-    let of = get(epfd)?;
-    let ep = of.file.as_epoll().ok_or(Errno(EINVAL))?;
-    let evs = with_sigmask(sigmask, sigsetsize, || {
-        ep.wait(maxevents as usize, tmo.block, tmo.deadline)
-    })?;
-    if !evs.is_empty() {
-        with_space(|s| s.copy_to_user(events, evs.as_slice().as_bytes()))?;
-    }
-    Ok(evs.len() as isize)
+    with_sigmask(sigmask, sigsetsize, || {
+        const EV: usize = size_of::<EpollEvent>();
+        if maxevents <= 0 || maxevents as usize > i32::MAX as usize / EV {
+            return Err(Errno(EINVAL));
+        }
+        let bytes = maxevents as usize * EV;
+        if !access_ok(events, bytes) {
+            return Err(Errno(EFAULT));
+        }
+        let of = get(epfd)?;
+        let ep = of.file.as_epoll().ok_or(Errno(EINVAL))?;
+        let room = with_space(|s| s.writable_prefix(events, bytes)) / EV;
+        if room == 0 {
+            return Err(Errno(EFAULT));
+        }
+        let evs = ep.wait(room, tmo.block, tmo.deadline)?;
+        // Copy event by event: a fault keeps the rest on the ready list.
+        let mut done = 0;
+        let r = with_space(|s| {
+            for r in &evs {
+                s.write_val(events + done * EV, &r.ev)?;
+                done += 1;
+            }
+            Ok::<(), Errno>(())
+        });
+        if let Err(e) = r {
+            ep.unreport(&evs[done..]);
+            if done == 0 {
+                return Err(if e == Errno(ENOMEM) { e } else { Errno(EFAULT) });
+            }
+        }
+        Ok(done as isize)
+    })
 }
 
 pub fn epoll_pwait(

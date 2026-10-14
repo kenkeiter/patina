@@ -28,9 +28,10 @@ use patina_abi::net::*;
 use patina_abi::signal::{SI_USER, SIGPIPE, SigInfo};
 use patina_inet::{AddrError, SOCKADDR_MAX, SockAddr};
 
-use super::fs::{get, install, read_iov};
+use super::fs::{MAX_RW, clamp_iov_out, get, install, out_room, read_iov};
 use super::{SysResult, with_space};
 use crate::fs::file::{OpenFile, wait_ready};
+use crate::mm::vm::access_ok;
 use crate::net::socket::SocketOps;
 use crate::task::signal::ERESTARTSYS;
 use crate::task::{self, WakeReason};
@@ -530,6 +531,30 @@ pub fn sendto(fd: i32, buf: usize, len: usize, flags: u32, addr: usize, alen: us
     )
 }
 
+/// Whether `len` bytes at `p` can be written by a copy-out (checked
+/// before data is consumed for results written after it, D86).
+fn writable(p: usize, len: usize) -> bool {
+    access_ok(p, len) && with_space(|s| s.writable_prefix(p, len)) == len
+}
+
+/// Before a receive consumes data: the source address goes to
+/// `uaddr`/`ulenp` after the data, so both must be writable now (`EFAULT`
+/// otherwise; Linux finds out in `move_addr_to_user` after the data is
+/// gone).
+fn check_addr_out(uaddr: usize, ulenp: usize) -> Result<(), Errno> {
+    if uaddr == 0 || ulenp == 0 {
+        return Ok(());
+    }
+    if !writable(ulenp, size_of::<u32>()) {
+        return Err(Errno(EFAULT));
+    }
+    let ulen: i32 = with_space(|s| s.read_val(ulenp))?;
+    if ulen > 0 && !writable(uaddr, (ulen as usize).min(SOCKADDR_MAX)) {
+        return Err(Errno(EFAULT));
+    }
+    Ok(())
+}
+
 pub fn recvfrom(
     fd: i32,
     buf: usize,
@@ -538,10 +563,18 @@ pub fn recvfrom(
     addr: usize,
     alenp: usize,
 ) -> SysResult {
+    // Linux __sys_recvfrom: import_ubuf (clamp, access_ok → EFAULT)
+    // before the socket lookup.
+    let len = len.min(MAX_RW);
+    if !access_ok(buf, len) {
+        return Err(Errno(EFAULT));
+    }
     let of = sock(fd)?;
+    let room = out_room(buf, len)?;
+    check_addr_out(addr, alenp)?;
     let r = recv_common(
         &of,
-        Iov::new(vec![(buf, len.min(isize::MAX as usize))]),
+        Iov::new(vec![(buf, room)]),
         MsgFlags::from_bits_retain(flags),
         0,
     )?;
@@ -577,12 +610,31 @@ pub fn recvmsg(fd: i32, msg: usize, flags: u32) -> SysResult {
     if (m.msg_namelen as i32) < 0 {
         return Err(Errno(EINVAL));
     }
-    let iov = Iov::new(read_iov(m.msg_iov as usize, m.msg_iovlen as usize)?);
+    let mut iovs = read_iov(m.msg_iov as usize, m.msg_iovlen as usize)?;
+    // Everything written after the data is consumed must be writable
+    // first (D86): the iovecs (trimmed to what can be filled), the
+    // msghdr, the name; control data is sized to what can be stored.
+    clamp_iov_out(&mut iovs)?;
+    if !writable(msg, size_of::<Msghdr>()) {
+        return Err(Errno(EFAULT));
+    }
+    if m.msg_name != 0
+        && m.msg_namelen > 0
+        && !writable(m.msg_name as usize, (m.msg_namelen as usize).min(SOCKADDR_MAX))
+    {
+        return Err(Errno(EFAULT));
+    }
     let room = if m.msg_control != 0 {
-        m.msg_controllen as usize
+        let want = m.msg_controllen as usize;
+        if access_ok(m.msg_control as usize, want) {
+            with_space(|s| s.writable_prefix(m.msg_control as usize, want))
+        } else {
+            0
+        }
     } else {
         0
     };
+    let iov = Iov::new(iovs);
     let r = recv_common(&of, iov, MsgFlags::from_bits_retain(flags), room)?;
     // Linux (`____sys_recvmsg`) starts `msg_flags` from the caller's
     // MSG_CMSG_CLOEXEC and reports it back (Go's TestSCMCredentials).
@@ -602,7 +654,7 @@ pub fn recvmsg(fd: i32, msg: usize, flags: u32) -> SysResult {
     } else {
         m.msg_namelen = 0;
     }
-    let cn = r.control.len().min(m.msg_controllen as usize);
+    let cn = r.control.len().min(room);
     if cn < r.control.len() {
         out |= MsgFlags::CTRUNC;
     }

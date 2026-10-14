@@ -110,6 +110,16 @@ impl PollHook for EpHook {
     }
 }
 
+/// One event [`Epoll::wait`] reported, with what is needed to put it
+/// back ([`Epoll::unreport`]) if it cannot be copied to user memory.
+pub struct Reported {
+    pub ev: EpollEvent,
+    key: Key,
+    hook: usize,
+    /// The item's `events` before reporting (`EPOLLONESHOT` clears them).
+    events: EpollFlags,
+}
+
 /// Result of polling one snapshotted item without the epoll lock.
 struct Polled {
     key: Key,
@@ -256,7 +266,7 @@ impl Epoll {
         max: usize,
         block: bool,
         deadline: Option<u64>,
-    ) -> Result<Vec<EpollEvent>, Errno> {
+    ) -> Result<Vec<Reported>, Errno> {
         let mut out = Vec::new();
         let mut may_block = block;
         loop {
@@ -304,7 +314,12 @@ impl Epoll {
                     g.enqueue(p.key);
                     continue;
                 }
-                out.push(EpollEvent::new(rep.bits(), it.data));
+                out.push(Reported {
+                    ev: EpollEvent::new(rep.bits(), it.data),
+                    key: p.key,
+                    hook: Arc::as_ptr(&it.hook) as usize,
+                    events: it.events,
+                });
                 if it.events.contains(EpollFlags::ONESHOT) {
                     it.events &= PRIVATE;
                 } else if !it.events.contains(EpollFlags::ET) {
@@ -336,6 +351,39 @@ impl Epoll {
                 WakeReason::Woken => {}
             }
         }
+    }
+
+    /// The copy-out of `reported` failed: undo the reporting (restore an
+    /// `EPOLLONESHOT` item's events) and put the items back on the ready
+    /// list, so the events are not lost (Linux `ep_send_events` re-adds
+    /// an item whose `epoll_put_uevent` faulted). Edge-triggered items
+    /// are reported again even though no new notification arrived.
+    pub fn unreport(&self, reported: &[Reported]) {
+        if reported.is_empty() {
+            return;
+        }
+        let n = {
+            let mut g = self.inner.lock();
+            let mut any = false;
+            for r in reported {
+                let Some(it) = g.items.get_mut(&r.key) else {
+                    continue;
+                };
+                if Arc::as_ptr(&it.hook) as usize != r.hook {
+                    continue; // deleted and re-added meanwhile
+                }
+                if it.events == r.events & PRIVATE {
+                    it.events = r.events;
+                }
+                any |= g.enqueue(r.key);
+            }
+            if !any {
+                return;
+            }
+            g.waiters.wake_all();
+            g.pollers.collect(EpollFlags::IN | EpollFlags::RDNORM)
+        };
+        n.fire();
     }
 }
 

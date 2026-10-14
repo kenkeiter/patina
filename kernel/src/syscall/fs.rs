@@ -21,6 +21,7 @@ use patina_abi::fs::{
 use patina_abi::misc::{FIOCLEX, FIONBIO, FIONCLEX};
 
 use super::{SysResult, proc, with_space};
+use crate::mm::vm::access_ok;
 use crate::fs::file::{OpenFile, wait_ready};
 use crate::fs::{eventfd, pipe};
 use crate::task::signal::{self, ERESTARTSYS};
@@ -30,7 +31,7 @@ use patina_abi::signal::{SI_USER, SIGPIPE, SigInfo};
 /// Kernel bounce buffer per read/write step.
 const CHUNK: usize = 64 * 1024;
 /// Linux `MAX_RW_COUNT` (`INT_MAX & PAGE_MASK`).
-const MAX_RW: usize = 0x7fff_f000;
+pub(super) const MAX_RW: usize = 0x7fff_f000;
 
 /// The open file at `fd`.
 pub fn get(fd: i32) -> Result<Arc<OpenFile>, Errno> {
@@ -42,6 +43,54 @@ pub fn install(of: Arc<OpenFile>, cloexec: bool) -> SysResult {
     let lim = proc::nofile_limit();
     let fd = task::process().files.lock().alloc(of, cloexec, 0, lim)?;
     Ok(fd as isize)
+}
+
+/// Before a read consumes anything for a copy-out to `[buf, buf+len)`:
+/// Linux `access_ok` (`EFAULT` if the range leaves the user half), then
+/// the number of bytes the copy-out can take (the run of writable VMAs
+/// from `buf`). A read is sized by this, so data that could not be
+/// copied out stays in the pipe/socket/epoll/directory instead of being
+/// consumed and lost; no writable byte at all is `EFAULT` (D86).
+pub(super) fn out_room(buf: usize, len: usize) -> Result<usize, Errno> {
+    if !access_ok(buf, len) {
+        return Err(Errno(EFAULT));
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    match with_space(|s| s.writable_prefix(buf, len)) {
+        0 => Err(Errno(EFAULT)),
+        n => Ok(n),
+    }
+}
+
+/// [`out_room`] for an iovec array (already through [`read_iov`]): trims
+/// it to the segments (and the part of the last one) a copy-out can fill.
+/// `EFAULT` if not one byte of a non-empty request is writable.
+pub(super) fn clamp_iov_out(iovs: &mut Vec<(usize, usize)>) -> Result<(), Errno> {
+    let want: usize = iovs.iter().map(|v| v.1).sum();
+    let mut keep = 0;
+    let mut got = 0;
+    for v in iovs.iter_mut() {
+        if v.1 == 0 {
+            keep += 1;
+            continue;
+        }
+        let r = with_space(|s| s.writable_prefix(v.0, v.1));
+        got += r;
+        if r > 0 {
+            keep += 1;
+        }
+        if r < v.1 {
+            v.1 = r;
+            break;
+        }
+    }
+    iovs.truncate(keep);
+    if want > 0 && got == 0 {
+        return Err(Errno(EFAULT));
+    }
+    Ok(())
 }
 
 /// `n > 0` bytes done before error `e`: report the bytes, else the error.
@@ -200,8 +249,10 @@ pub fn read(fd: i32, buf: usize, len: usize) -> SysResult {
     if !of.flags().readable() {
         return Err(Errno(EBADF));
     }
+    // Linux vfs_read: access_ok on the whole count, then clamp.
+    let room = out_room(buf, len)?;
     let chunk = dgram_max(&of).map_or(CHUNK, |m| m + 1);
-    let mut k = vec![0u8; len.min(MAX_RW).min(chunk)];
+    let mut k = vec![0u8; room.min(MAX_RW).min(chunk)];
     let n = read_into(&of, &mut k)?;
     with_space(|s| s.copy_to_user(buf, &k[..n]))?;
     Ok(n as isize)
@@ -239,7 +290,8 @@ pub fn readv(fd: i32, iov: usize, cnt: usize) -> SysResult {
     if !of.flags().readable() {
         return Err(Errno(EBADF));
     }
-    let iovs = read_iov(iov, cnt)?;
+    let mut iovs = read_iov(iov, cnt)?;
+    clamp_iov_out(&mut iovs)?;
     let total: usize = iovs.iter().map(|v| v.1).sum();
     let mut k = vec![0u8; total.min(CHUNK)];
     let n = read_into(&of, &mut k)?;
@@ -287,7 +339,8 @@ pub fn pread64(fd: i32, buf: usize, len: usize, off: i64) -> SysResult {
     if off < 0 {
         return Err(Errno(EINVAL));
     }
-    let mut k = vec![0u8; len.min(CHUNK)];
+    let room = out_room(buf, len)?;
+    let mut k = vec![0u8; room.min(CHUNK)];
     let n = of.file.pread(&mut k, off as u64)?;
     with_space(|s| s.copy_to_user(buf, &k[..n]))?;
     Ok(n as isize)
@@ -314,9 +367,22 @@ pub fn lseek(fd: i32, off: i64, whence: i32) -> SysResult {
     Ok(n as isize)
 }
 
-pub fn getdents64(fd: i32, buf: usize, len: usize) -> SysResult {
+/// `getdents64(fd, dirent, count)`: `count` is an `unsigned int`. The
+/// directory position advances by what is read, so the read is sized to
+/// the writable part of the buffer first (D86).
+pub fn getdents64(fd: i32, buf: usize, len: u32) -> SysResult {
     let of = get(fd)?;
-    let mut k = vec![0u8; len.min(CHUNK)];
+    let is_dir = of
+        .file
+        .stat()
+        .is_ok_and(|st| st.st_mode & patina_abi::fs::S_IFMT == patina_abi::fs::S_IFDIR);
+    // Not a directory: the file's own error (ENOTDIR, EBADF) comes first.
+    let room = if is_dir {
+        out_room(buf, len as usize)?
+    } else {
+        len as usize
+    };
+    let mut k = vec![0u8; room.min(CHUNK)];
     let n = of.file.getdents64(&mut k)?;
     with_space(|s| s.copy_to_user(buf, &k[..n]))?;
     Ok(n as isize)

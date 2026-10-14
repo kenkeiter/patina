@@ -266,7 +266,7 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::PIPE2 => fs::pipe2(u(0), a[1] as u32),
         nr::EVENTFD2 => fs::eventfd2(a[0] as u32, a[1] as u32),
         nr::FSTAT => fs::fstat(i(0), u(1)),
-        nr::GETDENTS64 => fs::getdents64(i(0), u(1), u(2)),
+        nr::GETDENTS64 => fs::getdents64(i(0), u(1), a[2] as u32),
         nr::FTRUNCATE => fs::ftruncate(i(0), a[1] as i64),
         nr::FALLOCATE => fs::fallocate(i(0), i(1), a[2] as i64, a[3] as i64),
         nr::FLOCK => fs::flock(i(0), i(1)),
