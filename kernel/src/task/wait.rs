@@ -15,8 +15,11 @@
 //! `sched::wake(thread, seq)`, which moves the thread Blocked → Runnable
 //! only if it is still in block `seq`. Since wakers need the lock, a
 //! wake-up cannot slip in between the condition check and step 1; one that
-//! comes between 3 and the switch (only possible on SMP, Phase 2) finds
-//! the thread already Blocked and simply makes it runnable again. Stale
+//! comes between 3 and the end of the switch (SMP: a waker on another CPU)
+//! finds the thread already Blocked, moves it to Runnable, waits until the
+//! blocking CPU has saved its context (`Thread::on_cpu`, see `sched`) and
+//! only then enqueues it; `schedule` sees the thread no longer Running and
+//! does not requeue it. Stale
 //! entries (the thread timed out, or was woken through another path) fail
 //! the sequence check and are skipped.
 //!

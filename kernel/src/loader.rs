@@ -131,7 +131,7 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
 
     let strace = matches!(c.get("patina.strace"), Some(None) | Some(Some("1")));
     let epoch_ns = c.epoch_ns.unwrap_or(0);
-    crate::random::seed(arch::timer::now_ns() ^ epoch_ns.rotate_left(32));
+    crate::random::seed_boot(arch::timer::now_ns() ^ epoch_ns.rotate_left(32));
 
     let mut space =
         AddressSpace::new().unwrap_or_else(|| fatal(127, format_args!("out of memory")));

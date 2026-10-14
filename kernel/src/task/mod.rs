@@ -25,7 +25,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use patina_abi::errno::{EAGAIN, ENOMEM, Errno};
 use patina_abi::signal::{SS_DISABLE, SigAction, SigSet, StackT};
@@ -177,6 +177,14 @@ pub struct Thread {
     pub name: SpinLock<[u8; 16]>,
     /// Packed state / wake reason / block sequence (see `ST_*`).
     sched_word: AtomicU64,
+    /// SMP: the CPU this thread runs on / last ran on (`sched::kick_remote`,
+    /// wake placement).
+    pub(crate) cpu: AtomicUsize,
+    /// SMP: true from the moment a CPU switches this thread in until the
+    /// CPU that switched it out has saved its context (`sched` docs).
+    pub(crate) on_cpu: AtomicBool,
+    /// CPU time consumed (user + system), ns; see `sched::current_cpu_time_ns`.
+    pub(crate) cpu_time_ns: AtomicU64,
     switch: UnsafeCell<SwitchState>,
 }
 
@@ -215,6 +223,9 @@ impl Thread {
             kstack,
             name: SpinLock::new(*b"app\0\0\0\0\0\0\0\0\0\0\0\0\0"),
             sched_word: AtomicU64::new(ST_RUNNABLE),
+            cpu: AtomicUsize::new(0),
+            on_cpu: AtomicBool::new(false),
+            cpu_time_ns: AtomicU64::new(0),
             switch: UnsafeCell::new(SwitchState {
                 kctx,
                 fp,
@@ -374,7 +385,8 @@ pub fn create_thread0(frame: ctx::TrapFrame) -> Arc<Thread> {
 /// is the child's register state (return value, stack and TLS already
 /// adjusted), `fp` the parent's FP state at the syscall, `mask` the
 /// parent's signal mask (the alternate stack is not inherited for
-/// `CLONE_VM` threads). The thread is made runnable on this CPU.
+/// `CLONE_VM` threads). The thread is NOT runnable yet: the caller does
+/// the `*_SETTID` writes and then calls `sched::make_runnable` (D41).
 pub fn spawn_user_thread(
     frame: ctx::TrapFrame,
     fp: ctx::FpState,
@@ -402,9 +414,7 @@ pub fn spawn_user_thread(
         },
     );
     t.clear_child_tid.store(clear_child_tid, Ordering::Relaxed);
-    let t = register(t);
-    sched::make_runnable(t.clone());
-    Ok(t)
+    Ok(register(t))
 }
 
 /// Create a kernel-only thread running `f` (self-tests) and make it
@@ -435,16 +445,20 @@ pub(crate) fn unregister_current() -> bool {
     }
 }
 
-/// Start thread 0: activate the address space, start the tick, and turn
-/// the boot context into this CPU's idle loop, which switches to thread 0
-/// on its own kernel stack. Never returns.
+/// Activate the process's user page tables on this CPU (each CPU, before
+/// it first enters user mode).
+pub(crate) fn activate_user_tables() {
+    let space = process().space.lock();
+    // SAFETY: the tables live in the process (a 'static global) for the
+    // life of the VM; their upper half is the kernel's.
+    unsafe { space.tables.activate() };
+}
+
+/// Start thread 0: activate the address space, start the tick and the
+/// secondary CPUs (`sched::run_smp`), and turn the boot context into this
+/// CPU's idle loop, which switches to thread 0 on its own kernel stack.
+/// Never returns.
 pub fn start_thread0(t0: Arc<Thread>) -> ! {
-    {
-        let space = process().space.lock();
-        // SAFETY: the tables live in the process (a 'static global) for
-        // the life of the VM; their upper half is the kernel's.
-        unsafe { space.tables.activate() };
-    }
-    sched::make_runnable(t0);
-    sched::run()
+    activate_user_tables();
+    sched::run_smp(t0)
 }

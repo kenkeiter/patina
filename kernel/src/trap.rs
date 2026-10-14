@@ -101,7 +101,8 @@ pub fn ipi(_frame: &mut TrapFrame, kind: IpiKind) {
     IPIS.fetch_add(1, Ordering::Relaxed);
     match kind {
         IpiKind::Reschedule => crate::task::sched::ipi_reschedule(),
-        IpiKind::Stop => crate::arch::cpu::halt(),
+        // Records the CPU in the scheduler's STOPPED mask, then halts.
+        IpiKind::Stop => crate::task::sched::ipi_stop(),
     }
 }
 

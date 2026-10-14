@@ -32,8 +32,13 @@ use alloc::format;
 use bootinfo::{BootInfo, PlatformInfo};
 
 /// Exit sentinel printed before poweroff; the host scripts / CLI parse it.
+/// Stops the other CPUs first (no user code runs or prints after the
+/// sentinel); if another CPU is already exiting, this CPU just halts. The
+/// sentinel goes through `panic_write_fmt`, which breaks a console lock a
+/// CPU that failed to stop might still hold.
 pub fn exit(code: i32) -> ! {
-    kprint!("\n[patina] exit code {}\n", code);
+    task::sched::stop_other_cpus();
+    console::panic_write_fmt(format_args!("\n[patina] exit code {}\n", code));
     arch::power::poweroff(code)
 }
 
