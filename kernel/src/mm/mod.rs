@@ -9,6 +9,7 @@
 
 pub mod frame;
 pub mod heap;
+pub mod tlb;
 pub mod vm;
 
 use core::fmt;

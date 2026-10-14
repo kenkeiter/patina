@@ -658,6 +658,7 @@ pub fn tick() {
     let now = timer::now_ns();
     let woke = super::sleep::expire(now);
     super::timers::tick();
+    crate::mm::tlb::reclaim();
     let next = super::sleep::next_deadline().unwrap_or(NO_DEADLINE);
     if next != cpu.armed.load(Ordering::Relaxed) {
         cpu.armed.store(next, Ordering::Relaxed);

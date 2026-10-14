@@ -254,6 +254,7 @@ fn sgi_for(kind: IpiKind) -> u32 {
     match kind {
         IpiKind::Reschedule => gic::SGI_RESCHEDULE,
         IpiKind::Stop => gic::SGI_STOP,
+        IpiKind::TlbFlush => gic::SGI_TLB_FLUSH,
     }
 }
 

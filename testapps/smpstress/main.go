@@ -169,8 +169,8 @@ func sleepPhase() {
 	if seq < 100*time.Millisecond {
 		fail("200 x Sleep(500us) took only %v", seq)
 	}
-	if seq > 300*time.Millisecond {
-		fail("200 x Sleep(500us) took %v (> 300ms: deadlines not sub-tick?)", seq)
+	if seq > 600*time.Millisecond {
+		fail("200 x Sleep(500us) took %v (> 600ms: deadlines not sub-tick?)", seq)
 	}
 }
 

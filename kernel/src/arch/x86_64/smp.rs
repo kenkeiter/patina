@@ -34,7 +34,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize
 
 use super::acpi::{self, CpuList, Mem};
 use super::cpu::{self, MAX_CPUS};
-use super::entry::{IPI_RESCHEDULE_VECTOR, IPI_STOP_VECTOR};
+use super::entry::{IPI_RESCHEDULE_VECTOR, IPI_STOP_VECTOR, IPI_TLB_FLUSH_VECTOR};
 use super::gdt::{self, ApTables};
 use super::lapic::{self, ICR_FIXED, ICR_INIT, ICR_LEVEL_ASSERT, ICR_STARTUP, ICR_TRIGGER_LEVEL};
 use super::{PHYS_OFFSET, entry, exceptions, fwcfg, irq, paging, percpu, timer};
@@ -599,6 +599,7 @@ pub fn send_ipi(cpu: usize, kind: IpiKind) {
     let vector = match kind {
         IpiKind::Reschedule => IPI_RESCHEDULE_VECTOR,
         IpiKind::Stop => IPI_STOP_VECTOR,
+        IpiKind::TlbFlush => IPI_TLB_FLUSH_VECTOR,
     };
     send_icr(apic_id(cpu), ICR_FIXED | ICR_LEVEL_ASSERT | vector as u32);
 }

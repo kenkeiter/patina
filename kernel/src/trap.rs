@@ -97,6 +97,9 @@ pub enum IpiKind {
     Reschedule,
     /// Stop this CPU for good (exit_group / panic): mask IRQs and halt.
     Stop,
+    /// Flush this CPU's user TLB entries and record the shootdown
+    /// generation it reached (`mm::tlb`). Sent by x86_64 only.
+    TlbFlush,
 }
 
 /// Number of IPIs received on all CPUs (diagnostics / self-tests).
@@ -113,6 +116,8 @@ pub fn ipi(_frame: &mut TrapFrame, kind: IpiKind) {
         IpiKind::Reschedule => crate::task::sched::ipi_reschedule(),
         // Records the CPU in the scheduler's STOPPED mask, then halts.
         IpiKind::Stop => crate::task::sched::ipi_stop(),
+        // Local full user-TLB flush + generation bookkeeping.
+        IpiKind::TlbFlush => crate::mm::tlb::ipi_flush(),
     }
 }
 

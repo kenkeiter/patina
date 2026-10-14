@@ -112,6 +112,16 @@
 //!         /// Make these the live user tables on this CPU.
 //!         pub unsafe fn activate(&self);
 //!     }
+//!     /// Whether `unmap`/`protect` invalidate only the executing CPU's TLB
+//!     /// (x86_64 `invlpg`: true) or every CPU's, complete on return
+//!     /// (aarch64 `TLBI ...IS` + `DSB ISH`: false). When true, `mm::tlb`
+//!     /// defers freeing unmapped frames until every online CPU flushed
+//!     /// (`IpiKind::TlbFlush`), and sends that IPI after permission
+//!     /// reductions; when false frames are freed at once.
+//!     pub const NEEDS_SHOOTDOWN: bool;
+//!     /// Flush every user (non-global) TLB entry on this CPU only (x86
+//!     /// CR3 reload; aarch64 `TLBI VMALLE1`). Used by the `TlbFlush` IPI.
+//!     pub fn flush_tlb_local();
 //! }
 //! pub mod timer {
 //!     /// Start the periodic tick at `trap::TICK_HZ`; each tick calls
@@ -187,7 +197,9 @@
 //!
 //! `trap::timer_tick` keeps its contract (periodic rearm is the arch's
 //! job); the deadline interrupt simply calls the same hook. IPIs are
-//! `trap::IpiKind::{Reschedule, Stop}` → `trap::ipi`.
+//! `trap::IpiKind::{Reschedule, Stop, TlbFlush}` → `trap::ipi` (x86_64 vectors
+//! 0xf0-0xf2, aarch64 SGIs 0-2; `TlbFlush` is only sent where
+//! `uspace::NEEDS_SHOOTDOWN`).
 //!
 //! Phase 2 signal frames (`task/signal.rs` is the arch-neutral driver; the
 //! layouts are `patina_abi::<arch>::{RtSigframe, UContext, SigContext,

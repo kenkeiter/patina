@@ -9,8 +9,8 @@
 //! SGIs (IPIs): [`send_sgi`] writes `ICC_SGI1R_EL1` (v3: target by the
 //! affinity of the destination CPU's MPIDR) or `GICD_SGIR` (v2: target by
 //! the CPU-interface mask each CPU read from its banked `GICD_ITARGETSR0`
-//! in [`init_cpu`]). [`init_cpu`] enables [`SGI_RESCHEDULE`] and
-//! [`SGI_STOP`] on every CPU. On GICv2 the IAR value of an SGI carries the
+//! in [`init_cpu`]). [`init_cpu`] enables [`SGI_RESCHEDULE`],
+//! [`SGI_STOP`] and [`SGI_TLB_FLUSH`] on every CPU. On GICv2 the IAR value of an SGI carries the
 //! source CPU in bits 12:10 and must be written back unchanged to EOIR, so
 //! [`ack`] returns the raw value for [`eoi`].
 
@@ -82,6 +82,9 @@ static V2_TARGET: [AtomicU8; cpu::MAX_CPUS] = [const { AtomicU8::new(0) }; cpu::
 pub const SGI_RESCHEDULE: u32 = 0;
 /// SGI used for `IpiKind::Stop`.
 pub const SGI_STOP: u32 = 1;
+/// SGI used for `IpiKind::TlbFlush` (never sent on aarch64: `tlbi ...is`
+/// broadcasts; handled for symmetry).
+pub const SGI_TLB_FLUSH: u32 = 2;
 
 /// Record the DTB's GIC description (boot code).
 pub(super) fn set_desc(d: GicDesc) {
@@ -263,6 +266,7 @@ pub fn init_cpu() {
     }
     enable(SGI_RESCHEDULE);
     enable(SGI_STOP);
+    enable(SGI_TLB_FLUSH);
 }
 
 /// Send SGI `sgi` (0-15) to the CPU with logical id `cpu` and hardware
