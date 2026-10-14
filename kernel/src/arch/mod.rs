@@ -8,7 +8,8 @@
 //! pub const KERNEL_VA_BASE: usize;   // 0xffff_ffff_8000_0000, kernel image link address
 //! pub const NAME: &str;              // "aarch64" / "x86_64", used in the banner
 //! pub fn kernel_load_phys() -> usize; // physical address the image was loaded at
-//!                                     // (KERNEL_VA_BASE maps to it)
+//!                                     // (aarch64: KERNEL_VA_BASE maps to it;
+//!                                     // x86_64: image at KERNEL_VA_BASE + it)
 //!
 //! pub mod cpu {
 //!     pub fn id() -> usize;             // logical CPU index (boot CPU = 0)

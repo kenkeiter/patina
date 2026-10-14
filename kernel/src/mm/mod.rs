@@ -80,6 +80,11 @@ pub const fn virt_to_phys(va: VirtAddr) -> Option<PhysAddr> {
 /// stack, page-table pool).
 pub fn kernel_virt_to_phys(va: VirtAddr) -> PhysAddr {
     debug_assert!(va.0 >= KERNEL_VA_BASE);
+    // aarch64: KERNEL_VA_BASE maps the load address. x86_64: the image is
+    // linked at KERNEL_VA_BASE + load_phys (KERNEL_VA_BASE maps phys 0).
+    #[cfg(target_arch = "x86_64")]
+    return PhysAddr(va.0 - KERNEL_VA_BASE);
+    #[cfg(not(target_arch = "x86_64"))]
     PhysAddr(va.0 - KERNEL_VA_BASE + crate::arch::kernel_load_phys())
 }
 
