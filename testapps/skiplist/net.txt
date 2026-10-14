@@ -1,4 +1,5 @@
 # Go net package tests skipped under patina (scripts/test-gonet.sh, D73).
+# AF_UNIX tests were re-enabled after D71 landed (254 passed, 0 failed).
 # One top-level test per line: TestName  # reason
 #
 # Child processes: the peer runs as a re-exec of the test binary.

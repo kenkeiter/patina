@@ -2089,3 +2089,14 @@ forms, deadlines, close/shutdown races, `TestDialParallel`, the accept
 abort tests, zero-byte reads and writes, UDP `ReadFrom`/`WriteTo` edge
 cases, many short-lived connections) passed on the D67/D68 stack without
 changes.
+
+Post-merge note (supervisor): after D71 landed, the 34 "AF_UNIX: pending"
+entries were removed from `testapps/skiplist/net.txt` and the three from
+`os.txt`. One kernel fix was needed: an unnamed unix datagram sender must
+yield no source address at all (`msg_namelen` 0, Linux `unix_copy_addr`),
+not a 2-byte `sun_family`-only address that Go decodes as the abstract name
+`@` (`TestReadUnixgramWithUnnamedSocket`, `TestUnixgramZeroByte*`,
+`TestUnixgramLinuxAbstractLongName`). Final counts on both arches:
+net 254 passed, 55 skipped (1 by our list: `TestSplice`), 0 failed;
+net/http 611 passed, 10 skipped, 0 failed; os 248 passed, 33 skipped (10 by
+our list), 0 failed.

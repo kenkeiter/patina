@@ -25,6 +25,10 @@ scripts/test-runtime.sh [aarch64] [x86_64]          # Phase 2 umbrella: hello, t
 scripts/test-hello.sh --app fileio [arch...]        # Phase 3 VFS/devfs/procfs/FIFO/os.Root coverage (48 checks)
 scripts/test-ctl.sh [aarch64] [x86_64]              # Phase 3 control channel over the patina.ctl port: 8 cases per arch
 scripts/test-os.sh [aarch64] [x86_64]               # Go's own `os` package tests under patina with testapps/skiplist/os.txt
+scripts/test-hello.sh --app sockets|unixsock [arch...] # Phase 4 AF_INET/AF_INET6 and AF_UNIX socket coverage over loopback
+scripts/test-net.sh [aarch64] [x86_64]              # Phase 4 Milestone A on QEMU: httphello via patina run --net user --publish, DHCP, PCI
+scripts/test-gonet.sh [--pkg net/http] [arch...]    # Go's own `net` (or net/http) package tests with testapps/skiplist/net.txt
+PATINA_NET=user scripts/run-qemu.sh <arch> -- patina.selftest=net   # virtio-net driver self-test (ARP against slirp)
 cargo test --workspace --exclude patina-kernel      # host tests
 ```
 
@@ -37,7 +41,7 @@ virtio-console port; `run-qemu.sh` always adds the virtio-serial device, the
 port and a `virtio-rng-device`, like the CLI), `PATINA_CTL_WAIT=1` (QEMU
 `wait=on`: boot only once a client is attached), `PATINA_CONSOLE=hvc0`
 (console on virtio-console port 0 instead of the UART), `PATINA_VIRTIO`
-(`1` virtio-mmio, `pci` the same devices as virtio-pci — default on x86 `pc`/`q35`, `0` none; `PATINA_VIRTIO_PCI_OPTS` e.g. `,disable-legacy=on`). `test-hello.sh --app` passes `PATINA_PARAMS` as extra kernel
+(`1` virtio-mmio, `pci` the same devices as virtio-pci — default on x86 `pc`/`q35`, `0` none; `PATINA_VIRTIO_PCI_OPTS` e.g. `,disable-legacy=on`), `PATINA_NET=user[:H-G,...]` (a slirp virtio-net NIC, optionally forwarding host 127.0.0.1:H to guest port G). `test-hello.sh --app` passes `PATINA_PARAMS` as extra kernel
 params (e.g. `patina.strace=1`). `test-runtime.sh` runs every suite at each
 CPU count in `PATINA_CPUS_LIST` (default `1 2 4`) and prints one PASS/FAIL
 row per case (logs in `out/test/runtime/`); `test-smp.sh` logs to
@@ -343,13 +347,45 @@ CLI and `os` tests:
 
 ## Phase 4 — Net
 
+Test names (aarch64 = QEMU `virt` HVF, x86_64 = QEMU `microvm` TCG unless
+noted, release profile). Decisions: D67 (smoltcp stack, loopback mux, net
+task), D68 (inet sockets, syscalls, listen pools, dual stack), D69
+(virtio-net), D70 (virtio-pci, PCI discovery, MSI-X/ITS/v2m/INTx), D71
+(AF_UNIX), D72 (DHCP, effective config, resolv.conf/hosts, test-net.sh),
+D73 (net package tests, netlink, sendfile).
+
+| Name | Command | Observed |
+|---|---|---|
+| **selftest-net** | `PATINA_NET=user scripts/run-qemu.sh <arch> -- patina.selftest=net` | driver-only ARP round trips against slirp: `[patina] virtio-net: mac 52:54:00:12:34:56, queues rx 128 / tx 32, link up (mmio @ 0xa003a00, hdr 10 B)`, `selftest net: arp reply 10.0.2.2 is-at 52:55:0a:00:02:02 after 287 us`, `selftest net: ok (64/64 replies, irqs 29)`, exit 0; both arches; also TCG, `PATINA_CPUS=2`, modern mmio (`-global virtio-mmio.force-legacy=false`, 12-byte header), `-M microvm,acpi=off` (cmdline discovery), and over PCI (`PATINA_MACHINE=q35`: `pci 0000:00:03.0 irq 306 … msi-x irq`; aarch64 `PATINA_VIRTIO=pci`: v2m `irq 82` on hvf, ITS `irq 8194` on TCG) |
+| **sockets** | `scripts/test-hello.sh --app sockets aarch64 x86_64`; `scripts/test-smp.sh --app sockets --cpus "2 4" aarch64 x86_64`; `PATINA_MACHINE=q35 … x86_64` | `PASS sockets` on both arches (21 `ok` lines: TCP echo over 127.0.0.1, [::1] and a dual-stack `:0` listener, 50 concurrent connections, 8 MiB each way with sha256, UDP echo + connected UDP, ECONNREFUSED, EOF/EPIPE after peer close, deadlines, CloseWrite, SO_REUSEADDR rebind, MSG_PEEK, SO_ERROR, TCP_NODELAY, nonblocking connect → EINPROGRESS + writable, accept4 flags, IPV6_V6ONLY, FIONREAD, http 1 MiB body); 2/4 CPUs, q35/PCI and `PATINA_PROFILE=dev` pass; with `patina.strace=1` no `ENOSYS` lines (Go's `IPPROTO_MPTCP` probe gets `EPROTONOSUPPORT`) |
+| **unixsock** | `scripts/test-hello.sh --app unixsock aarch64 x86_64`; `scripts/test-smp.sh --app unixsock --cpus "2 4" --repeat 2 aarch64 x86_64` | `PASS unixsock` both arches (36 `ok` lines: path and abstract names, `ModeSocket`, ENXIO open, ENOENT/ECONNREFUSED dials, unlink-while-listening, 50 connections, 8 MiB each way, EOF/EPIPE, deadlines, socketpair STREAM/DGRAM/SEQPACKET, SCM_RIGHTS over socketpair and `net.UnixConn` incl. MSG_CMSG_CLOEXEC and MSG_CTRUNC, SO_PEERCRED {1,0,0}, SO_PASSCRED + SCM_CREDENTIALS, unixgram ReadFrom/WriteTo, 64 KiB datagram, bounded queue, backlog EAGAIN/blocking connect, autobind, http over unix); 8/8 at 2/4 CPUs; no `ENOSYS` under strace |
+| **test-net** | `scripts/test-net.sh aarch64 x86_64` (Milestone A on QEMU; `PATINA_NET_EXTERNAL=1` adds a real DNS lookup) | 14/14 PASS, repeated 3×: per arch **serve** (`patina run --net user --publish P:8080`, `curl` → `hello from patina`, 20 concurrent GETs, `/big` 4 MiB sha256 match, `patina ctl stop` → `{"ev":"exit","code":0,"forced":false}`, `PASS httphello (graceful shutdown)`, `patina run` exit 0), **nohandler** (`-nohandler`: `{"ev":"exit","code":143,"signal":"SIGTERM","forced":false}`, exit 143), **selftest** (loopback GET `/`, `/big`, POST `/echo`, `LookupHost` of `localhost` and the guest hostname via /etc/hosts; `ok dns example.com -> …` through slirp's 10.0.2.3 with `PATINA_NET_EXTERNAL=1`), **dhcp** (`ip=dhcp` over slirp: `[patina] net: dhcp lease 10.0.2.15/24 via 10.0.2.2, dns 10.0.2.3 (2 ms)`; 5–7 ms on x86_64 TCG), **dhcp-nonic** (`ip=dhcp` without a NIC: warning line + ctl `log` event, program still runs), **dhcp-nolease** (dead link: `dhcp: no lease after 10 s, continuing without an address`, boot continues), **pci** (x86_64 `-M q35` / aarch64 `PATINA_VIRTIO=pci`: virtio-net-pci `hdr 12 B`, curl, stop via `ctlclient.py` → exit 0) |
+| **test-gonet** | `scripts/test-gonet.sh aarch64 x86_64` (Go 1.27.1 `go test -c net`, `-test.short`, `$GOROOT/src/net` at `/src/net`, `PATINA_NET=user` + the CLI's static `ip=`, skip list `testapps/skiplist/net.txt`) | `net aarch64 (cpus=1): 254 passed, 55 skipped (1 by our list), 0 failed, exit 0`; the same for x86_64 and at `PATINA_CPUS=4`. The one listed skip is `TestSplice` (needs os/exec). The 54 self-skips: 31 "no external network in -short", other `-short` skips, the cgo resolver (3), `-ipv6`/`-tcpbig`/`-dnsflood` flags, `/etc/services`, the pty test, MPTCP, raw-IP subcases (SOCK_RAW → `EPERM`). Only `ENOSYS` line: `pidfd_open`. Without `-short` (2 CPUs): 250 passed, 3 failed (`TestIPv4MulticastListener`/`TestIPv6MulticastListener`: no multicast, `TestSendfileWithLargeFile`: a 2 GiB file in the RAM-backed `/tmp`) |
+| **test-gonet-http** | `scripts/test-gonet.sh --pkg net/http aarch64` (and x86_64) | `net/http aarch64 (cpus=1): 611 passed, 10 skipped (0 by our list), 0 failed`; x86_64 the same; without `-short` (aarch64, 2 CPUs) 616 passed, 5 skipped, 0 failed |
+| **test-os-p4** | `scripts/test-os.sh aarch64 x86_64` with the 4 network tests removed from `testapps/skiplist/os.txt` | `os <arch> (cpus=1): 248 passed, 33 skipped (10 by our list), 0 failed, exit 0` on both arches (`TestLargeCopyViaNetwork`, `TestSpliceFile`, `TestGetPollFDAndNetwork`, `TestSendFile` now run, incl. their unix subtests) |
+| **p4-regression** | on the final Phase 4 tree: `scripts/test-ctl.sh aarch64 x86_64`, `PATINA_VIRTIO=pci scripts/test-ctl.sh aarch64`, `scripts/test-hello.sh --app fileio|fdtest`, `scripts/test-signals.sh`, `PATINA_CPUS_LIST="1 4" scripts/test-runtime.sh aarch64 x86_64`, `cargo test --workspace --exclude patina-kernel` (187 host tests), clippy both targets 0 warnings | test-ctl 16/16 (+ 8/8 over PCI); fileio/fdtest/signals PASS; `PATINA_CPUS_LIST="1 4" scripts/test-runtime.sh aarch64 x86_64` → `test-runtime: all passed` (44 rows: 11 cases × 1/4 CPUs × 2 arches); host tests 187/0 |
+
+Network stack and sockets (D67–D69, D71–D73):
+
+- [x] virtio-net driver (in-tree, D69): one RX/TX pair, no offloads, `F_MAC`/`F_STATUS`, 10/12-byte header, IRQ-driven through `net::device::NetDevice` — **selftest-net** (mmio legacy/modern, DSDT/cmdline/DTB discovery, PCI with MSI-X on both arches), every **test-net** case
+- [x] smoltcp 0.14.0 `Interface` + `SocketSet` behind one lock, loopback by a mux device (ARP/NDP answered to self), net task driven by the NIC IRQ `Event` and `poll_delay` deadlines, inline polls from syscalls (D67) — **sockets**, **test-net**, **test-gonet**
+- [x] Loopback 127.0.0.1/8 and ::1/128; eth0 link-local fe80::/64; static `ip=` address + default route — **sockets**, **test-net** (`[patina] net: virtio-net hwaddr …, addrs 127.0.0.1/8 ::1/128 fe80::…/64 10.0.2.15/24, gateway 10.0.2.2`)
+- [x] `ip=dhcp` (smoltcp DHCPv4 client, 10 s bound before user mode, renewals in the net task), `/etc/resolv.conf` and `/etc/hosts` from the effective config (lease, else `ip=`, else 10.0.2.3) (D72) — **test-net** dhcp / dhcp-nonic / dhcp-nolease / selftest
+- [x] Socket syscalls (Tier 2): `socket socketpair bind listen accept4 (accept) connect getsockname getpeername setsockopt getsockopt sendto recvfrom sendmsg recvmsg shutdown`, plus `read/write/readv/writev`, `FIONREAD`/`SIOCOUTQ`, epoll readiness (IN/OUT/RDHUP/HUP/ERR), blocking with EINTR/restart (D45), `MSG_PEEK/DONTWAIT/NOSIGNAL/TRUNC/WAITALL`, SIGPIPE on EPIPE, `SO_ERROR` for async connect, `SO_REUSEADDR/REUSEPORT/KEEPALIVE/LINGER/RCVBUF/SNDBUF/RCVTIMEO/SNDTIMEO`, `TCP_NODELAY/MAXSEG/KEEP*/USER_TIMEOUT`, `IPV6_V6ONLY`, IP/IPv6 TOS/TTL accepted — **sockets**, **test-gonet**, **test-gonet-http**
+- [x] AF_INET/AF_INET6 TCP (listen pools: 4 listening smoltcp sockets per listener + an accept queue bounded by the backlog, refilled per packet; 64 KiB buffers each way) and UDP (connected and unconnected), dual stack (`[::]` listeners accept IPv4 as `::ffff:a.b.c.d`; Go's init probes succeed), ephemeral ports 32768–60999, `EADDRINUSE`/`EADDRNOTAVAIL`/`ECONNREFUSED`/`ECONNRESET`/`ETIMEDOUT`/`ENETUNREACH` — **sockets**, **test-net** (20 concurrent requests, 4 MiB body), **test-gonet**
+- [x] `AF_UNIX` stream, datagram and seqpacket (D71): filesystem paths as `S_IFSOCK` nodes, abstract names, autobind, socketpair, SCM_RIGHTS (253 fds, MSG_CMSG_CLOEXEC, MSG_CTRUNC), SCM_CREDENTIALS/SO_PASSCRED, SO_PEERCRED = pid 1/uid 0/gid 0, 208 KiB buffers — **unixsock**, **test-gonet** (the 34 unix tests), **test-os-p4**
+- [x] Read-only `AF_NETLINK`/`NETLINK_ROUTE` (`RTM_GETLINK`/`RTM_GETADDR` dumps for `lo` and `eth0`; `net.Interfaces()`), `/proc/net/igmp{,6}`, `sendfile` (pread + write), `splice`/`tee` → `EINVAL` so Go falls back (D73) — **test-gonet**, **test-os-p4**
+- [~] Not implemented: multicast (options → `ENOPROTOOPT`; 2 non-`-short` net tests fail), ICMP errors to UDP sockets, UDP fragmentation (> MTU → `EMSGSIZE`), `TCP_INFO`, `sendmmsg`/`recvmmsg`, `SOCK_RAW` (`EPERM`), fd garbage collection for SCM_RIGHTS cycles, resolv.conf rewrite on a DHCP lease change after boot, DHCP hostname/domain options (untested: slirp sends none)
+- [~] IPv6 beyond loopback/link-local: no SLAAC/RA, no IPv6 default route (global IPv6 destinations → `ENETUNREACH`); fine for Go's probes and the tests above
+- [~] Firecracker/Cloud Hypervisor tap networking (`ip=dhcp` / `--ip`): the kernel side is the same code as the QEMU runs; the driver paths (virtio-mmio on Firecracker, virtio-pci + MSI-X on Cloud Hypervisor) are unverified on this host
+
 - [x] virtio-pci transport + PCI discovery (D70): ECAM (DTB / MCFG) or port 0xCF8, BAR sizing and assignment (QEMU `virt` without firmware), modern capabilities, MSI-X (x86 LAPIC; aarch64 GICv3 ITS LPIs and GICv2m SPIs), INTx through the DTB `interrupt-map` (shared lines) — **virtio-pci-a64** (`PATINA_VIRTIO=pci scripts/test-ctl.sh aarch64`, hvf = v2m, `PATINA_ACCEL=tcg` = ITS, `PATINA_CPUS=4`; `PATINA_VIRTIO=pci PATINA_CONSOLE=hvc0 scripts/test-hello.sh --app fileio aarch64`, also with `PATINA_PARAMS=patina.pci.irq=intx`), **virtio-pci-x86** (`PATINA_MACHINE=q35|pc scripts/test-ctl.sh x86_64`, `PATINA_MACHINE=q35 PATINA_CONSOLE=hvc0 scripts/test-hello.sh --app fileio x86_64`); Cloud Hypervisor paths untested
-- [ ] virtio-net (`virtio-drivers`), smoltcp interface task
-- [ ] Socket syscalls (Tier 2): `socket socketpair bind listen accept4 connect getsockname getpeername setsockopt getsockopt sendto recvfrom sendmsg recvmsg shutdown`
-- [ ] Loopback (127.0.0.1, ::1), `AF_UNIX` stream + datagram
-- [ ] `ip=` static and `dhcp`; generated `/etc/resolv.conf`, `/etc/hosts`
-- [~] CLI `build` / `run` / `ctl` shipped — working on QEMU since Phase 3 (**test-cli**); Firecracker/Cloud Hypervisor/VZ drivers exist, untested against the kernel
-- [ ] **Milestone A**: `net/http` hello + graceful `patina ctl stop` (Notify and exit-143 variants) on Firecracker, Cloud Hypervisor, QEMU, both arches (+ Apple VZ)
+
+CLI and Milestone A:
+
+- [x] CLI `build` / `run` / `ctl` with `--net user --publish` on QEMU, both arches — **test-net**, **test-cli** (Phase 3)
+- [x] **Milestone A on QEMU**, both arches: `net/http` hello served to host `curl` through `patina run --net user --publish`, concurrent requests and a 4 MiB body, `patina ctl stop` → clean `{"ev":"exit","code":0}` (signal.Notify variant) and 143 + `SIGTERM` (no-handler variant), `-selftest` over loopback with DNS through slirp, DHCP and the q35/PCI variant — **test-net**
+- [ ] Milestone A on Firecracker, Cloud Hypervisor (both arches) and Apple VZ: the CLI drivers exist (Phase 3, tested against fakes; the VZ driver is being added separately) and the kernel paths are written to doc/cli-contract.md (virtio-mmio + vsock on Firecracker; virtio-pci/MSI-X + vsock on Cloud Hypervisor; DTB + `hvc0` + vsock on VZ), but none of them has booted here: no KVM on this host, VZ needs the CLI shim. Specifically unverified: vsock control channel (D62), Cloud Hypervisor's ITS with 64 KiB table pages and 64-bit BARs, Firecracker's `virtio_mmio.device=` net device, tap DHCP against a real server
 
 ## Phase 5 — Hardening
 
