@@ -22,7 +22,7 @@ scripts/test-signals.sh [aarch64] [x86_64]          # 6 signal cases per arch (s
 scripts/test-smp.sh [--app <name>] [--cpus "1 2 4"] [--repeat N] [arch...]
                                                     # app at each vCPU count (default smpstress; smpstress/threads get -cpus N)
 scripts/test-runtime.sh [aarch64] [x86_64]          # Phase 2 umbrella: hello, threads, smpstress, fdtest, signals, pproftest per CPU count
-scripts/test-hello.sh --app fileio [arch...]        # Phase 3 VFS/devfs/procfs/FIFO/os.Root coverage (48 checks)
+scripts/test-hello.sh --app fileio [arch...]        # Phase 3 VFS/devfs/procfs/FIFO/os.Root coverage (48 checks; 50 on x86_64)
 scripts/test-ctl.sh [aarch64] [x86_64]              # Phase 3 control channel over the patina.ctl port: 8 cases per arch
 scripts/test-os.sh [aarch64] [x86_64]               # Go's own `os` package tests under patina with testapps/skiplist/os.txt
 scripts/test-hello.sh --app sockets|unixsock [arch...] # Phase 4 AF_INET/AF_INET6 and AF_UNIX socket coverage over loopback
@@ -30,6 +30,7 @@ scripts/test-net.sh [aarch64] [x86_64]              # Phase 4 Milestone A on QEM
 scripts/test-gonet.sh [--pkg net/http] [arch...]    # Go's own `net` (or net/http) package tests with testapps/skiplist/net.txt
 scripts/test-gopkg.sh <pkg>... [--arch aarch64|x86_64|both] [--cpus N] [--run RE] [--no-short] [--mem MiB]
                                                     # Milestone B: any Go std package's tests with testapps/skiplist/<pkg>.txt (D74); test-os.sh/test-gonet.sh wrap it
+                                                    # x86_64 (TCG) is slow: raise PATINA_TIMEOUT / GOPKG_TEST_TIMEOUT when the host is busy
 PATINA_NET=user scripts/run-qemu.sh <arch> -- patina.selftest=net   # virtio-net driver self-test (ARP against slirp)
 cargo test --workspace --exclude patina-kernel      # host tests
 ```
@@ -246,7 +247,7 @@ Runtime and scheduling:
 - [x] `sched_getaffinity` reports all vCPUs → `GOMAXPROCS` = `NumCPU` = vCPUs — **test-smp**, **threads-smp** (`GOMAXPROCS=4 NumCPU=4`)
 - [x] Per-thread CPU time (`Thread::cpu_time_ns`, `CLOCK_THREAD_CPUTIME_ID`, the process CPU clock) — **pproftest** (spinning thread +198.9–200.0 ms, sleeping thread +3.6–104 µs over 200 ms)
 - [x] x86_64 SMP memory safety: TLB shootdown IPIs with deferred frame reclaim (D52, `mm/tlb.rs`) — **tlbstress** (reproduced the stale-TLB free-list corruption before the fix, 8/8 after), **test-runtime**; aarch64 user-page invalidation broadcasts (`tlbi vale1is`) and needs no shootdown. Limits: a stopped CPU never advances its generation (pending batches stay pending after exit), remote flushes complete asynchronously (mprotect/munmap return before other CPUs flush)
-- [~] More than 4 vCPUs under the scheduler — untested (the arch self-tests ran 8 CPUs)
+- [x] More than 4 vCPUs under the scheduler: Go's `runtime` tests at 8 vCPUs, 0 failed (aarch64 3 identical runs, x86_64 one run; also `sync`, `os/signal`, `runtime/pprof` at 8 on aarch64) — **test-gopkg-8cpu** (Phase 5)
 - [~] Tickless idle — not implemented: idle CPUs keep the 100 Hz tick
 
 Signals (D42–D45):
@@ -392,27 +393,58 @@ CLI and Milestone A:
 ## Phase 5 — Hardening
 
 Milestone B (D74): Go 1.27.1 `go test -c` binaries, `-test.short`, aarch64
-= QEMU `virt` HVF, release kernel. Command for every row:
-`scripts/test-gopkg.sh <pkg> --arch aarch64 [--cpus 4]` (logs in
-`out/test/gopkg/`). Counts are top-level tests: passed / skipped (of which
-by our skip list) / failed.
+= QEMU `virt` HVF, x86_64 = QEMU `microvm` TCG, release kernel. Command for
+every cell: `scripts/test-gopkg.sh <pkg> --arch <arch> [--cpus N]` (logs in
+`out/test/gopkg/`; the x86_64 and 8-vCPU runs used `GOPKG_NO_KERNEL_BUILD=1
+PATINA_TIMEOUT=3600..7200 GOPKG_TEST_TIMEOUT=55m..115m` because the host was
+shared with other QEMU runs). Counts are top-level tests: passed / skipped
+(of which by our skip list) / failed. "—" = not run (not in the plan).
 
-| Name | Package | aarch64, 1 vCPU | aarch64, 4 vCPUs |
+| Name | Package | aarch64, 1 vCPU | aarch64, 4 vCPUs | x86_64, 1 vCPU | x86_64, 4 vCPUs |
+|---|---|---|---|---|---|
+| **test-gopkg** | `runtime` | 378 / 148 (11) / 0 | 385 / 141 (11) / 0 (3 runs identical; `--no-short`, 2 GiB: 399 passed, 1 failed — `TestPanicSystemstack`, needs exec, since listed) | 379 / 150 (11) / 0 | 386 / 143 (11) / 0 |
+| **test-gopkg** | `os` | 248 / 33 (10) / 0 | 248 / 33 (10) / 0 | 248 / 33 (10) / 0 | 248 / 33 (10) / 0 |
+| **test-gopkg** | `net` | 254 / 55 (1) / 0 | 254 / 55 (1) / 0 | 254 / 55 (1) / 0 | 254 / 55 (1) / 0 |
+| **test-gopkg** | `os/signal` | 18 / 3 (2) / 0 | 18 / 3 (2) / 0 | 18 / 3 (2) / 0 | 18 / 3 (2) / 0 |
+| **test-gopkg** | `time` | 180 / 4 (0) / 0 | 180 / 4 (0) / 0 | 180 / 4 (0) / 0 | — |
+| **test-gopkg** | `sync` | 51 / 2 (2) / 0 | 51 / 2 (2) / 0 | 51 / 2 (2) / 0 | — |
+| **test-gopkg** | `syscall` | 25 / 28 (10) / 0 | 25 / 28 (10) / 0 | 25 / 28 (10) / 0 | 25 / 28 (10) / 0 |
+| **test-gopkg** | `io` | 72 / 0 / 0 | 72 / 0 / 0 | 72 / 0 / 0 | — |
+| **test-gopkg** | `bufio` | 88 / 0 / 0 | 88 / 0 / 0 | 88 / 0 / 0 | — |
+| **test-gopkg** | `context` | 46 / 0 / 0 | 46 / 0 / 0 | 46 / 0 / 0 | — |
+| **test-gopkg** | `net/http` | 612 / 9 (0) / 0 | 611 / 10 (0) / 0 (before the go.mod change) | 612 / 9 (0) / 0 | — |
+| **test-gopkg** | `runtime/pprof` | 44 / 3 (0) / 0 | 44 / 3 (0) / 0 | 46 / 1 (0) / 0 | — |
+| **test-gopkg** | `os/user` | 12 / 0 / 0 | 12 / 0 / 0 | 12 / 0 / 0 | — |
+
+8 vCPUs (`--cpus 8`; QEMU `-smp 8`):
+
+| Name | Package | aarch64, 8 vCPUs | x86_64, 8 vCPUs |
 |---|---|---|---|
-| **test-gopkg** | `runtime` | 378 / 148 (11) / 0 | 385 / 141 (11) / 0 (3 runs identical; `--no-short`, 2 GiB: 399 passed, 1 failed — `TestPanicSystemstack`, needs exec, since listed) |
-| **test-gopkg** | `os` | 248 / 33 (10) / 0 | 248 / 33 (10) / 0 |
-| **test-gopkg** | `net` | 254 / 55 (1) / 0 | 254 / 55 (1) / 0 |
-| **test-gopkg** | `os/signal` | 18 / 3 (2) / 0 | 18 / 3 (2) / 0 |
-| **test-gopkg** | `time` | 180 / 4 (0) / 0 | 180 / 4 (0) / 0 |
-| **test-gopkg** | `sync` | 51 / 2 (2) / 0 | 51 / 2 (2) / 0 |
-| **test-gopkg** | `syscall` | 25 / 28 (10) / 0 | 25 / 28 (10) / 0 |
-| **test-gopkg** | `io` | 72 / 0 / 0 | 72 / 0 / 0 |
-| **test-gopkg** | `bufio` | 88 / 0 / 0 | 88 / 0 / 0 |
-| **test-gopkg** | `context` | 46 / 0 / 0 | 46 / 0 / 0 |
-| **test-gopkg** | `net/http` | 612 / 9 (0) / 0 | 611 / 10 (0) / 0 (before the go.mod change) |
-| **test-gopkg** | `runtime/pprof` | 44 / 3 (0) / 0 | 44 / 3 (0) / 0 |
-| **test-gopkg** | `os/user` | 12 / 0 / 0 | 12 / 0 / 0 |
-| **test-gopkg-x86** | `runtime`, x86_64 (microvm, TCG), 1 vCPU | 379 / 150 (11) / 0 | not run |
+| **test-gopkg-8cpu** | `runtime` | 385 / 141 (11) / 0, 3 runs with identical pass/skip sets; `--no-short --mem 4096`: 399 / 127 (11) / 0 (with the default 2 GiB `--no-short` ran the guest out of memory, see below) | 386 / 143 (11) / 0, 2 runs (before and after the select/utime commits) |
+| **test-gopkg-8cpu** | `sync` | 51 / 2 (2) / 0 | — |
+| **test-gopkg-8cpu** | `os/signal` | 18 / 3 (2) / 0 | — |
+| **test-gopkg-8cpu** | `runtime/pprof` | 46 / 1 (0) / 0 | — |
+
+No x86_64-only failure and no 8-vCPU failure: no skip-list entry was
+added, and the x86_64 legacy paths, XSAVE frames under preemption and the
+D52 shootdown held at 8 vCPUs. `runtime/pprof` now reports 46 passed / 1
+skipped (`TestMapping`) on both arches; an aarch64 1-vCPU re-run on this
+branch gives the same, so the 44 / 3 cells above are older numbers, not a
+difference between arches. `runtime
+--no-short` at 8 vCPUs with 2 GiB: about 20 parallel tests (`TestGcPacer`,
+the `TestSmhasher*` set, large `TestMemmove*`) exhausted guest RAM
+(`[patina] out of memory filling user page`, then Go's `fatal error:
+unexpected signal` — the OOM-to-signal path, not a crash in our code); with
+4 GiB it passes and exits with 3.8 GiB free, so this is capacity, not a
+leak. The `-short` default needs well under 2 GiB at 8 vCPUs.
+
+Regression on the tree with the `select`/`utime`/`time` commits:
+`scripts/test-gopkg.sh syscall os/signal --arch aarch64` (0 failed, counts
+as above), `scripts/test-signals.sh aarch64 x86_64` (12/12),
+`PATINA_CPUS_LIST="1 4" scripts/test-runtime.sh x86_64` (`all passed`,
+22 rows), `scripts/test-hello.sh --app fdtest|fileio aarch64 x86_64`,
+x86_64 `syscall` and `os` at 1 vCPU and `runtime` at 8 vCPUs (counts as
+above), host tests, clippy both targets 0 warnings.
 
 `ENOSYS` lines across all runs: `pidfd_open` (D57; Go's os/exec probe, falls
 back) and `clone3` (syscall tests that ask for a namespace or pidfd; Go
@@ -422,7 +454,10 @@ change (time then had 179 passed, 5 skipped).
 
 - [x] Milestone B harness `scripts/test-gopkg.sh` (D74): per-package defaults (RAM, timeouts, extra files), skip lists `testapps/skiplist/<pkg>.txt`, summary/failure rules of D65; `test-os.sh`/`test-gonet.sh` are wrappers — **test-gopkg** (reproduced test-os-p4 248/0 and test-gonet 254/0)
 - [x] **Milestone B on aarch64** (QEMU, 1 and 4 vCPUs): the design §13 packages (`runtime`, `os`, `net`, `os/signal`, `time`, `sync`, `syscall`) plus `io`, `bufio`, `context`, `net/http`, `runtime/pprof`, `os/user`, 0 failed; 36 listed tests, all "needs os/exec" or "GODEBUG re-exec" — **test-gopkg**
-- [~] Milestone B on x86_64: only `runtime` at 1 vCPU was run (379 / 150 (11) / 0) — **test-gopkg-x86**
+- [x] **Milestone B on x86_64** (QEMU microvm, TCG): all 13 packages at 1 vCPU and `runtime`, `os`, `net`, `syscall`, `os/signal` at 4 vCPUs, 0 failed, same 36 listed tests as aarch64 — **test-gopkg**
+- [x] **8 vCPUs**: `runtime` on aarch64 (3 runs, identical) and x86_64, `sync`, `os/signal`, `runtime/pprof` on aarch64, 0 failed; `runtime --no-short` at 8 vCPUs passes with 4 GiB — **test-gopkg-8cpu**
+- [x] `select` (x86_64) and `pselect6` (both arches) were `ENOSYS`: now over `File::poll` with Linux semantics (nfds clamped, `EBADF` for an unopened fd, `POLLIN/OUT/EX` sets, `ERESTARTNOHAND`, time left written back); Go's `syscall.Select` uses them — **fdtest** `ok select` (strace shows `select` on x86_64, `pselect6` on aarch64)
+- [x] x86_64 `utime` and `time` were `ENOSYS` (Go's `syscall.Utime` issues `SYS_UTIME` on amd64) — **fileio** `ok utime (x86_64 SYS_UTIME)`, `ok time (x86_64 SYS_TIME)`
 - [x] `recvmsg` reports `MSG_CMSG_CLOEXEC` back in `msg_flags` — **test-gopkg** syscall `TestSCMCredentials`
 - [x] Per-thread credentials (`set*uid`/`set*gid`/`setfs*`/`setgroups`/`getgroups`/`getres*` with Linux's rules and capability fix-ups, `patina_abi::cred` host-tested), `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS`, `capget` reports the sets, `/proc/1/status` `Uid`/`Gid`/`Groups`/`CapPrm`/`CapEff`, `/proc/1/task/<tid>/{status,stat,comm}` — **test-gopkg** syscall `TestSetuidEtc`, `TestAllThreadsSyscall`; os/signal `TestAllThreadsSyscallSignals`
 - [x] `fcntl` record locks (`F_GETLK`/`F_SETLK`/`F_SETLKW`, `F_OFD_*`): validated like Linux, granted — **test-gopkg** syscall `TestFcntlFlock` (parent half; the child half needs exec and the test is listed)

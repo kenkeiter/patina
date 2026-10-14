@@ -2184,6 +2184,22 @@ on purpose: Go falls back to `clone`, which cannot create a process (D57).
 mod}.rs` and `kernel/src/drivers/virtio/pci.rs`. Those paths belong to
 another change and were left alone.
 
+x86_64 and 8-vCPU runs. All 13 packages pass on x86_64 (microvm, TCG) at
+1 vCPU, and `runtime`, `os`, `net`, `syscall` and `os/signal` at 4 vCPUs,
+with the aarch64 skip lists unchanged: no x86_64-only failure, so nothing
+was added to a list. `runtime` passes at 8 vCPUs on both arches (aarch64
+three times with identical pass/skip sets), as do `sync`, `os/signal` and
+`runtime/pprof` on aarch64. `runtime --no-short` at 8 vCPUs needs more than
+the 2 GiB default (about 20 tests run in parallel; the guest ran out of
+frames) and passes with `--mem 4096`; the default stays, since the
+`-short` run is the gate. Three syscalls that are `ENOSYS` only on a path
+Go's `syscall` package reaches directly were cheap to add, though no
+package test needed them: `select` (x86_64) and `pselect6` (both; Go's
+`syscall.Select`), as a third client of `File::poll` with Linux's
+`fd_set` rules (fdtest `ok select`), and x86_64 `utime` (`syscall.Utime`
+issues `SYS_UTIME` on amd64) and `time` (fileio). The `ENOSYS` lines in
+the x86_64 runs are the aarch64 ones: `pidfd_open` and `clone3`.
+
 ## D75: vDSO (clock_gettime, gettimeofday, getrandom) and the vvar page
 *2026-10-14 · Phase 5*
 
