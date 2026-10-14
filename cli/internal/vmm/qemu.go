@@ -209,11 +209,29 @@ type qemuMachine struct {
 	ctx       context.Context
 
 	mu      sync.Mutex
-	cmd     *exec.Cmd
+	proc    *qemuProc // current QEMU process (replaced on the hvf->TCG retry)
 	stderr  *capBuffer
 	errf    *lineFilter
 	started time.Time
 	killed  bool
+}
+
+// qemuProc is one started QEMU process. A reaper goroutine is the only
+// caller of cmd.Wait; everyone else learns about the exit through done, so
+// nothing reads cmd.ProcessState while Wait is writing it.
+type qemuProc struct {
+	cmd  *exec.Cmd
+	done chan struct{} // closed once cmd.Wait has returned
+	err  error         // cmd.Wait's result; valid after done is closed
+}
+
+func (p *qemuProc) exited() bool {
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *qemuMachine) launch() error {
@@ -235,12 +253,26 @@ func (m *qemuMachine) launch() error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting %s: %w", m.bin, err)
 	}
-	m.mu.Lock()
-	m.cmd, m.started = cmd, time.Now()
-	m.mu.Unlock()
+	p := &qemuProc{cmd: cmd, done: make(chan struct{})}
 	go func() {
-		<-m.ctx.Done()
-		m.Kill()
+		p.err = cmd.Wait()
+		close(p.done)
+	}()
+	m.mu.Lock()
+	m.proc, m.started = p, time.Now()
+	killed := m.killed
+	m.mu.Unlock()
+	if killed {
+		// Kill raced with the hvf->TCG relaunch: it saw the old, exited
+		// process, so the new one must not outlive it.
+		cmd.Process.Kill()
+	}
+	go func() {
+		select {
+		case <-m.ctx.Done():
+			m.Kill()
+		case <-p.done:
+		}
 	}()
 	return nil
 }
@@ -252,20 +284,21 @@ func (m *qemuMachine) Control() ctl.Endpoint {
 func (m *qemuMachine) PID() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.cmd == nil || m.cmd.Process == nil {
+	if m.proc == nil {
 		return 0
 	}
-	return m.cmd.Process.Pid
+	return m.proc.cmd.Process.Pid
 }
 
 func (m *qemuMachine) Wait() (*Exit, error) {
 	for {
 		m.mu.Lock()
-		cmd := m.cmd
+		p := m.proc
 		m.mu.Unlock()
-		err := cmd.Wait()
+		<-p.done
+		err := p.err
 		m.errf.flush()
-		code := cmd.ProcessState.ExitCode()
+		code := p.cmd.ProcessState.ExitCode()
 		var ee *exec.ExitError
 		if err != nil && !errors.As(err, &ee) {
 			return nil, err
@@ -299,10 +332,14 @@ func (m *qemuMachine) Kill() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.killed = true
-	if m.cmd == nil || m.cmd.Process == nil || m.cmd.ProcessState != nil {
+	p := m.proc
+	if p == nil || p.exited() {
 		return nil
 	}
-	return m.cmd.Process.Kill()
+	if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return nil
 }
 
 // qemuBenign matches QEMU stderr lines that are expected and tell the user
