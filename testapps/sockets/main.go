@@ -1,13 +1,15 @@
 // sockets exercises the Phase 4 TCP/IP stack over loopback: TCP over
 // 127.0.0.1, [::1] and a dual-stack listener, many concurrent connections,
 // large transfers, UDP, error paths (ECONNREFUSED, EOF, EPIPE/ECONNRESET,
-// deadlines), half-close, SO_REUSEADDR, raw socket syscalls and an HTTP
-// round trip. Prints "ok <case>" per check, then "PASS sockets" (exit 0),
-// or "FAIL sockets: ..." (exit 1).
+// deadlines), half-close, SO_REUSEADDR, raw socket syscalls, TCP
+// keep-alive options and probes, and an HTTP round trip. Prints
+// "ok <case>" per check, then "PASS sockets" (exit 0), or
+// "FAIL sockets: ..." (exit 1).
 package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"flag"
@@ -511,6 +513,97 @@ func httpRoundTrip() {
 	ok("http.Server + http.Get, 1 MiB body")
 }
 
+// keepAlive: SO_KEEPALIVE / TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT
+// behave like Linux (defaults 0 / 7200 / 75 / 9, range checks, values
+// stored, inherited by accepted sockets), and keep-alive probes on an idle
+// connection (TCP_KEEPIDLE 1 s) neither break it nor put bytes in either
+// stream. The probes themselves are seen on the wire only (D85: one used
+// to go out right after Go enabled SO_KEEPALIVE on each connection).
+func keepAlive() {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	must(err, "socket")
+	defer syscall.Close(fd)
+	get := func(fd, level, name int) int {
+		v, err := syscall.GetsockoptInt(fd, level, name)
+		must(err, fmt.Sprintf("getsockopt(%d, %d)", level, name))
+		return v
+	}
+	const tcp = syscall.IPPROTO_TCP
+	opts := func(fd int) [4]int {
+		return [4]int{get(fd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE), get(fd, tcp, syscall.TCP_KEEPIDLE),
+			get(fd, tcp, syscall.TCP_KEEPINTVL), get(fd, tcp, syscall.TCP_KEEPCNT)}
+	}
+	if o := opts(fd); o != [4]int{0, 7200, 75, 9} {
+		fail("keep-alive defaults: %v, want [0 7200 75 9]", o)
+	}
+	for _, c := range []struct{ name, v int }{
+		{syscall.TCP_KEEPIDLE, 0}, {syscall.TCP_KEEPIDLE, 32768},
+		{syscall.TCP_KEEPINTVL, 0}, {syscall.TCP_KEEPINTVL, 32768},
+		{syscall.TCP_KEEPCNT, 0}, {syscall.TCP_KEEPCNT, 128},
+	} {
+		if err := syscall.SetsockoptInt(fd, tcp, c.name, c.v); err != syscall.EINVAL {
+			fail("setsockopt(TCP %d, %d): %v, want EINVAL", c.name, c.v, err)
+		}
+	}
+	must(syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, 1), "SO_KEEPALIVE")
+	must(syscall.SetsockoptInt(fd, tcp, syscall.TCP_KEEPIDLE, 1), "TCP_KEEPIDLE")
+	must(syscall.SetsockoptInt(fd, tcp, syscall.TCP_KEEPINTVL, 2), "TCP_KEEPINTVL")
+	must(syscall.SetsockoptInt(fd, tcp, syscall.TCP_KEEPCNT, 3), "TCP_KEEPCNT")
+	if o := opts(fd); o != [4]int{1, 1, 2, 3} {
+		fail("keep-alive set: %v, want [1 1 2 3]", o)
+	}
+	// Accepted sockets inherit the listener's settings (Linux copies them).
+	must(syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}), "bind")
+	must(syscall.Listen(fd, 4), "listen")
+	lsa, err := syscall.Getsockname(fd)
+	must(err, "getsockname")
+	cfd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	must(err, "socket")
+	defer syscall.Close(cfd)
+	must(syscall.Connect(cfd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}, Port: sockaddrPort(lsa)}), "connect")
+	afd, _, err := syscall.Accept(fd)
+	must(err, "accept")
+	defer syscall.Close(afd)
+	if a, c := opts(afd), opts(cfd); a != [4]int{1, 1, 2, 3} || c != [4]int{0, 7200, 75, 9} {
+		fail("accepted keep-alive: %v (connector %v), want [1 1 2 3] ([0 7200 75 9])", a, c)
+	}
+	ok("SO_KEEPALIVE/TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT: defaults, EINVAL, stored, inherited by accept")
+
+	// Enabled after the handshake on both ends (as Go's net does), then
+	// 2.5 s idle: probes go out, the connection stays up and clean.
+	ka := net.KeepAliveConfig{Enable: true, Idle: time.Second, Interval: time.Second, Count: 3}
+	ln, err := (&net.ListenConfig{KeepAliveConfig: ka}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	must(err, "listen")
+	defer ln.Close()
+	acc := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		must(err, "accept")
+		acc <- c
+	}()
+	c, err := (&net.Dialer{KeepAliveConfig: ka}).Dial("tcp", ln.Addr().String())
+	must(err, "dial")
+	defer c.Close()
+	s := <-acc
+	defer s.Close()
+	time.Sleep(2500 * time.Millisecond)
+	buf := make([]byte, 16)
+	for _, x := range []net.Conn{c, s} {
+		x.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if n, err := x.Read(buf); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+			fail("idle keep-alive connection: read %d bytes (%q), %v; want a timeout", n, buf[:n], err)
+		}
+		x.SetReadDeadline(time.Time{})
+	}
+	_, err = c.Write([]byte("ping"))
+	must(err, "write")
+	s.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(s, buf[:4]); err != nil || string(buf[:4]) != "ping" {
+		fail("keep-alive connection after idle: %q, %v", buf[:4], err)
+	}
+	ok("keep-alive (idle 1 s) connection idle 2.5 s: no stray bytes, still up")
+}
+
 // selfAddr: with -self <ip> (the ip= client address), TCP and UDP echo
 // over our own non-loopback address, which the stack must loop back.
 func selfAddr(ip string) {
@@ -540,6 +633,7 @@ func main() {
 	udp()
 	errorsCases()
 	rawSyscalls()
+	keepAlive()
 	httpRoundTrip()
 	fmt.Println("PASS sockets")
 }
