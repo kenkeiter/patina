@@ -70,7 +70,12 @@ pub fn is_ready() -> bool {
 /// for timestamps until the process exists.
 pub fn init(epoch_ns: u64) {
     let clock = move || {
-        let epoch = crate::task::try_process().map_or(epoch_ns, |p| p.epoch_ns);
+        // Before the process exists `wallclock::epoch_ns()` is 0: use the
+        // cmdline epoch until then; afterwards it follows `time` ops.
+        let epoch = match crate::wallclock::epoch_ns() {
+            0 => epoch_ns,
+            e => e,
+        };
         let ns = crate::arch::timer::now_ns().saturating_add(epoch);
         Timespec {
             tv_sec: (ns / 1_000_000_000) as i64,
