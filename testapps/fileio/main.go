@@ -395,6 +395,7 @@ func main() {
 		}
 		return nil
 	}())
+	legacyChecks(q)
 	check("large file", func() error {
 		big := bytes.Repeat([]byte("0123456789abcdef"), 64<<10) // 1 MiB
 		bp := filepath.Join(dir, "big")

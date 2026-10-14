@@ -54,6 +54,17 @@ pub fn gettimeofday(tv: usize) -> SysResult {
     Ok(0)
 }
 
+/// x86_64 `time(tloc)`: seconds since the epoch, also stored at a
+/// non-NULL `tloc`. (Go and libc normally get it from the vDSO.)
+#[cfg(target_arch = "x86_64")]
+pub fn time(tloc: usize) -> SysResult {
+    let secs = ((timer::now_ns() + crate::wallclock::epoch_ns()) / 1_000_000_000) as i64;
+    if tloc != 0 {
+        with_space(|s| s.write_val(tloc, &secs))?;
+    }
+    Ok(secs as isize)
+}
+
 fn read_timespec(p: usize) -> Result<u64, Errno> {
     let ts: Timespec = with_space(|s| s.read_val(p))?;
     ts.to_nanos().ok_or(Errno(EINVAL))

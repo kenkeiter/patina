@@ -169,6 +169,7 @@ fn path_arg(n: usize) -> Option<usize> {
         | nr::RENAME
         | nr::CREAT
         | nr::CHMOD
+        | nr::UTIME
         | nr::UTIMES => Some(0),
         _ => None,
     }
@@ -368,6 +369,8 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         #[cfg(target_arch = "x86_64")]
         nr::LCHOWN => path::lchown(u(0), a[1] as u32, a[2] as u32),
         #[cfg(target_arch = "x86_64")]
+        nr::UTIME => path::utime(u(0), u(1)),
+        #[cfg(target_arch = "x86_64")]
         nr::UTIMES => path::futimesat(AT_FDCWD, u(0), u(1)),
         #[cfg(target_arch = "x86_64")]
         nr::FUTIMESAT => path::futimesat(i(0), u(1), u(2)),
@@ -502,6 +505,8 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::SETITIMER => time::setitimer(i(0), u(1), u(2)),
         #[cfg(target_arch = "x86_64")]
         nr::ALARM => time::alarm(a[0] as u32),
+        #[cfg(target_arch = "x86_64")]
+        nr::TIME => time::time(u(0)),
         nr::GETRUSAGE => time::getrusage(i(0), u(1)),
         nr::TIMES => time::times(u(0)),
 

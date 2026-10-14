@@ -361,6 +361,24 @@ pub fn futimesat(dirfd: i32, path: usize, times: usize) -> SysResult {
     set_times(dirfd, &p, t, 0)
 }
 
+/// x86_64 `utime(path, const struct utimbuf *)`: whole seconds
+/// (`actime`, `modtime`); NULL sets both to now.
+pub fn utime(path: usize, times: usize) -> SysResult {
+    let t = if times == 0 {
+        [SetTime::Now, SetTime::Now]
+    } else {
+        let tb: [i64; 2] = with_space(|s| s.read_val(times))?;
+        tb.map(|sec| {
+            SetTime::At(Timespec {
+                tv_sec: sec,
+                tv_nsec: 0,
+            })
+        })
+    };
+    let p = upath(path)?;
+    set_times(AT_FDCWD, &p, t, 0)
+}
+
 pub fn truncate(path: usize, len: i64) -> SysResult {
     if len < 0 {
         return Err(Errno(EINVAL));
