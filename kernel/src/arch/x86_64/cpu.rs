@@ -6,6 +6,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::percpu;
 
+/// Maximum number of CPUs (per-CPU static slots; extra CPUs the firmware
+/// reports are not started).
+pub const MAX_CPUS: usize = 32;
+
 /// Logical CPU index, from the per-CPU block (GS; see `percpu.rs`).
 #[inline]
 pub fn id() -> usize {
@@ -291,4 +295,53 @@ const HWCAP2_FSGSBASE: u64 = 1 << 1;
 pub fn hwcap() -> (u64, u64) {
     let edx = cpuid(1, 0).3 as u64;
     (edx, if has_fsgsbase() { HWCAP2_FSGSBASE } else { 0 })
+}
+
+/// Initial APIC id of the executing CPU (CPUID 0xB x2APIC id when the leaf
+/// exists, else CPUID.1:EBX[31:24]).
+pub fn apic_id() -> u32 {
+    let (max_leaf, ..) = cpuid(0, 0);
+    if max_leaf >= 0xb {
+        let (_, ebx, _, edx) = cpuid(0xb, 0);
+        if ebx != 0 {
+            return edx;
+        }
+    }
+    cpuid(1, 0).1 >> 24
+}
+
+/// A 64-bit value from the hardware RNG: RDSEED (CPUID.7.0:EBX bit 18,
+/// retried a few times since it may transiently run dry), else RDRAND
+/// (CPUID.1:ECX bit 30, likewise); `None` without either or if both keep
+/// failing.
+pub fn hw_random() -> Option<u64> {
+    let (max_leaf, ..) = cpuid(0, 0);
+    let rdseed = max_leaf >= 7 && cpuid(7, 0).1 & (1 << 18) != 0;
+    let rdrand = cpuid(1, 0).2 & (1 << 30) != 0;
+    if rdseed {
+        for _ in 0..64 {
+            let (v, ok): (u64, u8);
+            // SAFETY: CPUID reports RDSEED; it only writes the register and CF.
+            unsafe {
+                asm!("rdseed {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack))
+            };
+            if ok != 0 {
+                return Some(v);
+            }
+            core::hint::spin_loop();
+        }
+    }
+    if rdrand {
+        for _ in 0..16 {
+            let (v, ok): (u64, u8);
+            // SAFETY: CPUID reports RDRAND; it only writes the register and CF.
+            unsafe {
+                asm!("rdrand {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack))
+            };
+            if ok != 0 {
+                return Some(v);
+            }
+        }
+    }
+    None
 }

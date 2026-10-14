@@ -36,7 +36,6 @@ pub fn run(cmdline: &str) {
                 "fault" => fault(),
                 "alloc" => alloc_test(),
                 "vm" => crate::mm::vm::selftest(),
-                #[cfg(target_arch = "aarch64")]
                 "smp" => crate::arch::smp::selftest(),
                 other => kprintln!("[patina] selftest: unknown test {:?}", other),
             }

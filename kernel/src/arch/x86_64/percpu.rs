@@ -6,8 +6,8 @@
 //! every return to ring 3 ends with one. Kernel-mode entries do not swap.
 //! The entry asm uses the fixed offsets below (`gs:OFF_*`).
 //!
-//! Phase 0/1 has the boot CPU's block as a static; Phase 2 allocates one per
-//! AP and calls [`init`] on it from the AP's startup path.
+//! The boot CPU's block is a static; each secondary CPU allocates its own
+//! (`alloc_ap` on the boot CPU, `init_ap` from `smp::ap_main`).
 
 use core::cell::UnsafeCell;
 use core::mem::offset_of;
@@ -66,6 +66,28 @@ unsafe fn init(pc: *mut PerCpu, cpu_id: u64, tss: *mut Tss) {
 pub(super) fn init_boot_cpu() {
     // SAFETY: single-threaded boot; BOOT_CPU is a static used only by CPU 0.
     unsafe { init(BOOT_CPU.0.get(), 0, gdt::boot_tss()) };
+}
+
+/// Allocate (and leak: CPUs never go away) a block for a secondary CPU.
+/// Called by the boot CPU; the AP then calls [`init_ap`] on it.
+pub(super) fn alloc_ap() -> *mut PerCpu {
+    alloc::boxed::Box::leak(alloc::boxed::Box::new(PerCpu {
+        self_ptr: 0,
+        kernel_stack_top: 0,
+        user_rsp_scratch: 0,
+        cpu_id: 0,
+        tss: core::ptr::null_mut(),
+    }))
+}
+
+/// On secondary CPU `cpu_id`: point GS at `pc` (from [`alloc_ap`]). Must
+/// run after `gdt::load_ap` (loading the GS selector clears GS_BASE).
+///
+/// # Safety
+/// `pc` must come from `alloc_ap` and be used by this CPU only.
+pub(super) unsafe fn init_ap(pc: *mut PerCpu, cpu_id: usize, tss: *mut Tss) {
+    // SAFETY: caller's guarantee.
+    unsafe { init(pc, cpu_id as u64, tss) };
 }
 
 /// This CPU's block.

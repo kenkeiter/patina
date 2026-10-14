@@ -39,6 +39,10 @@ use super::{exceptions, irq};
 pub const TIMER_VECTOR: u8 = 0xec;
 /// LAPIC spurious-interrupt vector (SVR); no EOI.
 pub const SPURIOUS_VECTOR: u8 = 0xff;
+/// IPI vectors (`trap::IpiKind::Reschedule` / `Stop`). Above the timer so
+/// the LAPIC priority classes order them first (0xf > 0xe).
+pub const IPI_RESCHEDULE_VECTOR: u8 = 0xf0;
+pub const IPI_STOP_VECTOR: u8 = 0xf1;
 
 const EFER_SCE: u64 = 1 << 0;
 /// RFLAGS bits cleared on SYSCALL: TF | IF | DF | NT | AC.
@@ -135,6 +139,8 @@ __isr\n:
     ISR_NOERR 31
     ISR_NOERR {timer}
     ISR_NOERR {spurious}
+    ISR_NOERR {ipi_resched}
+    ISR_NOERR {ipi_stop}
 
 __isr_common:
     PUSH_GPRS
@@ -215,9 +221,15 @@ __isr_timer:
     .global __isr_spurious
 __isr_spurious:
     .quad __isr{spurious}
+    .global __isr_ipi
+__isr_ipi:
+    .quad __isr{ipi_resched}
+    .quad __isr{ipi_stop}
 "#,
     timer = const TIMER_VECTOR,
     spurious = const SPURIOUS_VECTOR,
+    ipi_resched = const IPI_RESCHEDULE_VECTOR,
+    ipi_stop = const IPI_STOP_VECTOR,
     tf_orig = const TF_ORIG_RAX,
     tf_cs = const TF_CS,
     tf_rsp_from_vec = const TF_RSP_FROM_VECTOR,
@@ -239,6 +251,8 @@ unsafe extern "C" {
     pub(super) static __isr_table: [u64; 32];
     pub(super) static __isr_timer: u64;
     pub(super) static __isr_spurious: u64;
+    /// Reschedule and Stop IPI stubs.
+    pub(super) static __isr_ipi: [u64; 2];
     fn __patina_syscall_entry();
     pub(super) fn __patina_enter_user(frame: *const TrapFrame) -> !;
 }

@@ -21,7 +21,7 @@ use core::arch::global_asm;
 use super::start_info::{self, MEMMAP_ACPI, MEMMAP_NVS, MEMMAP_RAM};
 use super::{
     KERNEL_VA_BASE, console, cpu, entry, exceptions, gdt, kernel_load_phys, kernel_size, paging,
-    percpu, pic, timer,
+    percpu, pic, smp, timer,
 };
 use crate::bootinfo::{BootInfo, MemKind, MemoryMap, PhysRange, PlatformInfo};
 use crate::mm::{PhysAddr, frame, heap, page_align_down, page_align_up};
@@ -330,6 +330,13 @@ pub extern "C" fn early_main(start_info_pa: usize) -> ! {
         crate::kprintln!("[patina] early: warning: cmdline truncated to 4096 bytes");
     }
 
+    // ---- CPUs (ACPI / MP tables are read through the boot direct map,
+    // before the frame allocator could reuse their pages).
+    let skip = crate::cmdline::param(si.cmdline, "patina.smp.skip")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    smp::enumerate(si.rsdp, skip);
+
     // ---- Memory map.
     let mut map = MemoryMap::new();
     let mut direct = Ranges::new();
@@ -352,7 +359,8 @@ pub extern "C" fn early_main(start_info_pa: usize) -> ! {
         map.reserve(s, end, kind).expect("memory map full");
     }
     // Low 1 MiB: real-mode/BIOS area, EBDA, RSDP; also kept direct-mapped so
-    // Phase 1 can read the RSDP and an AP trampoline can live there.
+    // the AP trampoline and its page tables (`smp::TRAMPOLINE_PA`,
+    // 0x8000-0xbfff) can live there.
     map.reserve(0, 0x10_0000, MemKind::Reserved)
         .expect("memory map full");
     direct.add(0, 0x10_0000);
