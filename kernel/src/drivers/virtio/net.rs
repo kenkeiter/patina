@@ -1,10 +1,13 @@
 //! virtio-net (virtio 1.2 §5.1), decision D69: one receive/transmit queue
 //! pair, no offloads, behind the `net::device::NetDevice` seam.
 //!
-//! * Features: `VIRTIO_NET_F_MAC` and `VIRTIO_NET_F_STATUS` when offered;
-//!   nothing else (no `MRG_RXBUF`, checksum/GSO offloads, control queue or
-//!   multiqueue). The MAC comes from config space (or is generated,
-//!   locally administered, when the device does not offer one).
+//! * Features: `VIRTIO_NET_F_MAC`, `VIRTIO_NET_F_STATUS` and
+//!   `VIRTIO_NET_F_MTU` when offered; nothing else (no `MRG_RXBUF`,
+//!   checksum/GSO offloads, control queue or multiqueue). The MAC comes
+//!   from config space (or is generated, locally administered, when the
+//!   device does not offer one). `F_MTU` is accepted because Apple VZ
+//!   fails `FEATURES_OK` without it; the device's MTU (config offset 10) is
+//!   logged, and one below 1500 (our stack's) gets a warning.
 //! * Header (`virtio_net_hdr`): 10 bytes on a legacy transport, 12 (with
 //!   `num_buffers`) when `VIRTIO_F_VERSION_1` was negotiated. Transmit
 //!   headers are all zero (no checksum offload, `GSO_NONE`); receive
@@ -38,6 +41,8 @@ use crate::sync::{OnceCell, SpinLock};
 const F_MAC: u64 = 1 << 5;
 /// VIRTIO_NET_F_STATUS: config space holds the link status.
 const F_STATUS: u64 = 1 << 16;
+/// VIRTIO_NET_F_MTU: config space holds the device's maximum MTU.
+const F_MTU: u64 = 1 << 3;
 /// `status` bit VIRTIO_NET_S_LINK_UP.
 const S_LINK_UP: u16 = 1;
 
@@ -219,7 +224,7 @@ pub fn init() {
         return;
     };
     let t = dev.transport;
-    let feats = match negotiate(&*t, F_MAC | F_STATUS) {
+    let feats = match negotiate(&*t, F_MAC | F_STATUS | F_MTU) {
         Ok(f) => f,
         Err(e) => {
             crate::kprintln!("[patina] virtio-net: {}", e);
@@ -238,6 +243,16 @@ pub fn init() {
         m
     };
     let link_up = feats & F_STATUS == 0 || t.config_read16(6) & S_LINK_UP != 0;
+    let mtu = (feats & F_MTU != 0).then(|| t.config_read16(10));
+    if let Some(m) = mtu
+        && (m as usize) < MAX_FRAME - 14
+    {
+        crate::kprintln!(
+            "[patina] virtio-net: warning: device mtu {} is below the stack's {}",
+            m,
+            MAX_FRAME - 14
+        );
+    }
     let mk = || -> Option<Net> {
         let rx = VirtQueue::new(&*t, 0, RX_WANT)?;
         let tx = VirtQueue::new(&*t, 1, TX_WANT)?;
@@ -277,11 +292,12 @@ pub fn init() {
         attach_irq(line, irq);
     }
     crate::kprintln!(
-        "[patina] virtio-net: mac {}, queues rx {} / tx {}, link {} ({}, hdr {} B{})",
+        "[patina] virtio-net: mac {}, queues rx {} / tx {}, link {}{} ({}, hdr {} B{})",
         fmt_mac(&mac),
         nrx,
         ntx,
         if link_up { "up" } else { "down" },
+        mtu.map_or(String::new(), |m| alloc::format!(", mtu {}", m)),
         loc,
         hdr,
         if dev.irq.is_some() { "" } else { ", no irq" }

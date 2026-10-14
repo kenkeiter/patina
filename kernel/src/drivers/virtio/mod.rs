@@ -95,8 +95,11 @@ pub trait Transport: Send + Sync {
         None
     }
     fn config_generation(&self) -> u32;
-    /// TEMP: dump transport state for diagnostics.
-    fn diag(&self, _out: &mut dyn Write) {}
+    /// The device is Apple Virtualization.framework's (virtio-pci behind
+    /// Apple's host bridge); drivers work around its quirks (console.rs).
+    fn apple_vz(&self) -> bool {
+        false
+    }
     fn config_read8(&self, off: usize) -> u8;
     fn config_read32(&self, off: usize) -> u32;
     fn config_read64(&self, off: usize) -> u64 {
@@ -176,7 +179,6 @@ pub fn unclaimed() -> usize {
 /// up its queues and then calls [`driver_ok`]. Returns the accepted set.
 pub fn negotiate(t: &dyn Transport, wanted: u64) -> Result<u64, &'static str> {
     t.set_status(0);
-    settle(&RESET_SETTLE_NS);
     t.set_status(STATUS_ACKNOWLEDGE);
     t.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
     let offered = t.device_features();
@@ -203,53 +205,6 @@ pub fn negotiate(t: &dyn Transport, wanted: u64) -> Result<u64, &'static str> {
 /// Queues are set up: the driver is live.
 pub fn driver_ok(t: &dyn Transport) {
     t.set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
-    settle(&OK_SETTLE_NS);
-}
-
-/// Wait up to `ns` for `done`, re-notifying queue `q` of `t` every
-/// [`REKICK_NS`] meanwhile. Apple VZ starts a device model asynchronously
-/// after `DRIVER_OK`: a doorbell written in the first milliseconds is
-/// lost, and a device never looks at the available ring without one, so
-/// a polled transmit that waits on a single kick can hang forever (the
-/// console's early-ring replay did, in ~15% of boots). Re-kicking is
-/// harmless on every other device (a spurious notification of a queue it
-/// already processed).
-pub fn poll_until_kicked(t: &dyn Transport, q: u16, ns: u64, mut done: impl FnMut() -> bool) -> bool {
-    let t0 = crate::arch::timer::now_ns();
-    let mut next_kick = t0 + REKICK_NS;
-    loop {
-        if done() {
-            return true;
-        }
-        let now = crate::arch::timer::now_ns();
-        if now.saturating_sub(t0) >= ns {
-            return done();
-        }
-        if now >= next_kick {
-            crate::arch::cpu::io_barrier();
-            t.notify(q);
-            next_kick = now + REKICK_NS;
-        }
-        core::hint::spin_loop();
-    }
-}
-
-/// Interval between repeated notifications in [`poll_until_kicked`].
-pub const REKICK_NS: u64 = 1_000_000;
-
-/// TEMP diagnostic knobs: patina.virtio.reset_settle=<ms> / ok_settle=<ms>.
-pub static RESET_SETTLE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static OK_SETTLE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-fn settle(ns: &core::sync::atomic::AtomicU64) {
-    let ns = ns.load(core::sync::atomic::Ordering::Relaxed);
-    if ns == 0 {
-        return;
-    }
-    let until = crate::arch::timer::now_ns() + ns;
-    while crate::arch::timer::now_ns() < until {
-        core::hint::spin_loop();
-    }
 }
 
 /// Driver callback for a device interrupt (IRQs masked, must not block).

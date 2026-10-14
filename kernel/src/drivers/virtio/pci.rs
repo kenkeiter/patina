@@ -8,7 +8,10 @@
 //! from the subsystem id) also carry the modern capabilities; their legacy
 //! I/O BAR is ignored. The BARs the capabilities name are assigned if
 //! needed (`pci::BarAlloc`), mapped uncached, and memory decoding plus bus
-//! mastering are enabled.
+//! mastering are enabled. A device whose host bridge (function 0 of the
+//! first bus) has Apple's vendor id 0x106b is Virtualization.framework's:
+//! [`Transport::apple_vz`] says so (and the discovery line `apple host`),
+//! for the drivers' VZ workarounds (console.rs).
 //!
 //! Interrupts, in order of preference:
 //! * MSI-X (x86_64 always; aarch64 through the GICv3 ITS): one message
@@ -35,6 +38,8 @@ use crate::drivers::pci::{self, BarAlloc, Bdf, Function, Host};
 use crate::mm::PhysAddr;
 
 pub const VENDOR: u16 = 0x1af4;
+/// PCI vendor id of Apple's host bridge (Virtualization.framework: 0x106b:0x1a05).
+const APPLE_VENDOR: u16 = 0x106b;
 
 // virtio_pci_cap cfg_type.
 const CAP_COMMON: u8 = 1;
@@ -93,6 +98,8 @@ pub struct PciTransport {
     notify_off: Vec<AtomicU16>,
     /// MSI-X vector 0 is routed: program it into the device.
     msix: bool,
+    /// The host bridge is Apple's: the device is Virtualization.framework's.
+    apple: bool,
 }
 
 impl PciTransport {
@@ -150,7 +157,15 @@ impl Transport for PciTransport {
     }
 
     fn details(&self, out: &mut dyn Write) -> core::fmt::Result {
-        write!(out, "modern virtio-pci, vendor {:#x}", VENDOR)
+        write!(out, "modern virtio-pci, vendor {:#x}", VENDOR)?;
+        if self.apple {
+            write!(out, ", apple host")?;
+        }
+        Ok(())
+    }
+
+    fn apple_vz(&self) -> bool {
+        self.apple
     }
 
     fn irq_kind(&self) -> Option<&'static str> {
@@ -252,33 +267,6 @@ impl Transport for PciTransport {
 
     fn config_generation(&self) -> u32 {
         self.r8(CONFIG_GENERATION) as u32
-    }
-
-    fn diag(&self, out: &mut dyn Write) {
-        let _ = write!(
-            out,
-            " st {:#x} nq {} nm {}",
-            self.r8(DEVICE_STATUS),
-            self.r16(NUM_QUEUES),
-            self.notify_mult,
-        );
-        for q in 0..self.num_queues.min(2) {
-            self.w16(QUEUE_SELECT, q);
-            let _ = write!(
-                out,
-                " q{}[sz {} en {} no {} d {:#x} a {:#x} u {:#x}]",
-                q,
-                self.r16(QUEUE_SIZE),
-                self.r16(QUEUE_ENABLE),
-                self.r16(QUEUE_NOTIFY_OFF),
-                self.r32(QUEUE_DESC) as u64 | ((self.r32(QUEUE_DESC + 4) as u64) << 32),
-                self.r32(QUEUE_DRIVER) as u64 | ((self.r32(QUEUE_DRIVER + 4) as u64) << 32),
-                self.r32(QUEUE_DEVICE) as u64 | ((self.r32(QUEUE_DEVICE + 4) as u64) << 32),
-            );
-        }
-        // SAFETY: mapped ISR byte (diagnostic read; acks the interrupt).
-        let isr = unsafe { (self.isr as *const u8).read_volatile() };
-        let _ = write!(out, " isr {:#x}", isr);
     }
 
     fn config_read8(&self, off: usize) -> u8 {
@@ -493,6 +481,14 @@ pub fn probe(h: &Host, f: &mut Function, alloc: &mut BarAlloc, pref: IrqPref) ->
         num_queues: 0,
         notify_off: Vec::new(),
         msix,
+        apple: h.read16(
+            Bdf {
+                bus: h.desc.bus_start,
+                dev: 0,
+                func: 0,
+            },
+            pci::CFG_VENDOR,
+        ) == APPLE_VENDOR,
     };
     let nq = t.r16(NUM_QUEUES);
     let t = PciTransport {
