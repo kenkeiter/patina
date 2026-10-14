@@ -42,7 +42,13 @@ func archFrame(mode string) (uintptr, bool) {
 		put64(p+x64RSP, 0x8000_0000_0000_0000)
 		put64(p+x64RIP, uint64(getpidExit42Addr()))
 	case "sigreturn-tf":
-		put64(p+x64Eflags, 0x202|eflTF) // single-step: SIGTRAP
+		// Single-step: the next instruction raises SIGTRAP (Linux lets TF
+		// through, FIX_EFLAGS). Keep the live sigaltstack in uc_stack:
+		// with SS_DISABLE the SIGTRAP lands on the arena stack, where Go's
+		// handler (adjustSignalStack → needm) waits forever for an extra M
+		// that a non-cgo binary never has, on Linux just the same.
+		scr(SYS_SIGALTSTACK, 0, p+x64Stack)
+		put64(p+x64Eflags, 0x202|eflTF)
 	case "sigreturn-ac":
 		put64(p+x64Eflags, 0x202|eflAC)
 	case "sigreturn-iopl":
