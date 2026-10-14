@@ -48,6 +48,9 @@ dependencies = [
  "buddy_system_allocator",
  "fdt",
  "patina-abi",
+ "patina-cmdline",
+ "patina-cpio",
+ "patina-loader",
 ]
 
 [[package]]
