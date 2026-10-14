@@ -141,7 +141,8 @@ pub fn readlinkat(dirfd: i32, path: usize, buf: usize, size: usize) -> SysResult
         return Err(Errno(EINVAL));
     }
     let p = upath(path)?;
-    let t = namei::with_node(dirfd, &p, false, true, |n| match n {
+    // An empty path reads the dirfd itself (an O_PATH|O_NOFOLLOW symlink).
+    let t = namei::with_node(dirfd, &p, false, dirfd != AT_FDCWD, |n| match n {
         Node::Vfs(fs, ino) => fs.readlink_ino(ino),
         Node::Link { target, .. } => Ok(target.to_vec()),
         Node::File(_) => Err(Errno(EINVAL)),
@@ -162,6 +163,8 @@ fn statx_from_stat(st: &patina_abi::current::Stat) -> Statx {
     Statx {
         stx_mask: patina_abi::fs::STATX_BASIC_STATS,
         stx_blksize: st.st_blksize as u32,
+        // u32 on aarch64, u64 on x86_64.
+        #[allow(clippy::unnecessary_cast)]
         stx_nlink: st.st_nlink as u32,
         stx_uid: st.st_uid,
         stx_gid: st.st_gid,

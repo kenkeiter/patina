@@ -372,6 +372,9 @@ fn options(flags: u32, mode: u32) -> Result<OpenOptions, Errno> {
     })
 }
 
+/// An inode `open` resolved (holding a reference), its info and name.
+type Resolved = (Ino, Info, Vec<u8>);
+
 /// `openat(dirfd, path, flags, mode)`.
 pub fn open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<OpenFile>, Errno> {
     let mut opts = options(flags, mode)?;
@@ -389,7 +392,7 @@ pub fn open(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<OpenFi
     }
     let base = Base::new(dirfd, path)?;
     let follow = !opts.nofollow && !(opts.create && opts.excl);
-    let step = vfs::with(|fs| -> Result<Result<(Ino, Info, Vec<u8>), Magic>, Errno> {
+    let step = vfs::with(|fs| -> Result<Result<Resolved, Magic>, Errno> {
         let start = base.start(fs)?;
         if let Some(m) = classify(fs, start, path, follow) {
             return Ok(Err(m));

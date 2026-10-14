@@ -128,6 +128,38 @@ fn trace(n: usize, a: &[u64; 6], ret: Option<isize>) {
     }
 }
 
+/// Index of the path argument of a path syscall (for strace).
+fn path_arg(n: usize) -> Option<usize> {
+    match n {
+        nr::OPENAT | nr::MKDIRAT | nr::MKNODAT | nr::UNLINKAT | nr::READLINKAT
+        | nr::NEWFSTATAT | nr::STATX | nr::FACCESSAT | nr::FACCESSAT2 | nr::FCHMODAT
+        | nr::FCHOWNAT | nr::UTIMENSAT | nr::RENAMEAT | nr::RENAMEAT2 | nr::LINKAT => Some(1),
+        nr::SYMLINKAT => Some(2),
+        nr::CHDIR | nr::TRUNCATE | nr::STATFS => Some(0),
+        #[cfg(target_arch = "x86_64")]
+        nr::OPEN | nr::STAT | nr::LSTAT | nr::ACCESS | nr::READLINK | nr::MKDIR | nr::RMDIR
+        | nr::UNLINK | nr::RENAME | nr::CREAT | nr::CHMOD | nr::UTIMES => Some(0),
+        _ => None,
+    }
+}
+
+/// strace: show the path argument of a path syscall before the call.
+fn trace_path(n: usize, a: &[u64; 6]) {
+    if let Some(i) = path_arg(n) {
+        if a[i] == 0 {
+            return;
+        }
+        if let Ok(p) = with_space(|s| s.read_cstr(a[i] as usize, 4095)) {
+            crate::kprintln!(
+                "[strace] {} {} path {:?}",
+                TraceTid(task::current().tid),
+                current::syscall_name(n).unwrap_or("?"),
+                core::str::from_utf8(&p).unwrap_or("<non-utf8>")
+            );
+        }
+    }
+}
+
 /// Handle the syscall in `frame` (called from `trap::syscall`).
 pub fn dispatch(frame: &mut TrapFrame) {
     let n = frame.syscall_nr();
@@ -153,6 +185,9 @@ pub fn dispatch(frame: &mut TrapFrame) {
         return;
     }
 
+    if strace {
+        trace_path(n, &a);
+    }
     let r = call(n, &a, frame);
     let ret = match r {
         Ok(v) => v,
