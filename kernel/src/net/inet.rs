@@ -36,6 +36,7 @@ use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use patina_abi::current::Stat;
 use patina_abi::epoll::EpollFlags;
@@ -610,6 +611,9 @@ pub struct InetSocket {
     ino: u64,
 }
 
+/// Whether the port table got its post-boot seed ([`create`]).
+static PORTS_SEEDED: AtomicBool = AtomicBool::new(false);
+
 /// `socket(family, ty, protocol)` for AF_INET/AF_INET6 (`ty` without the
 /// flag bits).
 pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Errno> {
@@ -627,7 +631,18 @@ pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Er
         SOCK_SEQPACKET | SOCK_RDM => return Err(Errno(ESOCKTNOSUPPORT)),
         _ => return Err(Errno(EINVAL)),
     };
+    // The port table is made at boot, before the RNG has its real seed
+    // (virtio-rng comes later): pick the ephemeral starting points again
+    // at the first socket, so source ports differ between boots.
+    let seed = (!PORTS_SEEDED.swap(true, Ordering::Relaxed)).then(|| {
+        let mut b = [0u8; 8];
+        crate::random::fill(&mut b);
+        u64::from_ne_bytes(b)
+    });
     let id = stack::with(false, |s| {
+        if let Some(seed) = seed {
+            s.ports.reseed(seed);
+        }
         if s.socks.len() >= MAX_SOCKETS {
             return Err(Errno(ENFILE));
         }
