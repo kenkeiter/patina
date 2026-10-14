@@ -118,6 +118,8 @@ for arch in "${arches[@]}"; do
   # (a rejected sigreturn frame with a bad stack), i.e. a program death.
   nofatal='!re:^\[patina\] panic|!re:panicked at|!re:^\[patina\] fatal: user |!re:^\[patina\] unhandled'
   # name|cpus|mem|rc spec|expect...|--|args
+  limits_strict=
+  [[ -n ${SYSFUZZ_LIMITS_STRICT:-} ]] && limits_strict="|-limits-strict"
   skip=
   [[ -n ${SYSFUZZ_SKIP:-} ]] && skip="|-skip|$SYSFUZZ_SKIP"
   cases=("cases|1|512|0|re:PASS sysfuzz cases \([0-9]+\)|PASS sysfuzz|$nofatal|--|-mode|cases$skip")
@@ -125,6 +127,10 @@ for arch in "${arches[@]}"; do
     cases+=("fuzz-s$s-1cpu|1|512|0|PASS sysfuzz fuzz|PASS sysfuzz|$nofatal|--|-mode|fuzz|-seed|$s|-iters|$iters|-procs|2")
     cases+=("fuzz-s$s-4cpu|4|512|0|PASS sysfuzz fuzz|PASS sysfuzz|$nofatal|--|-mode|fuzz|-seed|$s|-iters|$iters|-procs|4")
   done
+  # Resource limits at 256 MiB: every refusal is a clean errno, the kernel
+  # survives, and memory comes back after release (strict once D87 closes).
+  cases+=("limits-1cpu|1|256|0|PASS sysfuzz limits|$nofatal|--|-mode|limits$limits_strict")
+  cases+=("limits-4cpu|4|256|0|PASS sysfuzz limits|$nofatal|--|-mode|limits$limits_strict")
   # Crash modes: accepted frames exit 42, rejected ones die by SIGSEGV.
   accept="42"; reject="2/sig"; either="2/42/sig"
   cases+=("sigreturn-ok|1|512|$accept|$nofatal|--|-mode|sigreturn-ok")
