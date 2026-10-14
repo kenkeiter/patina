@@ -263,6 +263,60 @@ impl EventCounter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// POSIX record locks.
+
+/// Why a `struct flock` range is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockRangeError {
+    /// `EINVAL`: bad `l_whence`, or the range starts before offset 0.
+    Invalid,
+    /// `EOVERFLOW`: the range does not fit in a file offset.
+    Overflow,
+}
+
+/// The byte range `[start, end]` (inclusive; `end` = `i64::MAX` for "to
+/// EOF and beyond") of a `struct flock` (`fs/locks.c:
+/// flock_to_posix_lock`). `whence` is `SEEK_SET`/`SEEK_CUR`/`SEEK_END`
+/// (0/1/2), relative to `pos` (the file position) or `size`.
+pub fn lock_range(
+    whence: i16,
+    start: i64,
+    len: i64,
+    pos: i64,
+    size: i64,
+) -> Result<(i64, i64), LockRangeError> {
+    let base = match whence {
+        0 => 0,
+        1 => pos,
+        2 => size,
+        _ => return Err(LockRangeError::Invalid),
+    };
+    if start > i64::MAX - base {
+        return Err(LockRangeError::Overflow);
+    }
+    let mut s = base + start;
+    if s < 0 {
+        return Err(LockRangeError::Invalid);
+    }
+    let e;
+    if len > 0 {
+        if len - 1 > i64::MAX - s {
+            return Err(LockRangeError::Overflow);
+        }
+        e = s + (len - 1);
+    } else if len < 0 {
+        e = s - 1;
+        s += len;
+        if s < 0 {
+            return Err(LockRangeError::Invalid);
+        }
+    } else {
+        e = i64::MAX;
+    }
+    Ok((s, e))
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -358,5 +412,25 @@ mod tests {
         assert_eq!(s.read(), Ok(1));
         assert_eq!(s.read(), Ok(1));
         assert_eq!(s.read(), Err(EventError::WouldBlock));
+    }
+
+    #[test]
+    fn lock_ranges() {
+        use LockRangeError::*;
+        // Go's TestFcntlFlock: SEEK_CUR at position 0.
+        assert_eq!(
+            lock_range(1, 31415, 271828, 0, 1 << 20),
+            Ok((31415, 31415 + 271828 - 1))
+        );
+        assert_eq!(lock_range(0, 10, 0, 0, 0), Ok((10, i64::MAX)));
+        assert_eq!(lock_range(2, -10, 5, 0, 100), Ok((90, 94)));
+        // Negative length: the bytes before start.
+        assert_eq!(lock_range(0, 10, -4, 0, 0), Ok((6, 9)));
+        assert_eq!(lock_range(0, 2, -4, 0, 0), Err(Invalid));
+        assert_eq!(lock_range(0, -1, 1, 0, 0), Err(Invalid));
+        assert_eq!(lock_range(3, 0, 0, 0, 0), Err(Invalid));
+        assert_eq!(lock_range(1, i64::MAX, 1, 1, 0), Err(Overflow));
+        assert_eq!(lock_range(0, i64::MAX, 2, 0, 0), Err(Overflow));
+        assert_eq!(lock_range(0, i64::MAX, 1, 0, 0), Ok((i64::MAX, i64::MAX)));
     }
 }
