@@ -15,6 +15,7 @@ console=<dev> [ip=...] [patina.strace=1] patina.epoch=<unix-seconds> [patina.env
 - Exception: QEMU microvm with `acpi=off` appends ` virtio_mmio.device=512@0xfeb00e00:12 virtio_mmio.device=512@0xfeb00c00:11` (one per device, from the top of the window down; seen with the CLI's console + rng devices) *after* `--`. The CLI always escapes `=` in args, so a raw `virtio_mmio.device=` token after `--` is a kernel parameter, not an arg.
 - `console=`: `ttyAMA0` (PL011, QEMU aarch64), `ttyS0` (16550 at 0x3f8 on x86; Firecracker/CH), `hvc0` (virtio-console, Apple VZ).
 - Networking: `--net user` → `ip=10.0.2.15::10.0.2.2:255.255.255.0:patina:eth0:off:10.0.2.3` plus a virtio-net-device. A tap device → `ip=dhcp`.
+- `ip=dhcp` (also `on`/`any`/`bootp`/`both`, or an `ip=` without a client address): the kernel runs DHCPv4 before the program starts and waits at most 10 s. On a lease it logs `[patina] net: dhcp lease <addr>/<prefix> via <gw>, dns <servers> (<n> ms)`. On timeout it logs `[patina] net: dhcp: no lease after 10 s, continuing without an address` and sends a control-channel event `{"ev":"log","level":"warn","msg":"net: dhcp: no lease after 10 s, continuing without an address"}`, possibly before `ready`. Without a NIC the message is `ip=dhcp: no network device, continuing without an address`. The program then runs without an IPv4 address. `/etc/resolv.conf` and `/etc/hosts` are generated from the lease, or from the static `ip=` fields, unless the initrd ships them (D72).
 
 ## QEMU devices
 

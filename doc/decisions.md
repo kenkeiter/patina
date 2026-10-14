@@ -1818,3 +1818,103 @@ capabilities and the MSI-X table, the KVM ITS with 64 KiB table pages, the
 MSHV v2m DTB override, and `msi-map` offsets for segment > 0. Not done:
 x86 INTx (`_PRT`), bridge renumbering, the swizzle for INTx behind bridges,
 per-queue MSI-X vectors, and LPIs targeted at CPUs other than the boot CPU.
+
+## D72: DHCP at boot, the effective network config, generated resolv.conf/hosts, test-net.sh
+*2026-10-14 · Phase 4*
+
+This replaces the `start_dhcp` stub described in D67.
+
+**When DHCP runs.** `ip=dhcp` (also `on`/`any`/`bootp`/`both`, or an `ip=`
+without a client address) adds a smoltcp `dhcpv4::Socket` to the socket set
+in `net::init`. `kernel_main` calls `net::wait_dhcp()` after `ctl::init` and
+before the self-test and the loader. It runs the interface itself, polling
+under the stack lock at least every 1 ms and spinning between polls. It
+stops when a lease is applied or after 10 s. No IRQs are needed, because the
+NIC's `recv` polls its used ring. The net task may also poll during the
+wait, which is harmless (see below).
+
+**Client settings.** smoltcp waits 10 s before retransmitting a DISCOVER and
+5 s before retransmitting a REQUEST. Both are lowered to 1 s, so one lost
+packet does not use up the boot budget. The client also requests options 12
+(host name) and 15 (domain), parsed from a 1500-byte receive buffer; smoltcp
+only parses mask, router and DNS itself.
+
+**Applying events.** `Stack::poll_all` handles the socket's events after
+every poll, so the boot wait, the net task and socket syscalls all apply
+them the same way:
+- `Configured`: replace the non-loopback IPv4 address and the default route
+  (`Stack::set_v4`, which also updates the mux's own-address list and
+  `gw4`), and record the lease. Because a receive buffer is set, smoltcp
+  emits `Configured` on every renewal ACK. An event with nothing new is
+  ignored; a changed lease is logged as `dhcp lease changed: …`.
+- `Deconfigured`: this is also the client's first event, before any lease,
+  so it is a no-op unless a lease is held. Otherwise it removes the address
+  and route and logs `dhcp lease lost`. Nothing panics.
+
+**Log lines.**
+- Lease: `[patina] net: dhcp lease 10.0.2.15/24 via 10.0.2.2, dns 10.0.2.3
+  (2 ms)`. QEMU slirp takes 2 ms on aarch64 hvf and 5 ms on x86 TCG.
+- Timeout: `[patina] net: dhcp: no lease after 10 s, continuing without an
+  address`.
+- No NIC: `ip=dhcp: no network device, …`.
+
+The timeout and no-NIC lines also go out through `ctl::log_warn`, which is
+why the wait runs after `ctl::init`. These events can arrive before `ready`;
+the CLI accepts `log` events in any order.
+
+**Effective config.** `net::effective_config() -> NetConfig { addr, gateway,
+dns, hostname, domain, leased }` starts from the static `ip=` fields and is
+replaced by the lease. DNS servers come from the lease, else from `ip=`. The
+default (none) is left to the consumer.
+
+**Generated /etc files.** `rootfs::etc()` runs inside the loader, after the
+wait, and builds `/etc/resolv.conf` and `/etc/hosts` from the effective
+config:
+- `resolv.conf`: `search <domain>` when the server sent a domain, then the
+  nameservers, falling back to `nameserver 10.0.2.3` (slirp).
+- `hosts`: `<addr> <hostname>` (with `<hostname>.<domain>` first when there
+  is a domain). Without an address the host name goes on the `127.0.0.1`
+  line, so `LookupHost(hostname)` works on loopback-only VMs. 127.0.0.1 is
+  used rather than Debian's 127.0.1.1 because it is the only 127/8 address
+  the stack has (D68).
+- `rootfs::hostname()` (uname, `/etc/hostname`) uses the `ip=` host field,
+  else the DHCP host name, else `patina`.
+- The initrd still wins (D54).
+
+Lease changes after boot are not written back to these files: rewriting the
+VFS from the net task would need a different lock order, and slirp and
+static setups never change the lease.
+
+**httphello additions.**
+- `/big`: 4 MiB where byte i is `(i*31 + i>>12) & 0xff`. sha256 is
+  `9d2b62e8…a5cb`, which the test computes independently.
+- `/echo`: returns the request body.
+- `-nohandler`: no `signal.Notify`, so SIGTERM is SIG_DFL and the exit code
+  is 143.
+- `-selftest` now also does loopback GET `/big`, POST `/echo`, and Go
+  resolver lookups of `localhost` (must include 127.0.0.1) and of
+  `os.Hostname()`.
+- `-dns <name>` adds a lookup through resolv.conf's server.
+
+**`scripts/test-net.sh [aarch64] [x86_64]`** is Milestone A on QEMU (§13).
+It builds the CLI and kernels, `patina build`s httphello, and runs these
+cases, each with a hard timeout:
+- **serve**: `patina run --net user --publish P:8080`. GET /, 20 concurrent
+  GETs, the /big sha256, then `patina ctl stop` gives exit 0 and the
+  graceful-shutdown line.
+- **nohandler**: the same with `-nohandler`; the result is 143/SIGTERM.
+- **selftest**: through the CLI, with `-dns` when `PATINA_NET_EXTERNAL=1`.
+- **dhcp**: `run-qemu.sh` with `PATINA_NET=user ip=dhcp`.
+- **dhcp-nonic**: `ip=dhcp` with no NIC.
+- **dhcp-nolease**: the NIC is a `-netdev socket` sending to the UDP
+  discard port. The test checks the 10 s line and the ctl `log` event, and
+  that the program still runs.
+- **pci**: x86 `q35`, or aarch64 `PATINA_VIRTIO=pci`, with the static `ip=`.
+  It curls, then stops through `ctlclient.py`.
+
+Host ports are `PATINA_NET_PORT` (default derived from the PID), plus 0-9
+for aarch64 and 10-19 for x86_64, each probed free. Run dirs and ctl sockets
+live in a private `/tmp/ptnet.*` directory. The exit trap kills only QEMUs
+whose command line names that directory, so concurrent QEMUs from other
+runs are left alone. The CLI was not changed: `--net user` still sends the
+static `ip=`, so DHCP is tested through `run-qemu.sh`.
