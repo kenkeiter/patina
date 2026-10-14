@@ -1649,7 +1649,9 @@ probe (bind `[::1]:0` with V6ONLY=1 and `[::ffff:127.0.0.1]:0` with
 V6ONLY=0) succeeds, matching what the stack does. Other kernel changes:
 `splice`/`tee` return `EINVAL` instead of `ENOSYS` — Go's `io.Copy` between
 TCP connections tries splice and falls back to read/write only on `EINVAL`
-(ENOSYS failed the copy and closed the echo connection). Not done: UDP
+(ENOSYS failed the copy and closed the echo connection). Of 127/8 only
+127.0.0.1 is an address (smoltcp accepts packets for exact addresses only):
+binding 127.0.0.2 is `EADDRNOTAVAIL`, connecting to it `ENETUNREACH`. Not done: UDP
 datagrams larger than the MTU (`EMSGSIZE`; no IP fragmentation), ICMP errors
 to UDP sockets, `SO_RCVTIMEO` on plain `read`/`write` (only the `recv*`/
 `send*`/`accept`/`connect` syscalls look at it; Go uses deadlines instead),

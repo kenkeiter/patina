@@ -161,12 +161,12 @@ impl Stack {
         self.next_id
     }
 
-    /// Is `ip` one of our addresses (127/8 counts)?
+    /// Is `ip` one of the interface's addresses? Only 127.0.0.1 of 127/8:
+    /// smoltcp accepts packets for its exact addresses, so binding or
+    /// connecting to 127.0.0.2 fails at once (`EADDRNOTAVAIL` /
+    /// `ENETUNREACH`) instead of hanging.
     pub fn is_local(&self, ip: core::net::IpAddr) -> bool {
-        match ip {
-            core::net::IpAddr::V4(a) => a.is_loopback() || self.iface.has_ip_addr(a),
-            core::net::IpAddr::V6(a) => a.is_loopback() || self.iface.has_ip_addr(a),
-        }
+        self.iface.has_ip_addr(ip)
     }
 
     /// Can we send to `ip` at all (a local address, a directly connected
