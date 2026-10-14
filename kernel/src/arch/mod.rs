@@ -189,6 +189,46 @@
 //! job); the deadline interrupt simply calls the same hook. IPIs are
 //! `trap::IpiKind::{Reschedule, Stop}` → `trap::ipi`.
 //!
+//! Phase 2 signal frames (`task/signal.rs` is the arch-neutral driver; the
+//! layouts are `patina_abi::<arch>::{RtSigframe, UContext, SigContext,
+//! sigframe_placement}`, verified against Linux headers):
+//!
+//! ```text
+//! pub mod sigframe {
+//!     /// Build the Linux `rt_sigframe` for `d` on the user stack (the
+//!     /// sigaltstack when `SA_ONSTACK` and not already on it; x86 skips
+//!     /// the 128-byte red zone) with ONE `copy_to_user` through the
+//!     /// process address space, then edit `frame` to enter the handler:
+//!     /// pc = sa_handler, sp = frame, args = (signo, &info, &uc), return
+//!     /// address = sa_restorer (x86 `pretcode`; arm64 x30, or a kernel-
+//!     /// mapped `rt_sigreturn` trampoline page when SA_RESTORER is absent,
+//!     /// standing in for the vDSO). The interrupted state goes into
+//!     /// `uc_mcontext` (+ FP state: x86 the live XSAVE/FXSAVE image with
+//!     /// fpx_sw_bytes/magic2, then the FPU is reset to init for the
+//!     /// handler; arm64 fpsimd_context from the TrapFrame and
+//!     /// esr_context for faults), `uc_sigmask` = d.mask, `uc_stack` =
+//!     /// d.altstack. Called from `trap::before_return_to_user` (IRQs
+//!     /// masked, current thread's FP registers live). Err → the caller
+//!     /// forces SIGSEGV. Does not touch the mask or the altstack.
+//!     pub fn setup_frame(frame: &mut TrapFrame, d: &SigDelivery) -> Result<(), SetupError>;
+//!     /// `rt_sigreturn`: read the frame at the user sp (x86: sp - 8 is
+//!     /// the frame, sp the ucontext; arm64: sp, 16-aligned), restore
+//!     /// every user register into `frame` (sanitized: x86 only the
+//!     /// FIX_EFLAGS bits, user CS/SS, orig_rax = -1, canonical rip; arm64
+//!     /// PSTATE must be EL0t with DAIF clear) and the FP state; return
+//!     /// (uc_sigmask, uc_stack). Err = bad frame (caller forces SIGSEGV).
+//!     pub fn restore_frame(frame: &mut TrapFrame) -> Result<(SigSet, StackT), ()>;
+//!     /// Re-execute the syscall in `frame` (x86: rip -= 2, rax =
+//!     /// orig_rax; arm64: pc -= 4, x0 = orig_x0); `nr` replaces the
+//!     /// number (restart_syscall).
+//!     pub fn rewind_syscall(frame: &mut TrapFrame, nr: Option<usize>);
+//!     /// Hardware details for a fault / other exception in `frame`
+//!     /// (arm64 FAR+ESR; x86 CR2, error code, vector).
+//!     pub fn fault_info(frame: &TrapFrame, addr: u64) -> FaultInfo;
+//!     pub fn exception_info(frame: &TrapFrame) -> FaultInfo;
+//! }
+//! ```
+//!
 //! Entry paths the arch must provide (all end by restoring `frame`):
 //! * syscall (`SVC #0` / `SYSCALL`+`SYSRET` with `swapgs` and the per-CPU
 //!   kernel stack) → `trap::syscall(&mut frame)`;

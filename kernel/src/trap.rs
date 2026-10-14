@@ -70,7 +70,7 @@ pub enum FaultKind {
 }
 
 /// A synchronous exception from user mode that is not a syscall or a page
-/// fault. Phase 2 maps these to signals.
+/// fault. `user_exception` maps these to signals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exception {
     /// `#UD` / undefined instruction → `SIGILL`.

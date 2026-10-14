@@ -7,7 +7,9 @@
 //   - SIGFPE: integer division by zero recovered (x86 #DE; arm64 Go checks
 //     explicitly and panics without a signal);
 //   - signal.Notify(SIGUSR1) with kill(getpid()) from several goroutines and
-//     tgkill to a locked thread, counting every receipt.
+//     tgkill to a locked thread, counting every receipt;
+//   - syscall interruption: nanosleep → EINTR + rem, a blocking pipe read
+//     restarted under SA_RESTART, timer sleeps under a signal storm.
 //
 // Modes:
 //
@@ -16,8 +18,8 @@
 //	                           "[signal SIGSEGV ... code=0x1 addr=0x0 ...]" line, exit 2)
 //	sigstress -breakpoint   -> runtime.Breakpoint() (SIGTRAP, Go's "SIGTRAP: trace trap" crash)
 //
-// No timers (time.Sleep/After/Ticker) are used: waits are busy loops on
-// time.Now() with runtime.Gosched(), so Go's netpoller is never needed.
+// Waits are busy loops on time.Now() with runtime.Gosched() (only the
+// timer-sleep check uses time.Sleep).
 package main
 
 import (
@@ -201,6 +203,113 @@ func notify() {
 	signal.Stop(ch)
 }
 
+// interrupts checks syscall interruption semantics with SIGUSR1 handled
+// by Go (SA_RESTART): nanosleep returns EINTR with the remaining time
+// regardless of SA_RESTART, a blocking pipe read is transparently
+// restarted, and timer sleeps (epoll_pwait under the netpoller) survive a
+// signal storm.
+func interrupts() {
+	ch := make(chan os.Signal, 64)
+	signal.Notify(ch, syscall.SIGUSR1)
+	defer signal.Stop(ch)
+	go func() {
+		for range ch {
+		}
+	}()
+	pid := os.Getpid()
+
+	// Run f on a locked thread; tgkill that thread every 50ms until f returns.
+	onThread := func(f func() error) error {
+		tidc := make(chan int)
+		res := make(chan error, 1)
+		go func() {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			tidc <- syscall.Gettid()
+			res <- f()
+		}()
+		tid := <-tidc
+		for {
+			select {
+			case err := <-res:
+				return err
+			default:
+			}
+			waitFor(50*time.Millisecond, func() bool { return false })
+			syscall.Tgkill(pid, tid, syscall.SIGUSR1)
+		}
+	}
+
+	// nanosleep: EINTR + rem.
+	err := onThread(func() error {
+		req := syscall.Timespec{Sec: 5}
+		var rem syscall.Timespec
+		start := time.Now()
+		err := syscall.Nanosleep(&req, &rem)
+		el := time.Since(start)
+		if err != syscall.EINTR {
+			return fmt.Errorf("nanosleep: got %v after %v, want EINTR", err, el)
+		}
+		left := time.Duration(rem.Nano())
+		if left <= 0 || left > 5*time.Second || el+left < 4900*time.Millisecond {
+			return fmt.Errorf("nanosleep: rem %v after %v", left, el)
+		}
+		fmt.Printf("sigstress: nanosleep interrupted after %v, rem %v\n", el.Round(time.Millisecond), left.Round(time.Millisecond))
+		return nil
+	})
+	if err != nil {
+		fail("%v", err)
+	}
+
+	// Blocking pipe read: restarted (SA_RESTART), returns the data.
+	var p [2]int
+	if err := syscall.Pipe(p[:]); err != nil {
+		fail("pipe: %v", err)
+	}
+	go func() {
+		waitFor(400*time.Millisecond, func() bool { return false })
+		syscall.Write(p[1], []byte("ok"))
+	}()
+	err = onThread(func() error {
+		buf := make([]byte, 8)
+		n, err := syscall.Read(p[0], buf)
+		if err != nil || string(buf[:n]) != "ok" {
+			return fmt.Errorf("pipe read: %q, %v (want restart, not EINTR)", buf[:n], err)
+		}
+		return nil
+	})
+	if err != nil {
+		fail("%v", err)
+	}
+	syscall.Close(p[0])
+	syscall.Close(p[1])
+	fmt.Println("sigstress: blocking pipe read restarted across signals")
+
+	// Timer sleeps under a SIGUSR1 storm.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				syscall.Kill(pid, syscall.SIGUSR1)
+				runtime.Gosched()
+			}
+		}
+	}()
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	el := time.Since(start)
+	close(stop)
+	if el < 200*time.Millisecond {
+		fail("20 x Sleep(10ms) took %v", el)
+	}
+	fmt.Printf("sigstress: 20 x time.Sleep(10ms) under SIGUSR1 storm: %v\n", el.Round(time.Millisecond))
+}
+
 func main() {
 	crash := flag.Bool("crash", false, "unrecovered nil dereference")
 	brk := flag.Bool("breakpoint", false, "runtime.Breakpoint()")
@@ -227,6 +336,7 @@ func main() {
 	preempt(*dur)
 	faults()
 	notify()
+	interrupts()
 	// Faults and preemption again with signal traffic behind us.
 	preempt(*dur / 2)
 	fmt.Println("PASS sigstress")
