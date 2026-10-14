@@ -269,9 +269,13 @@ func cmdPs(args []string, stdout, stderr io.Writer) (int, error) {
 		return 0, err
 	}
 	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tVMM\tARCH\tPID\tSTARTED\tIMAGE")
+	fmt.Fprintln(tw, "NAME\tVMM\tARCH\tPID\tADDR\tSTARTED\tIMAGE")
 	for _, s := range sts {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n", s.Name, s.VMM, s.Arch, s.PID, s.Started.Local().Format(time.Stamp), s.Image)
+		addr := "-"
+		if s.Net != nil {
+			addr = s.Net.Addr
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n", s.Name, s.VMM, s.Arch, s.PID, addr, s.Started.Local().Format(time.Stamp), s.Image)
 	}
 	return 0, tw.Flush()
 }

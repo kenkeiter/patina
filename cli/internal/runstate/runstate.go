@@ -37,6 +37,18 @@ type State struct {
 	Control  ctl.Endpoint `json:"control"`  // proxy socket (always KindStream)
 	Upstream ctl.Endpoint `json:"upstream"` // the VMM's own control endpoint
 	Started  time.Time    `json:"started"`
+	// Net is the guest's DHCP lease, once `patina run` has seen it (the
+	// kernel's lease log event or console line); absent before that and
+	// for guests without ip=dhcp.
+	Net *Net `json:"net,omitempty"`
+}
+
+// Net is the guest's IPv4 configuration as leased by DHCP.
+type Net struct {
+	Addr    string   `json:"addr"`              // e.g. "192.168.64.3"
+	Prefix  int      `json:"prefix"`            // e.g. 24
+	Gateway string   `json:"gateway,omitempty"` // e.g. "192.168.64.1"
+	DNS     []string `json:"dns,omitempty"`
 }
 
 var nameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)

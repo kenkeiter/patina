@@ -1,7 +1,9 @@
 package run
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -310,6 +312,86 @@ func TestFirecrackerCtlViaProxy(t *testing.T) {
 	r := <-res
 	if r.err != nil || r.code != 143 {
 		t.Fatalf("run: code %d err %v\nstderr:\n%s", r.code, r.err, r.errs)
+	}
+}
+
+// The DHCP lease (console line + log event) is reported once on stderr and
+// recorded in state.json while the VM runs.
+func TestFirecrackerLeaseReported(t *testing.T) {
+	setupFakeVMM(t, "lease")
+	type result struct {
+		code int
+		errs string
+		err  error
+	}
+	res := make(chan result, 1)
+	go func() {
+		code, _, errs, err := runVsockVMM(t, target.Firecracker, target.X86_64, Options{Name: "fclease"})
+		res <- result{code, errs, err}
+	}()
+	var st *runstate.State
+	waitFor(t, func() bool {
+		s, err := runstate.Load("fclease")
+		st = s
+		return err == nil && s.Net != nil
+	})
+	want := runstate.Net{Addr: "192.168.64.3", Prefix: 24, Gateway: "192.168.64.1", DNS: []string{"192.168.64.1"}}
+	if st.Net.Addr != want.Addr || st.Net.Prefix != want.Prefix || st.Net.Gateway != want.Gateway || strings.Join(st.Net.DNS, ",") != "192.168.64.1" {
+		t.Fatalf("state net %+v, want %+v", st.Net, want)
+	}
+	c, err := ctl.Dial(st.Control, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if code, err := ctl.DoStop(c, 3*time.Second, 10*time.Second, nil); err != nil || code != 143 {
+		t.Fatalf("ctl stop: code %d err %v", code, err)
+	}
+	r := <-res
+	if r.err != nil || r.code != 143 {
+		t.Fatalf("run: code %d err %v\nstderr:\n%s", r.code, r.err, r.errs)
+	}
+	if n := strings.Count(r.errs, "patina: guest address 192.168.64.3 (gateway 192.168.64.1)\n"); n != 1 {
+		t.Fatalf("guest address reported %d times:\n%s", n, r.errs)
+	}
+}
+
+func TestParseLease(t *testing.T) {
+	for _, c := range []struct {
+		msg  string
+		want string // addr/prefix gw dns, or "" for no match
+	}{
+		{"net: dhcp lease 192.168.64.3/24 via 192.168.64.1, dns 192.168.64.1 (402 ms)", "192.168.64.3/24 192.168.64.1 [192.168.64.1]"},
+		{"net: dhcp lease 10.0.2.15/24 via 10.0.2.2, dns 10.0.2.3 8.8.8.8, host h, domain d.example (2 ms)", "10.0.2.15/24 10.0.2.2 [10.0.2.3 8.8.8.8]"},
+		{"net: dhcp lease changed: 192.168.64.9/24 via none, dns none (5 ms)\r\n", "192.168.64.9/24  []"},
+		{"net: dhcp lease lost, no IPv4 address", ""},
+		{"net: dhcp: no lease after 10 s, continuing without an address", ""},
+		{"[patina] net: dhcp lease 1.2.3.4/8 via 1.1.1.1, dns 1.1.1.1 (1 ms)", ""}, // prefix stripped by the caller
+	} {
+		n := parseLease(c.msg)
+		got := ""
+		if n != nil {
+			got = fmt.Sprintf("%s/%d %s %v", n.Addr, n.Prefix, n.Gateway, n.DNS)
+		}
+		if got != c.want {
+			t.Errorf("parseLease(%q) = %q, want %q", c.msg, got, c.want)
+		}
+	}
+}
+
+func TestSentinelWriterLease(t *testing.T) {
+	var out bytes.Buffer
+	var got []string
+	s := &sentinelWriter{w: &out}
+	s.onLease = func(n *runstate.Net) {
+		s.mu.Lock() // must be called outside the writer's lock
+		s.mu.Unlock()
+		got = append(got, n.Addr)
+	}
+	s.Write([]byte("[patina] net: dhcp lease 192.168.64.3/24 via 192.168.64.1, dns 192."))
+	s.Write([]byte("168.64.1 (300 ms)\r\nprogram: net: dhcp lease 9.9.9.9/8 via 9.9.9.1, dns none (1 ms)\n"))
+	if strings.Join(got, ",") != "192.168.64.3" {
+		t.Fatalf("leases %v", got)
 	}
 }
 
