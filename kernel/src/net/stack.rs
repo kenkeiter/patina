@@ -166,7 +166,9 @@ impl Stack {
                     _ => self.refill_listeners(),
                 }
             }
-            while self.iface.poll_egress(now, &mut self.mux, &mut self.sockets)
+            while self
+                .iface
+                .poll_egress(now, &mut self.mux, &mut self.sockets)
                 != PollResult::None
             {}
             if !self.mux.lo_pending() {
@@ -468,8 +470,7 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
             name,
             mac_str(&mac),
             addrs,
-            s.gw4
-                .map_or(String::from("none"), |g| format!("{}", g)),
+            s.gw4.map_or(String::from("none"), |g| format!("{}", g)),
             if dhcp { ", dhcp requested" } else { "" }
         ),
         None => crate::kprintln!(

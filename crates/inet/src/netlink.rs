@@ -145,10 +145,18 @@ pub fn link_msg(l: &Link, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
     m.attr(IFLA_IFNAME, &name);
     m.attr(IFLA_MTU, &l.mtu.to_ne_bytes());
     m.attr(IFLA_TXQLEN, &1000u32.to_ne_bytes());
-    let oper = if l.flags & IFF_LOOPBACK != 0 { IF_OPER_UNKNOWN } else { IF_OPER_UP };
+    let oper = if l.flags & IFF_LOOPBACK != 0 {
+        IF_OPER_UNKNOWN
+    } else {
+        IF_OPER_UP
+    };
     m.attr(IFLA_OPERSTATE, &[oper]);
     m.attr(IFLA_ADDRESS, &l.mac);
-    let bcast = if l.flags & IFF_BROADCAST != 0 { [0xff; 6] } else { [0; 6] };
+    let bcast = if l.flags & IFF_BROADCAST != 0 {
+        [0xff; 6]
+    } else {
+        [0; 6]
+    };
     m.attr(IFLA_BROADCAST, &bcast);
     m.finish()
 }
@@ -283,9 +291,7 @@ pub fn respond(buf: &[u8], pid: u32, links: &[Link], addrs: &[IfAddr]) -> Vec<Ve
                 });
                 match found {
                     Some(l) => msgs.push(link_msg(l, 0, req.seq, pid)),
-                    None if index == 0 && name.is_none() => {
-                        msgs.push(error_msg(&req, EINVAL, pid))
-                    }
+                    None if index == 0 && name.is_none() => msgs.push(error_msg(&req, EINVAL, pid)),
                     None => msgs.push(error_msg(&req, ENODEV, pid)),
                 }
                 if req.flags & NLM_F_ACK != 0 && found.is_some() {
@@ -345,9 +351,21 @@ mod tests {
 
     fn addrs() -> Vec<IfAddr> {
         alloc::vec![
-            IfAddr { index: 1, addr: IpAddr::V4(Ipv4Addr::LOCALHOST), prefix: 8 },
-            IfAddr { index: 1, addr: IpAddr::V6(Ipv6Addr::LOCALHOST), prefix: 128 },
-            IfAddr { index: 2, addr: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)), prefix: 24 },
+            IfAddr {
+                index: 1,
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                prefix: 8
+            },
+            IfAddr {
+                index: 1,
+                addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                prefix: 128
+            },
+            IfAddr {
+                index: 2,
+                addr: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)),
+                prefix: 24
+            },
         ]
     }
 
@@ -398,7 +416,10 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].ty, RTM_NEWADDR);
         // 127.0.0.1/8 on lo, host scope.
-        assert_eq!(msgs[0].payload[..4], [AF_INET as u8, 8, IFA_F_PERMANENT, RT_SCOPE_HOST]);
+        assert_eq!(
+            msgs[0].payload[..4],
+            [AF_INET as u8, 8, IFA_F_PERMANENT, RT_SCOPE_HOST]
+        );
         assert_eq!(u32_at(msgs[0].payload, 4), 1);
         let a = attrs(&msgs[0], size_of::<IfAddrmsg>());
         assert!(a.contains(&(IFA_LOCAL, alloc::vec![127, 0, 0, 1])));
@@ -441,7 +462,10 @@ mod tests {
         let msgs = respond(&req, 4, &links(), &addrs());
         let m = parse(&msgs[0]);
         assert_eq!(m[0].ty, NLMSG_ERROR);
-        assert_eq!(i32::from_ne_bytes(m[0].payload[..4].try_into().unwrap()), -EOPNOTSUPP);
+        assert_eq!(
+            i32::from_ne_bytes(m[0].payload[..4].try_into().unwrap()),
+            -EOPNOTSUPP
+        );
         assert_eq!(m[0].payload[4..20], req[..16]);
 
         // RTM_GETLINK for index 2 (ifinfomsg), no dump.
@@ -451,7 +475,10 @@ mod tests {
         b.extend_from_slice(&NLM_F_REQUEST.to_ne_bytes());
         b.extend_from_slice(&8u32.to_ne_bytes());
         b.extend_from_slice(&0u32.to_ne_bytes());
-        let ifi = IfInfomsg { ifi_index: 2, ..Default::default() };
+        let ifi = IfInfomsg {
+            ifi_index: 2,
+            ..Default::default()
+        };
         b.extend_from_slice(zerocopy::IntoBytes::as_bytes(&ifi));
         let m = respond(&b, 4, &links(), &addrs());
         let m = parse(&m[0]);

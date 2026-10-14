@@ -55,7 +55,10 @@ pub enum SockAddr {
     /// `AF_UNSPEC` (`connect` to dissolve a UDP association).
     Unspec,
     /// `AF_NETLINK`: port id and multicast group mask (`sockaddr_nl`).
-    Netlink { pid: u32, groups: u32 },
+    Netlink {
+        pid: u32,
+        groups: u32,
+    },
 }
 
 /// Why a user `sockaddr` could not be decoded.
@@ -509,7 +512,10 @@ mod tests {
         let b = SockAddr::inet6(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443);
         let n = b.encode(&mut buf);
         assert_eq!(n, 28);
-        assert_eq!(&buf[8..24], &Ipv4Addr::new(10, 0, 0, 2).to_ipv6_mapped().octets());
+        assert_eq!(
+            &buf[8..24],
+            &Ipv4Addr::new(10, 0, 0, 2).to_ipv6_mapped().octets()
+        );
         assert_eq!(SockAddr::parse(&buf[..n]).unwrap(), b);
         // RFC 2133 length (no scope id).
         assert!(SockAddr::parse(&buf[..24]).is_ok());
@@ -518,7 +524,10 @@ mod tests {
             Some((IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443))
         );
 
-        let nl = SockAddr::Netlink { pid: 1, groups: 0x10 };
+        let nl = SockAddr::Netlink {
+            pid: 1,
+            groups: 0x10,
+        };
         let n = nl.encode(&mut buf);
         assert_eq!(n, 12);
         assert_eq!(&buf[..2], &AF_NETLINK.to_ne_bytes());
@@ -531,7 +540,10 @@ mod tests {
         let mut u = [0u8; 12];
         u[..2].copy_from_slice(&AF_UNIX.to_ne_bytes());
         u[2..6].copy_from_slice(b"/sok");
-        assert_eq!(SockAddr::parse(&u).unwrap(), SockAddr::Unix(b"/sok".to_vec()));
+        assert_eq!(
+            SockAddr::parse(&u).unwrap(),
+            SockAddr::Unix(b"/sok".to_vec())
+        );
         assert_eq!(SockAddr::Unix(b"/sok".to_vec()).encode(&mut buf), 7);
     }
 
@@ -575,12 +587,15 @@ mod tests {
         // A v6-only wildcard leaves IPv4 free.
         assert_eq!(t.bind(4, Proto::Tcp, 80, any4, r), Ok(80));
         // Distinct specific addresses do not overlap.
+        assert_eq!(t.bind(5, Proto::Tcp, 81, lo4, r), Ok(81));
         assert_eq!(
-            t.bind(5, Proto::Tcp, 81, lo4, r),
-            Ok(81)
-        );
-        assert_eq!(
-            t.bind(6, Proto::Tcp, 81, Cover::of(AF_INET, v4([10, 0, 0, 2]), false), r),
+            t.bind(
+                6,
+                Proto::Tcp,
+                81,
+                Cover::of(AF_INET, v4([10, 0, 0, 2]), false),
+                r
+            ),
             Ok(81)
         );
     }

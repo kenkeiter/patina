@@ -158,10 +158,14 @@ fn snapshot() -> (Vec<Link<'static>>, Vec<IfAddr>) {
 /// Linux. Go's `Interface.MulticastAddrs` reads it.
 pub fn proc_igmp() -> Vec<u8> {
     let (links, _) = snapshot();
-    let mut s =
-        alloc::string::String::from("Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n");
+    let mut s = alloc::string::String::from(
+        "Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n",
+    );
     for l in &links {
-        s.push_str(&format!("{}\t{:<10}: {:>5} {:>7}\n", l.index, l.name, 1, "V3"));
+        s.push_str(&format!(
+            "{}\t{:<10}: {:>5} {:>7}\n",
+            l.index, l.name, 1, "V3"
+        ));
         // The group is a __be32 printed as a host-order hex number.
         let g = u32::from_ne_bytes([224, 0, 0, 1]);
         s.push_str(&format!("\t\t\t\t{:08X} {:>5} 0:00000000\t\t0\n", g, 1));
@@ -240,7 +244,11 @@ impl SocketOps for NetlinkSocket {
         }
         let mut st = self.st.lock();
         if let Some(cur) = st.pid {
-            return if pid == 0 || pid == cur { Ok(()) } else { Err(Errno(EINVAL)) };
+            return if pid == 0 || pid == cur {
+                Ok(())
+            } else {
+                Err(Errno(EINVAL))
+            };
         }
         if pid == 0 {
             autobind(&mut st);

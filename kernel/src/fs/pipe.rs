@@ -19,9 +19,7 @@ use patina_abi::fs::S_IFIFO;
 use patina_abi::misc::FIONREAD;
 use patina_fsutil::ByteRing;
 
-use super::file::{
-    File, FileFlags, Notify, PollHook, PollList, PollWaiter, alloc_ino, anon_stat,
-};
+use super::file::{File, FileFlags, Notify, PollHook, PollList, PollWaiter, alloc_ino, anon_stat};
 use crate::sync::SpinLock;
 use crate::task::WakeReason;
 use crate::task::signal::ERESTARTSYS;
