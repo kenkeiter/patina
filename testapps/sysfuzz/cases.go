@@ -68,12 +68,15 @@ func (t *tcase) check(name string, ok bool, detail string) {
 	t.failed = append(t.failed, msg)
 }
 
-func must(name string, r uintptr, e syscall.Errno) uintptr {
-	if e != 0 {
-		fmt.Printf("FAIL sysfuzz setup %s: %v\n", name, e)
-		os.Exit(1)
+// must("what")(scr(...)) exits the program when a setup call fails.
+func must(name string) func(uintptr, syscall.Errno) uintptr {
+	return func(r uintptr, e syscall.Errno) uintptr {
+		if e != 0 {
+			fmt.Printf("FAIL sysfuzz setup %s: %v\n", name, e)
+			os.Exit(1)
+		}
+		return r
 	}
-	return r
 }
 
 func closeFd(fd uintptr) { scr(SYS_CLOSE, fd) }
@@ -81,12 +84,12 @@ func closeFd(fd uintptr) { scr(SYS_CLOSE, fd) }
 // pipe returns a non-blocking pipe.
 func pipe(t *tcase) (uintptr, uintptr) {
 	p := t.c.alloc(8)
-	must("pipe2", scr(SYS_PIPE2, p, syscall.O_NONBLOCK|syscall.O_CLOEXEC))
+	must("pipe2")(scr(SYS_PIPE2, p, syscall.O_NONBLOCK|syscall.O_CLOEXEC))
 	return uintptr(get32(p)), uintptr(get32(p + 4))
 }
 
 func openPath(t *tcase, path string, flags int) uintptr {
-	return must("open "+path, scr(SYS_OPENAT, u(-100), t.c.cstr(path), uintptr(flags|syscall.O_CLOEXEC), 0o644))
+	return must("open "+path)(scr(SYS_OPENAT, u(-100), t.c.cstr(path), uintptr(flags|syscall.O_CLOEXEC), 0o644))
 }
 
 func runCases() {
@@ -112,6 +115,13 @@ func runCases() {
 	}
 	fmt.Printf("PASS sysfuzz cases (%d)\n", t.n)
 }
+
+// Generic ioctl numbers (the same on arm64 and x86_64; the syscall
+// package defines them for neither).
+const (
+	FIONREAD = 0x541b
+	FIONBIO  = 0x5421
+)
 
 const (
 	anon     = syscall.MAP_PRIVATE | syscall.MAP_ANONYMOUS
@@ -243,7 +253,7 @@ func casesMM(t *tcase) {
 
 	// mm/mremap.c check_mremap_params (after PAGE_ALIGN of both lengths).
 	// Two RW pages between PROT_NONE neighbours (no VMA merging).
-	m := must("mmap mremap src", scr(SYS_MMAP, mmBase+16*4096, 2*4096, rw, anon|mapFixed, allOnes, 0))
+	m := must("mmap mremap src")(scr(SYS_MMAP, mmBase+16*4096, 2*4096, rw, anon|mapFixed, allOnes, 0))
 	r, e = scr(SYS_MREMAP, m, 4096, 4096, 0x80)
 	t.want("mremap bad flags", r, e, syscall.EINVAL)
 	r, e = scr(SYS_MREMAP, m+1, 4096, 4096, 0)
@@ -362,7 +372,7 @@ func casesFd(t *tcase) {
 	// -EINVAL; writing ULLONG_MAX → -EINVAL.
 	r, e = scr(SYS_EVENTFD2, 0, 0x1)
 	t.want("eventfd2 bad flags", r, e, syscall.EINVAL)
-	efd := must("eventfd2", scr(SYS_EVENTFD2, 0, syscall.O_NONBLOCK|syscall.O_CLOEXEC))
+	efd := must("eventfd2")(scr(SYS_EVENTFD2, 0, syscall.O_NONBLOCK|syscall.O_CLOEXEC))
 	r, e = scr(SYS_WRITE, efd, t.c.u64s(1), 4)
 	t.want("eventfd write 4 bytes", r, e, syscall.EINVAL)
 	r, e = scr(SYS_WRITE, efd, t.c.u64s(^uint64(0)), 8)
@@ -385,11 +395,11 @@ func casesFd(t *tcase) {
 	r, e = scr(SYS_GETDENTS64, u(-1), junk(randFor(3), 4096), 4096)
 	t.want("getdents64 bad fd", r, e, syscall.EBADF)
 	// fs/ioctl.c: FIONBIO with a bad pointer → -EFAULT; a bad fd → -EBADF.
-	r, e = scr(SYS_IOCTL, pr, syscall.FIONBIO, kernHalf)
+	r, e = scr(SYS_IOCTL, pr, FIONBIO, kernHalf)
 	t.want("ioctl FIONBIO bad ptr", r, e, syscall.EFAULT)
-	r, e = scr(SYS_IOCTL, u(-1), syscall.FIONREAD, junk(randFor(4), 4))
+	r, e = scr(SYS_IOCTL, u(-1), FIONREAD, junk(randFor(4), 4))
 	t.want("ioctl bad fd", r, e, syscall.EBADF)
-	r, e = scr(SYS_IOCTL, pr, syscall.FIONREAD, kernHalf)
+	r, e = scr(SYS_IOCTL, pr, FIONREAD, kernHalf)
 	t.want("ioctl FIONREAD bad ptr", r, e, syscall.EFAULT)
 	r, e = scr(SYS_FSTAT, fd, kernHalf)
 	t.want("fstat bad ptr", r, e, syscall.EFAULT)
@@ -426,7 +436,7 @@ func casesRW(t *tcase) {
 	t.want("write kernel buffer", r, e, syscall.EFAULT)
 	r, e = scr(SYS_WRITE, pw, buf, 1<<62)
 	t.want("write huge count", r, e, syscall.EFAULT)
-	must("write x", scr(SYS_WRITE, pw, t.c.cstr("xy"), 2))
+	must("write x")(scr(SYS_WRITE, pw, t.c.cstr("xy"), 2))
 	r, e = scr(SYS_READ, pr, kernHalf, 1)
 	t.want("read kernel buffer", r, e, syscall.EFAULT)
 	r, e = scr(SYS_READ, pr, buf, 1<<62)
@@ -486,7 +496,7 @@ func casesRW(t *tcase) {
 	// sendfile (fs/read_write.c do_sendfile): an offset pointer that faults
 	// → -EFAULT; a negative *offset → -EINVAL.
 	ffd := openPath(t, "/tmp/sfc/sf", syscall.O_RDWR|syscall.O_CREAT|syscall.O_TRUNC)
-	must("write sf", scr(SYS_WRITE, ffd, t.c.cstr("hello"), 5))
+	must("write sf")(scr(SYS_WRITE, ffd, t.c.cstr("hello"), 5))
 	r, e = scr(SYS_SENDFILE, pw, ffd, kernHalf, 5)
 	t.want("sendfile bad offset ptr", r, e, syscall.EFAULT)
 	r, e = scr(SYS_SENDFILE, pw, ffd, t.c.u64s(^uint64(0)), 5)
@@ -618,7 +628,7 @@ func casesPath(t *tcase) {
 
 func casesPoll(t *tcase) {
 	c := t.c
-	ep := must("epoll_create1", scr(SYS_EPOLL_CREATE1, syscall.EPOLL_CLOEXEC))
+	ep := must("epoll_create1")(scr(SYS_EPOLL_CREATE1, syscall.EPOLL_CLOEXEC))
 	pr, pw := pipe(t)
 	evs := junk(randFor(9), 4096)
 	// fs/eventpoll.c do_epoll_wait: "maxevents <= 0 || > EP_MAX_EVENTS →
@@ -672,7 +682,7 @@ func casesPoll(t *tcase) {
 	t.want("epoll_create1 bad flags", r, e, syscall.EINVAL)
 	// An event is ready, but the events buffer faults: Linux re-queues the
 	// event and returns -EFAULT; a later wait still sees it.
-	must("write pipe", scr(SYS_WRITE, pw, c.cstr("z"), 1))
+	must("write pipe")(scr(SYS_WRITE, pw, c.cstr("z"), 1))
 	r, e = scr(SYS_EPOLL_PWAIT, ep, holePage, 4, 0, 0, 8)
 	t.want("epoll_pwait events into hole", r, e, syscall.EFAULT)
 	r, e = scr(SYS_EPOLL_PWAIT, ep, evs, 4, 0, 0, 8)
@@ -735,8 +745,8 @@ func casesNet(t *tcase) {
 	t.want("socket bad family", r, e, syscall.EAFNOSUPPORT)
 	r, e = scr(SYS_SOCKET, u(-1), syscall.SOCK_STREAM, 0)
 	t.want("socket family -1", r, e, syscall.EAFNOSUPPORT)
-	s := must("socket udp", scr(SYS_SOCKET, syscall.AF_INET, syscall.SOCK_DGRAM|nb, 0))
-	ts := must("socket tcp", scr(SYS_SOCKET, syscall.AF_INET, syscall.SOCK_STREAM|nb, 0))
+	s := must("socket udp")(scr(SYS_SOCKET, syscall.AF_INET, syscall.SOCK_DGRAM|nb, 0))
+	ts := must("socket tcp")(scr(SYS_SOCKET, syscall.AF_INET, syscall.SOCK_STREAM|nb, 0))
 	// move_addr_to_kernel: "ulen < 0 || ulen > sizeof(sockaddr_storage) →
 	// -EINVAL"; a bad pointer → -EFAULT. sockfd_lookup first: -EBADF / -ENOTSOCK.
 	r, e = scr(SYS_BIND, s, sockaddrIn(c, 0, [4]byte{127, 0, 0, 1}), 129)
@@ -793,7 +803,7 @@ func casesNet(t *tcase) {
 	// cmsg_len < sizeof(cmsghdr) or past msg_controllen → -EINVAL; more
 	// than SCM_MAX_FD (253) fds → -EINVAL; a bad fd → -EBADF.
 	sv := c.alloc(8)
-	must("socketpair", scr(SYS_SOCKETPAIR, syscall.AF_UNIX, syscall.SOCK_DGRAM|nb, 0, sv))
+	must("socketpair")(scr(SYS_SOCKETPAIR, syscall.AF_UNIX, syscall.SOCK_DGRAM|nb, 0, sv))
 	ua, ub := uintptr(get32(sv)), uintptr(get32(sv+4))
 	sendCtl := func(ctl []byte) (uintptr, syscall.Errno) {
 		m := c.alloc(56)
@@ -862,21 +872,21 @@ func casesSignal(t *tcase) {
 	// kernel/signal.c rt_sigaction: "if (sigsetsize != sizeof(sigset_t))
 	// return -EINVAL"; do_sigaction: "!valid_signal(sig) || sig < 1 ||
 	// (act && sig_kernel_only(sig)) → -EINVAL".
-	r, e := scr(SYS_RT_SIGACTION, syscall.SIGUSR1, 0, oact, 4)
+	r, e := scr(SYS_RT_SIGACTION, uintptr(syscall.SIGUSR1), 0, oact, 4)
 	t.want("rt_sigaction sigsetsize 4", r, e, syscall.EINVAL)
 	for _, sig := range []int64{0, 65, -1, 1 << 32} {
 		r, e = scr(SYS_RT_SIGACTION, u(sig), 0, oact, 8)
 		t.want(fmt.Sprintf("rt_sigaction sig %d", sig), r, e, syscall.EINVAL)
 	}
-	r, e = scr(SYS_RT_SIGACTION, syscall.SIGKILL, c.alloc(32), 0, 8)
+	r, e = scr(SYS_RT_SIGACTION, uintptr(syscall.SIGKILL), c.alloc(32), 0, 8)
 	t.want("rt_sigaction SIGKILL", r, e, syscall.EINVAL)
-	r, e = scr(SYS_RT_SIGACTION, syscall.SIGSTOP, c.alloc(32), 0, 8)
+	r, e = scr(SYS_RT_SIGACTION, uintptr(syscall.SIGSTOP), c.alloc(32), 0, 8)
 	t.want("rt_sigaction SIGSTOP", r, e, syscall.EINVAL)
-	r, e = scr(SYS_RT_SIGACTION, syscall.SIGKILL, 0, oact, 8)
+	r, e = scr(SYS_RT_SIGACTION, uintptr(syscall.SIGKILL), 0, oact, 8)
 	t.want("rt_sigaction SIGKILL query", r, e, 0)
-	r, e = scr(SYS_RT_SIGACTION, syscall.SIGUSR1, kernHalf, 0, 8)
+	r, e = scr(SYS_RT_SIGACTION, uintptr(syscall.SIGUSR1), kernHalf, 0, 8)
 	t.want("rt_sigaction kernel act", r, e, syscall.EFAULT)
-	r, e = scr(SYS_RT_SIGACTION, syscall.SIGUSR1, 0, kernHalf, 8)
+	r, e = scr(SYS_RT_SIGACTION, uintptr(syscall.SIGUSR1), 0, kernHalf, 8)
 	t.want("rt_sigaction kernel oact", r, e, syscall.EFAULT)
 	// rt_sigprocmask: sigsetsize → -EINVAL; bad how with a set → -EINVAL;
 	// bad how without a set → 0.
