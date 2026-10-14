@@ -65,6 +65,40 @@ fn read_into(of: &OpenFile, kbuf: &mut [u8]) -> Result<usize, Errno> {
     }
 }
 
+/// Write all of `k`, blocking unless `O_NONBLOCK`: the bytes written and,
+/// if it stopped early, why (`None`: a zero-length write).
+fn write_kbuf(of: &OpenFile, k: &[u8]) -> (usize, Option<Errno>) {
+    let mut off = 0;
+    while off < k.len() {
+        let fl = of.flags();
+        match of.file.write(&k[off..], fl) {
+            Ok(0) => return (off, None),
+            Ok(w) => off += w,
+            Err(Errno(EAGAIN)) if !fl.nonblocking() => {
+                if wait_ready(&*of.file, EpollFlags::OUT | EpollFlags::WRNORM, None)
+                    == WakeReason::Interrupted
+                {
+                    // Linux pipe_write: bytes written so far, else
+                    // -ERESTARTSYS.
+                    return (off, Some(Errno(ERESTARTSYS)));
+                }
+            }
+            Err(e) => {
+                if e == Errno(EPIPE) {
+                    // Linux `send_sig(SIGPIPE, current, 0)`.
+                    let pid = task::process().pid as i32;
+                    signal::send_to_thread(
+                        &task::sched::current_arc(),
+                        SigInfo::kill(SIGPIPE, SI_USER, pid, 0),
+                    );
+                }
+                return (off, Some(e));
+            }
+        }
+    }
+    (off, None)
+}
+
 /// Write `len` user bytes at `ubuf`, blocking unless `O_NONBLOCK`.
 fn write_from(of: &OpenFile, ubuf: usize, len: usize) -> SysResult {
     if len == 0 {
@@ -77,37 +111,72 @@ fn write_from(of: &OpenFile, ubuf: usize, len: usize) -> SysResult {
         if let Err(e) = with_space(|s| s.copy_from_user(ubuf + done, &mut k[..n])) {
             return partial(done, e);
         }
-        let mut off = 0;
-        while off < n {
-            let fl = of.flags();
-            match of.file.write(&k[off..n], fl) {
-                Ok(0) => return Ok((done + off) as isize),
-                Ok(w) => off += w,
-                Err(Errno(EAGAIN)) if !fl.nonblocking() => {
-                    if wait_ready(&*of.file, EpollFlags::OUT | EpollFlags::WRNORM, None)
-                        == WakeReason::Interrupted
-                    {
-                        // Linux pipe_write: bytes written so far, else
-                        // -ERESTARTSYS.
-                        return partial(done + off, Errno(ERESTARTSYS));
-                    }
-                }
-                Err(e) => {
-                    if e == Errno(EPIPE) {
-                        // Linux `send_sig(SIGPIPE, current, 0)`.
-                        let pid = task::process().pid as i32;
-                        signal::send_to_thread(
-                            &task::sched::current_arc(),
-                            SigInfo::kill(SIGPIPE, SI_USER, pid, 0),
-                        );
-                    }
-                    return partial(done + off, e);
-                }
-            }
+        match write_kbuf(of, &k[..n]) {
+            (w, None) if w == n => {}
+            (w, None) => return Ok((done + w) as isize),
+            (w, Some(e)) => return partial(done + w, e),
         }
         done += n;
     }
     Ok(done as isize)
+}
+
+/// `sendfile(out_fd, in_fd, offp, count)`: copy from a seekable file
+/// (`pread` at `*offp`, or at the file position, which advances) to any
+/// writable fd through a kernel buffer, blocking on the output unless it
+/// is `O_NONBLOCK`. Only what was written counts as consumed.
+pub fn sendfile(out_fd: i32, in_fd: i32, offp: usize, count: usize) -> SysResult {
+    let inf = get(in_fd)?;
+    let outf = get(out_fd)?;
+    if !inf.flags().readable() || !outf.flags().writable() {
+        return Err(Errno(EBADF));
+    }
+    let start: u64 = if offp != 0 {
+        let o: i64 = with_space(|s| s.read_val(offp))?;
+        if o < 0 {
+            return Err(Errno(EINVAL));
+        }
+        o as u64
+    } else {
+        inf.file
+            .lseek(0, patina_abi::fs::SEEK_CUR)
+            .map_err(|_| Errno(EINVAL))?
+    };
+    let count = count.min(MAX_RW);
+    let mut k = vec![0u8; count.clamp(1, CHUNK)];
+    let mut done = 0usize;
+    let mut err = None;
+    while done < count {
+        let m = (count - done).min(CHUNK);
+        let n = match inf.file.pread(&mut k[..m], start + done as u64) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(Errno(patina_abi::errno::ESPIPE)) => {
+                err = Some(Errno(EINVAL));
+                break;
+            }
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        };
+        let (w, e) = write_kbuf(&outf, &k[..n]);
+        done += w;
+        if e.is_some() || w < n {
+            err = e;
+            break;
+        }
+    }
+    let end = start + done as u64;
+    if offp != 0 {
+        with_space(|s| s.write_val(offp, &(end as i64)))?;
+    } else if done > 0 {
+        inf.file.lseek(end as i64, patina_abi::fs::SEEK_SET)?;
+    }
+    match err {
+        Some(e) => partial(done, e),
+        None => Ok(done as isize),
+    }
 }
 
 pub fn read(fd: i32, buf: usize, len: usize) -> SysResult {
