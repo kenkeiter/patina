@@ -20,6 +20,7 @@
 #   PATINA_ACCEL    hvf | kvm | tcg (default: hvf on Apple Silicon, kvm if
 #                   /dev/kvm is usable, else tcg)
 #   PATINA_TIMEOUT  hard timeout in seconds (default 60)
+#   PATINA_MACHINE  x86_64 only: QEMU machine type (default microvm; pc, q35 work)
 #   PATINA_KERNEL   kernel image to boot (default out/kernel-<arch>...)
 #   PATINA_LOG      file to capture serial output in (default: a temp file)
 #   PATINA_QEMU_EXTRA  extra QEMU arguments (word-split)
@@ -85,17 +86,22 @@ case $arch in
            -kernel "$kernel")
     ;;
   x86_64)
-    # ---- x86_64: STUB, TO BE FINISHED BY THE x86_64 BRING-UP ----
-    # QEMU microvm (ACPI on, the default), 16550 at 0x3f8, PVH ELF via
-    # -kernel. isa-debug-exit only terminates QEMU: QEMU reports
-    # (value << 1) | 1 and only statuses >= 3 are trustworthy, so exit code 0
-    # MUST come through the "[patina] exit code 0" serial sentinel. This
-    # script always derives its exit status from the sentinel.
+    # QEMU microvm (ACPI on, the default) with a 16550 at 0x3f8, booting
+    # the PVH ELF via -kernel. isa-debug-exit only terminates QEMU: QEMU
+    # reports (value << 1) | 1 and only statuses >= 3 are trustworthy, so
+    # exit code 0 MUST come through the "[patina] exit code 0" serial
+    # sentinel. This script always derives its exit status from the sentinel.
+    # PATINA_MACHINE overrides the machine type (e.g. pc, q35).
     qemu=qemu-system-x86_64
     kernel=${PATINA_KERNEL:-$root/out/kernel-x86_64-pvh.elf}
     accel=${PATINA_ACCEL:-tcg}
+    case $accel in
+      kvm|hvf) cpu=host ;;
+      *) cpu=max ;;
+    esac
+    machine=${PATINA_MACHINE:-microvm}
     console=ttyS0
-    qargs=(-M microvm -accel "$accel" -cpu max
+    qargs=(-M "$machine" -accel "$accel" -cpu "$cpu"
            -smp "$cpus" -m "$mem" -nodefaults -no-user-config -display none -no-reboot
            -device isa-debug-exit,iobase=0xf4,iosize=0x04
            -kernel "$kernel")
