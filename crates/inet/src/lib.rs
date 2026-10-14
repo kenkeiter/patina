@@ -6,13 +6,17 @@
 //! * [`PortTable`]: the inet bind table — which (protocol, port, address
 //!   scope) bindings exist, `EADDRINUSE` decisions under `SO_REUSEADDR` /
 //!   `SO_REUSEPORT` and dual-stack overlap, and ephemeral port allocation
-//!   (32768–60999, Linux's `ip_local_port_range`).
+//!   (32768–60999, Linux's `ip_local_port_range`);
+//! * [`unix`]: AF_UNIX pieces — the stream buffer that carries passed fds
+//!   with their bytes, and the `cmsg` codec.
 //!
 //! The kernel (`kernel/src/net/`) wires these to smoltcp.
 
 #![no_std]
 
 extern crate alloc;
+
+pub mod unix;
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
