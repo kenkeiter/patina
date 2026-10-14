@@ -381,10 +381,12 @@ CPU's redistributor by MPIDR for AP bring-up.
 
 Go's arm64 runtime reads `MIDR_EL1` from user mode when `AT_HWCAP` has
 `HWCAP_CPUID` (as Linux sets). patina advertises it and emulates the
-resulting EC 0x18 trap in `exceptions::emulate_mrs` (MIDR, ID_AA64ISAR0/1,
-ID_AA64PFR0/1, ID_AA64MMFR*, CTR, REVIDR, with Linux's sanitised view where
-it matters). On CPUs without FEAT_IDST the access arrives as EC 0x00 and is
-treated as an illegal instruction. `AT_HWCAP` itself is
+resulting EC 0x18 trap in `exceptions::emulate_mrs`: `MIDR_EL1` and
+`ID_AA64ISAR0_EL1` are passed through, `ID_AA64PFR0_EL1` is sanitised to the
+FP/AdvSIMD/GIC fields Linux exposes, and every other register in the ID
+group reads as zero (unknown encodings are an illegal instruction). On CPUs
+without FEAT_IDST the access arrives as EC 0x00 and is treated as an
+illegal instruction. `AT_HWCAP` itself is
 `patina_abi::aarch64::hwcap::from_id_aa64isar0` plus FP/ASIMD/CPUID.
 
 ## D32: x86_64 user-mode CPU setup
