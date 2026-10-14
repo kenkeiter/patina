@@ -226,19 +226,41 @@ impl ClassList {
 static CLASSES: [SpinLock<ClassList>; NCLASSES] =
     [const { SpinLock::new(ClassList::new()) }; NCLASSES];
 
-/// Frames held by slabs, and by page-path allocations.
-static SLAB_PAGES: AtomicUsize = AtomicUsize::new(0);
-static LARGE_PAGES: AtomicUsize = AtomicUsize::new(0);
-/// Bytes requested; bytes of slots and pages handed out; bytes of slots
-/// handed out.
-static USER_BYTES: AtomicUsize = AtomicUsize::new(0);
-static ACTUAL_BYTES: AtomicUsize = AtomicUsize::new(0);
-static SLOT_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Per-class counters. Written only under the class's lock, with a plain
+/// load + store (no atomic read-modify-write on the allocation path);
+/// atomics so that [`stats`] and [`reserve`] can read them without it.
+struct ClassStats {
+    /// Slab pages the class holds.
+    slabs: AtomicUsize,
+    /// Slots handed out.
+    slots: AtomicUsize,
+    /// Bytes requested by the slots' owners.
+    user: AtomicUsize,
+}
 
-/// A new slab for class `c`, every slot on its free list.
+static CLASS_STATS: [ClassStats; NCLASSES] = [const {
+    ClassStats {
+        slabs: AtomicUsize::new(0),
+        slots: AtomicUsize::new(0),
+        user: AtomicUsize::new(0),
+    }
+}; NCLASSES];
+
+/// `a += d` for a counter only the class lock holder writes.
+#[inline]
+fn bump(a: &AtomicUsize, d: isize) {
+    a.store(a.load(Ordering::Relaxed).wrapping_add_signed(d), Ordering::Relaxed);
+}
+
+/// Page-path allocations: frames held, bytes requested.
+static LARGE_PAGES: AtomicUsize = AtomicUsize::new(0);
+static LARGE_USER: AtomicUsize = AtomicUsize::new(0);
+
+/// A new slab for class `c`, every slot on its free list. Called with the
+/// class lock held.
 fn new_slab(c: usize) -> Option<*mut Slab> {
     let pa = frame::alloc_frames(0)?;
-    SLAB_PAGES.fetch_add(1, Ordering::Relaxed);
+    bump(&CLASS_STATS[c].slabs, 1);
     let base = phys_to_virt(pa).as_usize();
     let size = CLASS_SIZE[c];
     let mut free: *mut usize = ptr::null_mut();
@@ -267,13 +289,8 @@ fn new_slab(c: usize) -> Option<*mut Slab> {
     Some(s)
 }
 
-fn free_slab(s: *mut Slab) {
-    let pa = virt_to_phys(VirtAddr(s as usize)).expect("heap: slab outside the direct map");
-    frame::free_frames(pa, 0);
-    SLAB_PAGES.fetch_sub(1, Ordering::Relaxed);
-}
-
-fn slab_alloc(c: usize) -> *mut u8 {
+/// A slot of class `c` for an object of `user` bytes.
+fn slab_alloc(c: usize, user: usize) -> *mut u8 {
     let mut l = CLASSES[c].lock();
     if l.head.is_null() {
         let Some(s) = new_slab(c) else {
@@ -284,6 +301,8 @@ fn slab_alloc(c: usize) -> *mut u8 {
         l.empty += 1;
     }
     let s = l.head;
+    bump(&CLASS_STATS[c].slots, 1);
+    bump(&CLASS_STATS[c].user, user as isize);
     // SAFETY: list members are live slabs of this class with a free slot.
     unsafe {
         let obj = (*s).free;
@@ -300,10 +319,12 @@ fn slab_alloc(c: usize) -> *mut u8 {
 }
 
 /// # Safety
-/// `p` came from `slab_alloc(c)` and is not used any more.
-unsafe fn slab_free(p: *mut u8, c: usize) {
+/// `p` came from `slab_alloc(c, user)` and is not used any more.
+unsafe fn slab_free(p: *mut u8, c: usize, user: usize) {
     let s = (p as usize & !(PAGE_SIZE - 1)) as *mut Slab;
     let mut l = CLASSES[c].lock();
+    bump(&CLASS_STATS[c].slots, -1);
+    bump(&CLASS_STATS[c].user, -(user as isize));
     // SAFETY: `s` is the live slab holding `p` (caller contract).
     unsafe {
         let was_full = (*s).free.is_null();
@@ -315,8 +336,10 @@ unsafe fn slab_free(p: *mut u8, c: usize) {
                 l.unlink(s);
             }
             if l.empty >= KEEP_EMPTY {
+                bump(&CLASS_STATS[c].slabs, -1);
                 drop(l);
-                free_slab(s);
+                let pa = virt_to_phys(VirtAddr(s as usize)).expect("heap: slab outside the direct map");
+                frame::free_frames(pa, 0);
             } else {
                 l.empty += 1;
                 l.push_back(s);
@@ -338,60 +361,46 @@ fn large_pa(p: *mut u8) -> PhysAddr {
 
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let (p, actual) = match class_for(&layout) {
-            Some(c) => {
-                let p = slab_alloc(c);
-                if !p.is_null() {
-                    SLOT_BYTES.fetch_add(CLASS_SIZE[c], Ordering::Relaxed);
-                }
-                (p, CLASS_SIZE[c])
-            }
-            None => {
-                let (pages, align_order) = pages_for(&layout);
-                match frame::alloc_pages(pages, align_order) {
-                    Some(pa) => {
-                        LARGE_PAGES.fetch_add(pages, Ordering::Relaxed);
-                        (phys_to_virt(pa).as_mut_ptr(), pages * PAGE_SIZE)
-                    }
-                    None => (ptr::null_mut(), 0),
-                }
-            }
-        };
-        if !p.is_null() {
-            USER_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-            ACTUAL_BYTES.fetch_add(actual, Ordering::Relaxed);
+        if let Some(c) = class_for(&layout) {
+            return slab_alloc(c, layout.size());
         }
-        p
+        let (pages, align_order) = pages_for(&layout);
+        match frame::alloc_pages(pages, align_order) {
+            Some(pa) => {
+                LARGE_PAGES.fetch_add(pages, Ordering::Relaxed);
+                LARGE_USER.fetch_add(layout.size(), Ordering::Relaxed);
+                phys_to_virt(pa).as_mut_ptr()
+            }
+            None => ptr::null_mut(),
+        }
     }
 
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
         if p.is_null() {
             return;
         }
-        USER_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        match class_for(&layout) {
-            Some(c) => {
-                ACTUAL_BYTES.fetch_sub(CLASS_SIZE[c], Ordering::Relaxed);
-                SLOT_BYTES.fetch_sub(CLASS_SIZE[c], Ordering::Relaxed);
-                // SAFETY: GlobalAlloc contract: `p`/`layout` come from `alloc`.
-                unsafe { slab_free(p, c) };
-            }
-            None => {
-                let (pages, _) = pages_for(&layout);
-                LARGE_PAGES.fetch_sub(pages, Ordering::Relaxed);
-                ACTUAL_BYTES.fetch_sub(pages * PAGE_SIZE, Ordering::Relaxed);
-                frame::free_pages(large_pa(p), pages);
-            }
+        if let Some(c) = class_for(&layout) {
+            // SAFETY: GlobalAlloc contract: `p`/`layout` come from `alloc`.
+            unsafe { slab_free(p, c, layout.size()) };
+            return;
         }
+        let (pages, _) = pages_for(&layout);
+        LARGE_PAGES.fetch_sub(pages, Ordering::Relaxed);
+        LARGE_USER.fetch_sub(layout.size(), Ordering::Relaxed);
+        frame::free_pages(large_pa(p), pages);
     }
 
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: GlobalAlloc contract: `new_size` with `layout.align()` is
         // a valid layout.
         let new = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let in_place = match (class_for(&layout), class_for(&new)) {
+        match (class_for(&layout), class_for(&new)) {
             // Same slot class: nothing moves.
-            (Some(a), Some(b)) => a == b,
+            (Some(a), Some(b)) if a == b => {
+                let _l = CLASSES[a].lock();
+                bump(&CLASS_STATS[a].user, new_size as isize - layout.size() as isize);
+                return p;
+            }
             // Page path, not growing: keep the head, free the tail.
             (None, None) => {
                 let (old_pages, _) = pages_for(&layout);
@@ -401,19 +410,13 @@ unsafe impl GlobalAlloc for KernelHeap {
                     if tail > 0 {
                         frame::free_pages(PhysAddr(large_pa(p).0 + new_pages * PAGE_SIZE), tail);
                         LARGE_PAGES.fetch_sub(tail, Ordering::Relaxed);
-                        ACTUAL_BYTES.fetch_sub(tail * PAGE_SIZE, Ordering::Relaxed);
                     }
-                    true
-                } else {
-                    false
+                    LARGE_USER.fetch_add(new_size, Ordering::Relaxed);
+                    LARGE_USER.fetch_sub(layout.size(), Ordering::Relaxed);
+                    return p;
                 }
             }
-            _ => false,
-        };
-        if in_place {
-            USER_BYTES.fetch_add(new_size, Ordering::Relaxed);
-            USER_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-            return p;
+            _ => {}
         }
         // SAFETY: `new` is a valid, non-zero-size layout.
         let q = unsafe { self.alloc(new) };
@@ -443,11 +446,26 @@ pub fn init() {
 /// the heap holds (slab pages, kept empty ones included, and page-path
 /// blocks).
 pub fn stats() -> (usize, usize, usize) {
-    (
-        USER_BYTES.load(Ordering::Relaxed),
-        ACTUAL_BYTES.load(Ordering::Relaxed),
-        (SLAB_PAGES.load(Ordering::Relaxed) + LARGE_PAGES.load(Ordering::Relaxed)) * PAGE_SIZE,
-    )
+    let large = LARGE_PAGES.load(Ordering::Relaxed);
+    let (mut user, mut actual, mut slabs) = (LARGE_USER.load(Ordering::Relaxed), large * PAGE_SIZE, 0);
+    for (c, st) in CLASS_STATS.iter().enumerate() {
+        user += st.user.load(Ordering::Relaxed);
+        actual += st.slots.load(Ordering::Relaxed) * CLASS_SIZE[c];
+        slabs += st.slabs.load(Ordering::Relaxed);
+    }
+    (user, actual, (slabs + large) * PAGE_SIZE)
+}
+
+/// Bytes of free slots in slab pages (kept empty slabs included).
+fn slab_free_bytes() -> usize {
+    CLASS_STATS
+        .iter()
+        .enumerate()
+        .map(|(c, st)| {
+            (st.slabs.load(Ordering::Relaxed) * PAGE_SIZE)
+                .saturating_sub(st.slots.load(Ordering::Relaxed) * CLASS_SIZE[c])
+        })
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -488,9 +506,7 @@ pub const fn alloc_size(n: usize) -> usize {
 /// slots in slab pages.
 fn available_bytes() -> usize {
     let (free, _) = frame::stats();
-    let slab_free = (SLAB_PAGES.load(Ordering::Relaxed) * PAGE_SIZE)
-        .saturating_sub(SLOT_BYTES.load(Ordering::Relaxed));
-    free.saturating_mul(PAGE_SIZE).saturating_add(slab_free)
+    free.saturating_mul(PAGE_SIZE).saturating_add(slab_free_bytes())
 }
 
 /// The low watermark: half of the D78 kernel reserve (RAM/32, 2–32 MiB).

@@ -2985,7 +2985,13 @@ D3/design §11 planned) that holds no frame it does not use:
 Size accounting changed with it: `heap::alloc_size` (what `charge`
 callers count) is the slot size or whole pages, not the next power of
 two; `reserve`'s free-memory estimate is free frames plus free slab slots.
-`/proc/meminfo` gains `Slab:` (frames the heap holds). The fd table
+`/proc/meminfo` gains `Slab:` (frames the heap holds). `charge` now
+stops 1/32 of the commit limit (1–32 MiB) short of it: with a denser
+heap, pipe rings filled the commit limit before the watermark tripped,
+and at 4 vCPUs Go's GC lost the race for the last pages (`fatal error:
+runtime: cannot allocate memory` in `sysfuzz -mode limits`); kernel
+buffers are now refused (a recoverable errno) while the program's heap
+growth still fits. The fd table
 (`FdSlots`) also shrinks: when at most a quarter of its slots are in use
 after a close it moves to an array twice the slots in use (fallibly;
 256 minimum), so a program that once had 2^20 fds open does not keep a
@@ -2999,11 +3005,13 @@ kernel grows by up to 204 MiB and comes back to within 1 MiB of its
 baseline after every phase (aarch64: kernel-held 3 → 4 MiB, MemFree
 1012 → 1011 MiB; x86_64: 4 → 5 MiB, 1011 → 1010 MiB); the old heap ended
 the pipe phase 74 MiB up. `sysfuzz -mode limits -limits-strict` (now the
-default in `test-sysfuzz.sh`) ends 2.7 MiB below its MemFree baseline
+default in `test-sysfuzz.sh`) ends 2.6–5.6 MiB below its MemFree baseline on both arches at 1 and 4 vCPUs
 (was 238.6 MiB); its MemFree samples now follow `debug.FreeOSMemory()`,
 so what Go keeps resident does not count. `selftest alloc` checks every
 class and alignment, in-place and moving reallocs and that the frames
 come back. Robust `reclaim` now checks the kernel frames outside the
-heap (MemTotal − MemFree − VmRSS − Slab): with a heap that tracks the
-objects alive at the moment, the old total moved by up to ±100 frames
-between samples.
+heap (MemTotal − MemFree − VmRSS − Slab), with a tolerance of 96 frames
+(was 64): with a heap that tracks the objects alive at the moment, the
+old total moved by up to ±130 frames between samples, and at 4 vCPUs the
+number of Go's idle threads (8 kernel-stack frames each) moves the rest
+by up to ~65; a stack leak would be 16000 frames.
