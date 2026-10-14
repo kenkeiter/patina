@@ -870,7 +870,178 @@ Background: Go's runtime initialises its netpoller (`epoll_create1`,
 test died at `netpollinit`.
 
 ## D50: SMP scheduler core
-*(second documentation pass; see the SMP/timers worker reports)*
+*2026-10-14 · Phase 2*
+
+`kernel/src/task/sched.rs`; its module docs are the contract. This closes
+the Phase 2 items of D38–D41. `static CPUS: [PerCpu; MAX_CPUS]` is indexed
+by `cpu::id()`. Each `PerCpu` holds the current thread, a FIFO runqueue (a
+`SpinLock` plus an atomic length that stealers read without the lock), the
+idle context (the boot stack on CPU 0, the AP's entry stack elsewhere), a
+`prev` hand-off slot, `need_resched`, `slice_start`, `run_start` and the
+one-shot deadline it has armed. The kernel stays non-preemptible, so a
+thread changes CPU only across `schedule()`, i.e. across anything that
+blocks. `this_cpu()` is therefore stable in IRQ-masked code and within a
+syscall until it first blocks; code after a block re-reads it. Bring-up:
+`start_thread0` activates the user tables and calls `sched::run_smp(t0)`.
+That runs `timer::init` and `arch::smp::start_secondaries(ap_main)`, waits
+up to 100 ms for the last AP's `ONLINE` bit, prints `[patina] smp: N cpus
+online`, queues thread 0 on CPU 0 and becomes CPU 0's idle loop. `ap_main`
+activates the user tables on its CPU (`activate_user_tables`, when a process
+exists), sets its `ONLINE` bit and enters the idle loop. `sched::run()`,
+used by the kernel self-tests, starts no secondaries and stays on CPU 0.
+
+Placement: `wake` and `make_runnable` queue the thread on the waker's CPU,
+with one exception. A waker that is running a thread claims an idle CPU if
+there is one (the thread's last CPU if it is idle, else the lowest idle one)
+by clearing its bit in `IDLE` with `fetch_and`, queues the thread there and
+sends that CPU a `Reschedule` IPI. A waker in its idle loop's context (a
+tick on an idle CPU) keeps the thread local. New threads follow the same
+rule, so Go's Ms spread over idle CPUs. A CPU whose runqueue is empty sets
+its `IDLE` bit and re-checks its queue (a waker either sees the bit or
+enqueued before the re-check). It then steals from the longest other
+runqueue, with `try_lock` only, taking the oldest thread whose `on_cpu` is
+clear. On contention, or when only still-switching threads are queued there,
+it retries up to 10 000 times and then waits in `cpu::idle_wait`.
+
+The `on_cpu` protocol (as Linux): a thread that blocks on CPU A can be woken
+by CPU B before A has saved its context. The CPU that switches a thread in
+sets `on_cpu`. `finish_switch`, run on the new stack after every switch,
+takes the outgoing thread from `PerCpu::prev` and clears it. A waker whose
+`try_wake` CAS succeeded spins (IRQs masked) until `on_cpu` is clear and
+then enqueues the thread exactly once. The spin is in the waker and not at
+switch-in because spinning at switch-in can deadlock when two CPUs each pop
+the other's outgoing thread. `schedule()` requeues `prev` only if it is
+still `Running` (preemption, yield), and only on its own runqueue. A dead
+thread's `Arc` sits in `prev` across the switch away from it;
+`finish_switch` on that CPU frees its kernel stack and drops it (this
+replaces D39's zombie slot). `clone` (D41) now writes
+`PARENT_SETTID`/`CHILD_SETTID` before `sched::make_runnable(child)`, and
+`spawn_user_thread` no longer enqueues, so a child running on another CPU
+cannot read its tid word first. `kick_remote(t)` (D45) sends a `Reschedule`
+IPI to `t`'s CPU if `t` is `Running` on another CPU; it reads `Thread::cpu`
+after the state. It runs after the sender's SeqCst pending-bit store, so a
+thread that migrated meanwhile went through a switch and checks the bits on
+its way back to user mode. `sched_getaffinity` returns
+`sched::online_mask()`, so `runtime.NumCPU()` and GOMAXPROCS equal the vCPU
+count. With more than one CPU online, `patina.strace=1` prints `[strace]
+<tid>@<cpu>`.
+
+Time: the slice is `QUANTUM_NS` = 20 ms, measured with `timer::now_ns`
+rather than by counting ticks, because a one-shot deadline interrupt also
+calls `trap::timer_tick`. `Thread::cpu_time_ns` is accumulated at every
+context switch (user and system time together).
+`sched::cpu_time_ns(&Thread)` is the accounted part, `current_cpu_time_ns()`
+adds the caller's running slice, and `thread_cpu_time_ns(&Thread)` adds any
+thread's running slice lock-free (`t.cpu` → `CPUS[c].run_start`, retried if
+the thread switched meanwhile). A reader that hits the few instructions of a
+switch-in can overcount once by the previous thread's slice. Deadlines: the
+sleep list stays one global list (D40). `sleep::add` calls
+`sched::arm_deadline(d)`, which arms this CPU's one-shot if `d` is earlier
+than what it has armed. Every CPU's tick expires sleepers and re-arms its
+one-shot to the global earliest deadline, so some CPU wakes at that
+deadline: sleeps and timeouts are now sub-tick and never early (D46's
+tick-granular timeouts are gone). Idle CPUs still take the 100 Hz periodic
+tick; idle is not tickless. Measured on aarch64/HVF: 200 ×
+`time.Sleep(500µs)` took 2.001 s before and 248 ms after (1, 2 and 4 CPUs;
+x86_64/TCG 263–268 ms), and 10 000 sleeps from 8 goroutines went from 12.5 s
+to about 1.5 s. The remaining floor of about 1.2 ms per sleep is Go's
+netpoller, which waits in `epoll_pwait` with whole-millisecond timeouts.
+
+Stop: `stop_other_cpus()` runs first in `exit_group`, `crate::exit`,
+`crate::exit_signal` and the panic handler. The first caller becomes
+`EXIT_OWNER`, sends `Stop` to every other CPU and waits up to 10 ms for the
+`STOPPED` bits of the CPUs running the scheduler (`trap::ipi(Stop)` →
+`sched::ipi_stop` sets the bit and halts). A later caller on another CPU
+halts (`halt_this_cpu`, also counted as stopped); the owner calling again
+returns at once. A CPU takes the IPI only with IRQs unmasked, and every
+`SpinLock` masks IRQs, so a stopped CPU never holds a lock. The exit
+sentinels are printed with `console::panic_write_fmt`, which force-unlocks
+the console after a bounded wait. A panic on an AP stops the others, CPU 0
+included. Lock order: futex bucket → address space → frame allocator;
+wait-queue lock (futex bucket / file / `PollWaiter` / epoll) → sleep list →
+per-CPU runqueue. No CPU holds two runqueue locks at once (the stealer only
+`try_lock`s the victim's), and nobody waits on `on_cpu` while holding a
+runqueue lock. `Thread::sig`/`sigq` and the console lock are leaves;
+`task::signal` calls `sched::kick` only after dropping its queue lock.
+`IDLE`, `ONLINE`, `STOPPED`, `on_cpu` and `need_resched` are atomics.
+
+`random.rs`: `seed_boot` mixes up to four `cpu::hw_random()` words (RNDR on
+aarch64, RDSEED else RDRAND on x86_64) into the SplitMix64 state together
+with the boot counter and `patina.epoch`. It logs `[patina] random: seeded
+from RNDR` (or `RDSEED/RDRAND`), or `... from boot counter only` when the
+CPU has none. HVF `-cpu host` on this host has no RNDR, so it seeds from the
+boot counter only; TCG `-cpu max` has RNDR and RDSEED. The generator is
+still NOT cryptographic: D35 stands until virtio-rng. Unverified: Stop or
+panic while another CPU is mid-print or stuck with IRQs masked (reasoned
+only), more than 4 vCPUs under the scheduler (the arch self-test ran 8),
+Firecracker and Cloud Hypervisor. On x86_64 the scheduler is not yet
+memory-safe: frames freed by one CPU can still be reached through another
+CPU's stale TLB entries (D52).
 
 ## D51: Timers and CPU clocks
-*(second documentation pass; see the SMP/timers worker reports)*
+*2026-10-14 · Phase 2*
+
+`kernel/src/task/timers.rs` (model, expiry and lock order in its module
+docs) and `syscall/time.rs`. There is one table per process: POSIX timers by
+id plus the three itimers. Timer ids count from 0, skip ids in use and wrap
+at `i32::MAX`, as Linux 6.x; more than `MAX_TIMERS` = 4096 timers is
+`EAGAIN`. Every timer is an `Arm`: an absolute expiry in its own clock (0 =
+disarmed) and a reload interval. Clocks: wall time (`now_ns`, plus
+`patina.epoch` for `CLOCK_REALTIME`); a thread's CPU time (`Weak<Thread>`
+read through `sched::thread_cpu_time_ns`, D50); and the process's CPU time,
+the sum over live user threads plus `DEAD_CPU_NS`, which `exit` adds each
+thread's time to, clamped so it never goes backwards. `resolve_clock`
+accepts the static clock ids and the Linux-encoded per-thread and
+per-process ids (`patina_abi::time::decode_cpuclock`). The thread must be a
+live user thread of the process, and the process id must be 0 or the pid;
+anything else is `EINVAL`. Timers reject `_RAW` and `_COARSE` clocks, as
+Linux does.
+
+Expiry runs from the tick on every CPU. `timers::tick()` is one `ARMED` load
+while nothing is armed. Otherwise it takes `TABLE` with `try_lock`, so a CPU
+that loses the race skips that tick. Periodic timers are re-armed by whole
+intervals, and the skipped intervals become the overrun of the one signal
+sent, as on Linux. The signals are collected under the lock and sent after
+dropping it (`send_to_process` / `send_to_thread`). When a send is refused
+because the timer's previous signal is still pending, the pass relocks and
+adds 1 + missed to the timer's accumulated overrun, which the next queued
+signal reports. `timer_settime` and `setitimer` run the same pass at once,
+so an already-expired value fires immediately. Granularity is the 10 ms tick
+plus any one-shot deadline tick: never early, up to one tick late. Timers do
+not arm deadlines themselves; that is a follow-up through
+`sched::arm_deadline`. Lock order: `TABLE` → `THREADS` (process CPU clock);
+no signal is sent under `TABLE`.
+
+Notifications: `SIGEV_SIGNAL` signals the process, `SIGEV_THREAD_ID` a live
+user thread (else `EINVAL`), `SIGEV_NONE` nothing. A NULL `sevp` means
+SIGALRM to the process with the timer id as value. `SIGEV_THREAD` and
+unknown modes are `EINVAL`, and the signal must be in 1..=64. If writing the
+id back fails, the timer is removed and the call returns `EFAULT`. POSIX
+timers send `SI_TIMER` (timer id, overrun, sigval). Itimers send
+`SI_KERNEL`: `ITIMER_REAL` → SIGALRM on the monotonic clock,
+`ITIMER_VIRTUAL` → SIGVTALRM and `ITIMER_PROF` → SIGPROF, both on the
+process CPU clock. `ITIMER_VIRTUAL` therefore counts total CPU time, since
+there is no user/system split. Go's `validSIGPROF` accepts `SI_KERNEL` from
+`setitimer` and `SI_TIMER` from its per-M
+`timer_create(CLOCK_THREAD_CPUTIME_ID, SIGEV_THREAD_ID)`, which is why both
+paths exist.
+
+Syscalls: `timer_create`, `timer_settime` (with `TIMER_ABSTIME`),
+`timer_gettime`, `timer_getoverrun`, `timer_delete`; `getitimer` and
+`setitimer` (a NULL new value disarms); x86_64 `alarm` with Linux's
+rounding; `getrusage` for `RUSAGE_SELF`, `RUSAGE_THREAD` and
+`RUSAGE_CHILDREN` (`ru_utime` is the CPU time, every other field 0);
+`times()` (all of it as user time). `clock_gettime` and `clock_getres` (1
+ns) work on the CPU clocks; `clock_nanosleep` on a thread CPU clock is
+`EINVAL` and on the process CPU clock `ENOTSUP`. Deviations:
+`timer_getoverrun` returns the overrun recorded when the timer last fired
+with a target, even if that signal was then refused (Linux: the last
+delivered one). A timer on an RT signal can queue several copies, where
+Linux keeps one entry and counts overruns. `timer_delete` leaves an
+already-queued signal queued (as Linux), and a tick on another CPU that
+already collected an expiry may still send one last signal. CPU timers of
+exited threads are disarmed, and a signal for a `SIGEV_THREAD_ID` target
+that has exited is dropped.
+
+## D52: x86_64 TLB shootdown and deferred frame reclaim
+*(pending: the shootdown worker's report)*
