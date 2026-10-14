@@ -36,6 +36,11 @@
 #                   UART; passes console=hvc0. Default: the UART.
 #   PATINA_VIRTIO   0: no virtio devices at all (default 1; 0 for x86 pc/q35,
 #                   which have no virtio-mmio bus)
+#   PATINA_NET      user[:H-G,...]: virtio-net-device on a QEMU user-mode
+#                   network (slirp, guest 10.0.2.15, gateway 10.0.2.2),
+#                   optionally forwarding host 127.0.0.1:H to guest TCP port
+#                   G (as `patina run --net user`, doc/cli-contract.md).
+#                   Default: no NIC.
 #
 # Serial output is streamed to the terminal and captured. Exit status:
 #   N    from the last "[patina] exit code N" line
@@ -155,6 +160,15 @@ if [[ $virtio != 0 ]]; then
           -device virtio-rng-device)
 else
   qargs+=(-serial chardev:con0)
+fi
+if [[ -n ${PATINA_NET:-} ]]; then
+  [[ $virtio != 0 && ${PATINA_NET%%:*} == user ]] || { echo "error: PATINA_NET=user[:H-G,...] needs virtio" >&2; exit 2; }
+  netdev=user,id=net0
+  if [[ $PATINA_NET == *:* ]]; then
+    IFS=, read -ra fwds <<<"${PATINA_NET#*:}"
+    for f in "${fwds[@]}"; do netdev+=",hostfwd=tcp:127.0.0.1:${f%-*}-:${f#*-}"; done
+  fi
+  qargs+=(-netdev "$netdev" -device virtio-net-device,netdev=net0)
 fi
 # shellcheck disable=SC2206
 [[ -n ${PATINA_QEMU_EXTRA:-} ]] && qargs+=(${PATINA_QEMU_EXTRA})

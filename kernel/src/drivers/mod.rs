@@ -5,7 +5,8 @@
 //! Boot order (`init`, from `kernel_main` before the self-tests and the
 //! loader): discover and register every virtio transport, then bring up
 //! virtio-rng (seeds `random`), virtio-console (multiport; the
-//! `patina.ctl` port and the `hvc0` console) and virtio-vsock. All device
+//! `patina.ctl` port and the `hvc0` console), virtio-vsock and virtio-net
+//! (registered with `net::device`). All device
 //! setup polls with bounded waits: IRQs are still masked and a device
 //! that never answers must not hang the boot. Interrupts are attached for
 //! use once the scheduler runs.
@@ -57,6 +58,8 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     virtio::rng::init();
     virtio::console::init(cmdline);
     virtio::vsock::init();
+    // virtio-net registers itself with `net::device` for the stack.
+    virtio::net::init();
     let left = virtio::unclaimed();
     if left > 0 {
         crate::kprintln!("[patina] virtio: {} device(s) left undriven", left);

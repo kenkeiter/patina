@@ -8,6 +8,9 @@
 //! * `patina.selftest=vm` — VMA operations and uaccess (`mm::vm::selftest`).
 //! * `patina.selftest=smp` — secondary CPU bring-up, IPIs, per-CPU ticks and
 //!   one-shot deadlines (`arch::smp::selftest`).
+//! * `patina.selftest=net` — virtio-net ARP round trips against QEMU's
+//!   user-mode network, IRQ path included (`drivers::virtio::net::selftest`;
+//!   prints `no device` and exits 0 without a NIC).
 //!
 //! Only kernel parameters are considered (see `cmdline::params`): tokens
 //! before the first `--`, or raw `key=value` tokens after it.
@@ -37,6 +40,7 @@ pub fn run(cmdline: &str) {
                 "alloc" => alloc_test(),
                 "vm" => crate::mm::vm::selftest(),
                 "smp" => crate::arch::smp::selftest(),
+                "net" => crate::drivers::virtio::net::selftest(),
                 other => kprintln!("[patina] selftest: unknown test {:?}", other),
             }
         }

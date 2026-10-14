@@ -18,6 +18,7 @@
 
 pub mod console;
 pub mod mmio;
+pub mod net;
 pub mod queue;
 pub mod rng;
 pub mod vsock;

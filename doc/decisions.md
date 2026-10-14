@@ -1553,3 +1553,35 @@ in a row): hello args/exit 3, ctl stop handler/nohandler/forced, ping, dump,
 signal SIGUSR1, `--timeout`, SIGINT → 143, double SIGINT → 137. A `patina
 run` killed with SIGKILL still leaves QEMU running (own process group, no
 parent-death signal on macOS).
+
+## D69: virtio-net driver: one queue pair, no offloads, `NetDevice` handle
+*2026-10-14 · Phase 4*
+
+`drivers/virtio/net.rs`, against virtio 1.2 §5.1. Features: only
+`VIRTIO_NET_F_MAC` (5) and `VIRTIO_NET_F_STATUS` (16) when offered (plus
+`VERSION_1` on modern transports); no `MRG_RXBUF`, no checksum/GSO/TSO/UFO/ECN
+offloads (the stack computes checksums), no control queue, no multiqueue, so
+there is exactly receiveq1 (0) and transmitq1 (1). The `virtio_net_hdr` is 10
+bytes on a legacy transport and 12 (with `num_buffers`) once `VERSION_1` was
+negotiated; transmit headers are all zero, receive headers are skipped. The
+MAC comes from config bytes 0-5 (without F_MAC a locally administered
+02:xx:… is generated and logged; it is not written back to the device), the
+link state from config offset 6 at init (logged, not tracked). Receive: queue
+size min(queue_max, 128), one posted 2 KiB device-writable descriptor per
+buffer (one 256 KiB `DmaBuf`); `recv` pops used entries until one fits the
+caller's buffer (oversized and runt frames are dropped), re-posts every buffer
+it popped and kicks once per call. Transmit: min(queue size, 32) slots of
+2 KiB; `send` reclaims the used ring, stages header + frame in a free slot as
+one device-readable descriptor and kicks per frame, returning `false` when no
+slot is free (a frame that cannot fit a slot is dropped and reported as
+sent). The transport sits in a `OnceCell` so the interrupt callback only
+counts, reads+acks the interrupt status and signals the driver's `Event` (D59)
+without the ring lock (`SpinLock<Option<Net>>`); the `NetDevice` registered
+with `net::device` is a handle that locks it per call, which also lets the
+self-test drive the rings directly. Every init step is non-blocking (no device
+round trip is awaited). Verified by `patina.selftest=net` (hand-built ARP
+who-has 10.0.2.2 against QEMU slirp, reply `52:55:0a:00:02:02`, then 64
+back-to-back requests with 64 replies, IRQs counted with the timer started) on
+aarch64 hvf/tcg, legacy and modern (`force-legacy=false`, 12-byte header)
+mmio, x86_64 microvm with ACPI (DSDT, level IRQ) and `acpi=off` (cmdline,
+edge), 1 and 2 vCPUs; `scripts/run-qemu.sh` gained `PATINA_NET=user[:H-G,…]`.
