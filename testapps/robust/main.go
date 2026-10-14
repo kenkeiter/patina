@@ -45,11 +45,14 @@ func main() {
 	switch *mode {
 	case "":
 		checkTimers()
+		checkFltinv()
 		checkSignals()
 		checkFds()
 		checkRusage()
 	case "idle":
 		checkIdle()
+	case "restart":
+		checkRestartSyscall()
 	case "reclaim":
 		checkReclaim()
 	case "sigbus":
