@@ -35,6 +35,9 @@ scripts/bench.sh [arch...] [--cpus 1,2] [--runs 3] [--novdso] [-n F] [--only L]
 GO=go1.26.9 scripts/build-testapp.sh <name> <arch> <out>  # build a testapp with another Go toolchain (default GO=go)
 PATINA_NET=user scripts/run-qemu.sh <arch> -- patina.selftest=net   # virtio-net driver self-test (ARP against slirp)
 cargo test --workspace --exclude patina-kernel      # host tests
+scripts/test-vz.sh                                  # Milestone A on Apple VZ (patina run --vmm vz): hello, ctl, stop modes, NAT serve, Phase 2-4 subset
+PATINA_VMM=vz <any of the above aarch64 runs>       # the same kernel + initrd under Apple VZ via scripts/run-vz.sh (D81)
+cli/scripts/vztest.sh [--e2e]                       # in-process VZ driver tests; --e2e = TestVZE2E (hello, ctl, --net user HTTP)
 ```
 
 Environment for `run-qemu.sh` (and `smoke.sh`): `PATINA_MEM` (MiB, default
@@ -166,7 +169,7 @@ booted) · `—` not applicable.
 | Firecracker x86_64 | U | U | U i8042 reset (last in the D64 order) | U | U (MP table / MADT) | U `virtio_mmio.device=` cmdline entries, DSDT, vsock |
 | Cloud Hypervisor aarch64 | U | U PL011 | U PSCI | U | U | U virtio-pci (D70): DTB ECAM bus 0, MSI-X only via the GICv3 ITS (KVM, 64 KiB ITS pages) or GICv2m (MSHV) |
 | Cloud Hypervisor x86_64 | U | U | U ACPI S5 at port 0x600 (D64) | U | U | U virtio-pci (D70): MCFG ECAM 0xe8000000 bus 0, MSI-X, 64-bit BARs above RAM |
-| Apple VZ aarch64 | U (needs the CLI's VZ shim) | U `hvc0` = virtio-console port 0 (driven since Phase 3, verified only on QEMU) | U PSCI | U | U | U DTB discovery, vsock 4242 |
+| Apple VZ aarch64 (`patina run --vmm vz`, macOS 26) | V **vz-hello** (RAM base 0x7000_0000, unaligned initrd, DTB) | V `hvc0` = virtio-console port 0 over virtio-pci INTx, early ring replayed (**vz-hello**, **test-vz**; D80 sacrificial buffer) | V PSCI HVC (**vz-hello**) | V **vz-hello** | V **vz-runtime** (1/2/4 vCPUs), `selftest=smp` (**vz-timing**) | V ECAM DTB discovery, BAR assignment, INTx auto-selected (no ITS/v2m), rng, **vsock 4242** control channel (**test-vz**, **vz-ctl**), virtio-net-pci + VZ NAT DHCP (**test-vz**, **vz-e2e**) |
 
 ## Phase 1 — Hello
 
@@ -339,15 +342,15 @@ Devices and control channel (D58–D64):
 - [x] IRQ routing: GIC SPIs on aarch64; x86_64 I/O APIC (MADT, level/edge from the DSDT) with LAPIC EOI, device IRQs on CPU 0 — **test-ctl** at `PATINA_CPUS=2`, **selftests-p3**
 - [x] virtio-rng feeding a ChaCha20 DRBG (BLAKE2s entropy pool, periodic reseed; `getrandom`, `AT_RANDOM`, `/dev/urandom`) — **rng-seed**, host tests (RFC 8439/7693 vectors)
 - [x] virtio-console multiport: `patina.ctl` found by name through the control-queue handshake, PORT_OPEN tracked; port 0 as `hvc0` console with an early ring flushed when the device comes up — **test-ctl**, **hvc0**
-- [~] virtio-vsock listener on port 4242 (D62): written to virtio 1.2 §5.10, builds on both arches, **never run** (no vhost-vsock on this host)
+- [x] virtio-vsock listener on port 4242 (D62): first run on Apple VZ (Phase 5): CONNECT handshake, `ready`/`exit`/`log`/`pong` events, stop/signal/dump/time ops, reconnects — **test-vz**, **vz-ctl**, **vz-e2e** (no driver bug surfaced; the ctl misses on fast programs were the CLI's 100 ms dial, D82). Firecracker/Cloud Hypervisor's vsock-over-Unix-socket path remains unverified
 - [x] Control channel (D63): one kernel thread; `ping`→`pong(uptime_ms)`, `signal` (SIGTERM INT HUP USR1 USR2 QUIT), `stop` (SIGTERM + grace → forced 137), `time` (steps `CLOCK_REALTIME`, VFS timestamps follow), `dump` (SIGQUIT); events `ready` (go version from `.go.buildinfo`, cpus, mem_mb), `exit` (code, signal, forced; flushed before poweroff), `panic`, `log` (ENOSYS); pending buffer until a host connects; one connection at a time — **test-ctl**
 - [x] x86_64 poweroff order isa-debug-exit → ACPI S5 (hardware-reduced sleep control register, else PM1a) → i8042 reset (D64) — **poweroff-order** (QEMU paths); Cloud Hypervisor S5 at port 0x600 and Firecracker i8042 untested
-- [~] Firecracker (cmdline discovery, 16550 MMIO, i8042), Cloud Hypervisor (virtio-pci: Phase 4), Apple VZ (`hvc0`, vsock): code written to the spec, no host to run them
+- [~] Firecracker (cmdline discovery, 16550 MMIO, i8042), Cloud Hypervisor (virtio-pci: Phase 4): code written to the spec, no host to run them. Apple VZ (`hvc0`, vsock, virtio-pci INTx): verified in Phase 5 (**test-vz**, D80–D82)
 
 CLI and `os` tests:
 
 - [x] `patina run` / `patina ctl` end-to-end on QEMU, both arches (D66: chardev `wait=on`, exit-code precedence timeout 124 → `exit` event → `panic` 255 → sentinel → isa-debug-exit → killed 137) — **test-cli**
-- [~] `patina run` on Firecracker, Cloud Hypervisor and Apple VZ: CLI drivers exist (tested against fakes), the kernel side (vsock, hvc0, cmdline discovery, S5/i8042 poweroff) is unverified on this host
+- [~] `patina run` on Firecracker and Cloud Hypervisor: CLI drivers exist (tested against fakes), the kernel side (vsock over a Unix socket, cmdline discovery, S5/i8042 poweroff) is unverified on this host. Apple VZ: verified (**test-vz**, **vz-e2e**)
 - [x] `os` package tests pass with a 14-entry skip list (D65): kernel additions for it were `patina.cwd=<dir>` (start directory), `/proc/sys/fs/pipe-max-size`, `uname` nodename = hostname, and `mkinitrd.sh` directory mappings — **test-os**
 
 ## Phase 4 — Net
@@ -390,7 +393,8 @@ CLI and Milestone A:
 
 - [x] CLI `build` / `run` / `ctl` with `--net user --publish` on QEMU, both arches — **test-net**, **test-cli** (Phase 3)
 - [x] **Milestone A on QEMU**, both arches: `net/http` hello served to host `curl` through `patina run --net user --publish`, concurrent requests and a 4 MiB body, `patina ctl stop` → clean `{"ev":"exit","code":0}` (signal.Notify variant) and 143 + `SIGTERM` (no-handler variant), `-selftest` over loopback with DNS through slirp, DHCP and the q35/PCI variant — **test-net**
-- [ ] Milestone A on Firecracker, Cloud Hypervisor (both arches) and Apple VZ: the CLI drivers exist (Phase 3, tested against fakes; the VZ driver is being added separately) and the kernel paths are written to doc/cli-contract.md (virtio-mmio + vsock on Firecracker; virtio-pci/MSI-X + vsock on Cloud Hypervisor; DTB + `hvc0` + vsock on VZ), but none of them has booted here: no KVM on this host, VZ needs the CLI shim. Specifically unverified: vsock control channel (D62), Cloud Hypervisor's ITS with 64 KiB table pages and 64-bit BARs, Firecracker's `virtio_mmio.device=` net device, tap DHCP against a real server
+- [x] **Milestone A on Apple VZ** (Phase 5, D80–D82): `net/http` hello served to host `curl` at the guest's VZ NAT address (DHCP, no port forwarding), concurrent requests, 4 MiB body, DNS through the NAT resolver, `patina ctl stop` → clean `{"ev":"exit","code":0}` and 143 + `SIGTERM`, vsock control channel — **test-vz**, **vz-e2e** (see Phase 5)
+- [ ] Milestone A on Firecracker and Cloud Hypervisor (both arches): the CLI drivers exist (Phase 3, tested against fakes) and the kernel paths are written to doc/cli-contract.md (virtio-mmio + vsock on Firecracker; virtio-pci/MSI-X + vsock on Cloud Hypervisor), but neither has booted here (no KVM on this host). Specifically unverified: vsock over the VMM's Unix socket (the driver itself now runs on VZ), Cloud Hypervisor's ITS with 64 KiB table pages and 64-bit BARs, Firecracker's `virtio_mmio.device=` net device, tap DHCP against a real server
 
 ## Phase 5 — Hardening
 
@@ -422,6 +426,31 @@ back) and `clone3` (syscall tests that ask for a namespace or pidfd; Go
 falls back to `clone`, which cannot create processes, D57). The 4-vCPU
 column of the other packages was run before the final `go.mod` harness
 change (time then had 179 passed, 5 skipped).
+
+### Apple Virtualization.framework (`patina run --vmm vz`)
+
+macOS 26 on Apple Silicon, the ad-hoc signed CLI (`cli/scripts/build.sh`),
+release kernel, 2 vCPUs / 512 MiB unless noted. Decisions D80 (the VZ
+console start quirk, `VIRTIO_NET_F_MTU`), D81 (`PATINA_VMM=vz`,
+`patina image pack`, timing check), D82 (NAT networking, guest address,
+gateway ARP, NIC tx backpressure, fast control attach). The full VZ
+device layout is in doc/cli-contract.md.
+
+| Name | Command | Observed |
+|---|---|---|
+| **vz-hello** | `patina run out/vz/hello.patina --vmm vz -v -- 3 a b` (`patina build --target vz-aarch64`) | boot log on hvc0 from `[patina] early: final page tables live` on (RAM 0x7000_0000, initrd right after the image, DTB at 0x7040_0000), `gic: v3 dist @ 0x10000000, redist @ 0x10010000`, `virtio: pci 0000:00:05.0 irq 69 device-id 3 (console) [ecam dtb, modern virtio-pci, vendor 0x1af4, apple host, intx irq]` (+ 06.0 vsock irq 70, 07.0 rng irq 71, 01.0 net irq 65 with `--net user`), `virtio-console: single port, ports: 0(console)`, `console: hvc0 (virtio-console port 0)`, `virtio-vsock: guest cid 3`, `ctl: virtio-vsock port 4242`, `random: seeded from virtio-rng (64 bytes)`, `patina: control channel attached (vz vsock port 4242)`, `control: ready: go1.27.1, 2 cpus, 512 MiB`, `PASS hello (exit 3)`, `control: exit code 3`, `[patina] exit code 3`, `vz: guest stopped the VM`; `patina run` exit 3. 40/40 runs attach the channel and deliver `ready` + `exit`, ~125–185 ms wall; 200 + 40 consecutive runs with 0 silent boots after D80 (before: ~15% printed nothing) |
+| **vz-ctl** | `PATINA_VMM=vz scripts/test-ctl.sh aarch64` | 8/8 (ready-ping, stop-handler, stop-nohandler, stop-forced, dump, usr1-time, hvc0 — `[patina] ctl: virtio-vsock port 4242` —, panic → 255); the early `log` event is checked on serial only (a late proxy client gets just `ready`) |
+| **test-vz** | `scripts/test-vz.sh` | 12/12 PASS: hello-exit (3), console (banner + sentinel), ctl (ping/pong, SIGUSR1, `time`, fixed-epoch time op → `9466848xx`), ctl-dump (goroutine dump, 2), stop-handler → 0, stop-nohandler → 143 + `"signal":"SIGTERM"`, stop-forced (`-mode ignore`, `--grace 1s`) → 137 `forced:true`, net-serve (`--net user`: `[patina] net: dhcp lease 192.168.64.182/24 via 192.168.64.1, dns 192.168.64.1`, `patina: guest address 192.168.64.182 (gateway 192.168.64.1)`, GET / = `hello from patina`, 20 concurrent GETs, `/big` 4 MiB sha256, `ctl stop` → `{"ev":"exit","code":0,"forced":false}`, run exit 0), threads, signals-self, signals-nohandler-self, sockets at 2 vCPUs |
+| **vz-e2e** | `PATINA_NET_EXTERNAL=1 cli/scripts/vztest.sh --e2e` (`TestVZE2E`, cli/vz_integration_test.go) | hello-exit ×3 (rc 3, attach, ready, exit event), stop-handler/nohandler/forced, ping, net-serve (address line + `state.json` `net`, 5 GETs with #2–4 < 500 ms, 20 concurrent, `/big` sha256 ×2: 4 MiB in 13–21 ms, ~200–310 MB/s, first byte 0.3–1.5 ms; GET / connect 2.6–7 ms), net-nohandler (143), net-selftest (`-dns example.com` → `ok dns example.com -> …` via 192.168.64.1); ping RTT from the host 0.3–1.3 ms (INTx delivery) |
+| **vz-runtime** | `PATINA_VMM=vz PATINA_CPUS_LIST="1 2 4" scripts/test-runtime.sh aarch64` | 33/33 rows PASS (hello 0/3, threads, smpstress, fdtest, signals handler/nohandler, sigstress, sigstress-procs2/-crash/-breakpoint, pproftest × 1/2/4 vCPUs), `test-runtime: all passed`; `PATINA_VMM=vz PATINA_CPUS=N scripts/test-hello.sh --app fileio\|sockets\|unixsock aarch64` 9/9 at 1/2/4 vCPUs. smpstress on VZ: 8×1250×Sleep(100µs) 1.55–1.60 s, 200×Sleep(500µs) 249–264 ms (QEMU hvf: ~1.5 s / 248 ms) |
+| **vz-gopkg** | `PATINA_VMM=vz scripts/test-gopkg.sh os net --arch aarch64 --cpus 2` (also 1 and 4) | `os aarch64 (cpus=2): 248 passed, 33 skipped (10 by our list), 0 failed`, `net aarch64 (cpus=2): 254 passed, 55 skipped (1 by our list), 0 failed` — the QEMU counts — with the net run over a real VZ NAT lease (`virtio-net: mac …, queues rx 128 / tx 32, link up, mtu 1500 (pci 0000:00:01.0, hdr 12 B)`) |
+| **vz-timing** | `testapps/sleeper` and `patina.selftest=smp\|timer` on VZ vs QEMU hvf at 1/2/4 vCPUs, 3 runs each (D81) | no VZ anomaly: kernel to `main` 3–4 ms, `Sleep(1s)` 1000.3–1001.0 ms everywhere, secondaries up in 75–95 µs (2 vCPUs) / 236–257 µs (4), +2 ms deadline at 2003–2005 µs, `timer: ok (5 ticks in 51–52 ms)`; WFI-idle wake from its own timer is ~20–25% late below 2 ms on both VMMs (host-side); at 1 vCPU a sleeper competing with a spinner wakes up to a quantum late on both (scheduler, noted) |
+
+Not verified on VZ: console rx (VZ attaches no guest input), `--cpus` > 4
+under the scheduler, memory sizes other than 512 MiB / 1 GiB, more than
+one NAT VM concurrently (the macOS NAT bridge delays the first connection
+after it is created). The stray 1-byte segment smoltcp sends after every
+accepted handshake (D82) is unexplained.
 
 - [x] Milestone B harness `scripts/test-gopkg.sh` (D74): per-package defaults (RAM, timeouts, extra files), skip lists `testapps/skiplist/<pkg>.txt`, summary/failure rules of D65; `test-os.sh`/`test-gonet.sh` are wrappers — **test-gopkg** (reproduced test-os-p4 248/0 and test-gonet 254/0)
 - [x] **Milestone B on aarch64** (QEMU, 1 and 4 vCPUs): the design §13 packages (`runtime`, `os`, `net`, `os/signal`, `time`, `sync`, `syscall`) plus `io`, `bufio`, `context`, `net/http`, `runtime/pprof`, `os/user`, 0 failed; 36 listed tests, all "needs os/exec" or "GODEBUG re-exec" — **test-gopkg**

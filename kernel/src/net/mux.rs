@@ -313,10 +313,10 @@ impl Device for Mux {
         // stalled for 1 s in about half the runs). Without a token smoltcp
         // keeps the data; the driver's transmit-completion interrupt wakes
         // the net task to poll again.
-        if let Some(n) = self.tx.nic.as_mut() {
-            if !n.can_send() {
-                return None;
-            }
+        if let Some(n) = self.tx.nic.as_mut()
+            && !n.can_send()
+        {
+            return None;
         }
         Some(TxToken(&mut self.tx))
     }

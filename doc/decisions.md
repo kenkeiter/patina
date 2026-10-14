@@ -2518,3 +2518,65 @@ lands at ~1.2 ms because the netpoller rounds up to `epoll_pwait(1 ms)`.
 Noted for the scheduler (not VZ-specific, identical on QEMU): at 1 vCPU a
 thread woken from `nanosleep` while a CPU-bound thread runs is late by up
 to a quantum (500 µs → 1.1 ms avg, 12 ms worst; 10 ms → 16.5 ms avg).
+
+## D82: Milestone A on Apple VZ: NAT networking, guest-address reporting, gateway ARP, no NIC tx drops, fast control attach
+*2026-10-14 · Phase 5 (Milestone A on VZ)*
+
+`--net user` on VZ attaches virtio-net (00:01.0, modern 0x1041) on
+`VZNATNetworkDeviceAttachment` with `ip=dhcp`; VZ's bootpd leases
+192.168.64.0/24 with gateway and DNS at .1 (DISCOVER at ~80 ms, OFFER
+~200–500 ms later, ACK at once), and INTx (SPI 32 + slot, level) delivers
+the NIC's interrupts (ping RTT 0.3–1.3 ms; frames are answered in the
+millisecond they arrive, no 1 s net-task poll stalls). VZ has no port
+forwarding, but the host reaches the guest at its leased address, so the
+CLI must learn it: the kernel now emits the lease line as a control-channel
+`log` event at level `info` (`{"ev":"log","level":"info","msg":"net: dhcp
+lease A/P via G, dns D… (N ms)"}`, the console line minus `[patina] `; a
+changed lease says `net: dhcp lease changed: …`; `ctl::log_info` beside
+`log_warn`, no new event type), possibly before `ready`. `patina run`
+prints `patina: guest address A (gateway G)` on stderr once per new
+address (from the event, else parsed from the `[patina] net: dhcp lease`
+console line, `cli/internal/run/lease.go`), records
+`"net":{"addr","prefix","gateway","dns"}` in `state.json`, and `patina ps`
+gained an `ADDR` column.
+
+Two stack bugs came out of measuring from the host. (1) The macOS NAT host
+drops the packet that triggers its own ARP resolution of the guest, so
+every first connection paid a 1 s SYN retransmit (the guest's ARP reply
+went out in the same millisecond): after the first lease the kernel sends
+one ARP request for the gateway (`MuxTx::arp_request`; the target of a
+request creates an entry for the sender, RFC 826 / BSD `in_arpinput`), and
+the first ping is now 1.3 ms. (2) `Mux::transmit` handed smoltcp a token
+while the virtio tx ring was full, `route` dropped the frame (counted in
+`nic_tx_drops`) and TCP waited smoltcp's 1 s minimum RTO — a 4 MiB `/big`
+took 1.02 s instead of ~15 ms in about half the runs. `transmit` now
+returns no token while `!nic.can_send()` (the contract net/device.rs always
+stated); the transmit-completion interrupt wakes the net task. Both apply
+to QEMU too (`test-net.sh` 14/14 unchanged).
+
+CLI: the control hub dialled the VZ vsock port every 100 ms, so a program
+that exits within ~100 ms of boot (hello) powered off before the host
+connected and its `ready`/`exit` events were never delivered (the exit
+code still came from the sentinel). It now retries every 5 ms until the
+first connection (a refused connect costs ~1 ms on VZ), 100 ms for
+reconnects; hello attaches 40/40. After the guest stops, `run` waited a
+fixed 300 ms for an exit event and the VZ driver drained the console for a
+fixed 250 ms; now `Hub.Quiesce` returns as soon as the live connection's
+buffered events are delivered (at once if none attached; 300 ms cap) and
+the drain stops once the console pipe has been quiet for 20 ms after the
+stop event (250 ms cap). hello's wall time fell from ~480 ms to ~185 ms.
+The exit-code precedence (D66) is unchanged.
+
+Verified on this Mac (macOS 26): `cli/scripts/vztest.sh --e2e`
+(`TestVZE2E`: hello ×3 with attach + ready + exit events, stop
+handler/nohandler/forced, ping, `--net user` GET / (connect 2.6–7 ms,
+first byte 3.5–16 ms), 20 concurrent GETs, `/big` 4 MiB sha256 in 13–21 ms
+(~200–310 MB/s), stop → 0, `-nohandler` → 143, `-selftest -dns example.com`
+through 192.168.64.1), `scripts/test-vz.sh`, `test-net.sh aarch64 x86_64`
+14/14, QEMU CLI e2e 20/20, `go test ./...`. Known host-side effect: right
+after macOS creates the NAT bridge (no other NAT VM running) the first
+connection can be delayed by seconds while the host ARPs unrelated
+addresses (the guest answers in < 1 ms); the e2e test treats the first
+request as informational. Also noted: every accepted TCP connection sends
+one 1-byte segment right after the handshake (smoltcp keep-alive
+handling, harmless, not fixed).
