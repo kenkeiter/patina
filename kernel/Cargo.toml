@@ -13,7 +13,6 @@ bench = false
 
 [dependencies]
 bitflags = "2.9"
-buddy_system_allocator = { version = "0.13", default-features = false }
 patina-abi = { path = "../crates/abi" }
 patina-cmdline = { path = "../crates/cmdline" }
 patina-cpio = { path = "../crates/cpio" }

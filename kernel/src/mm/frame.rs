@@ -141,19 +141,24 @@ impl BuddyAllocator {
         self.push(pa, order);
     }
 
-    /// Add `[start, end)` (page aligned) as free memory, greedily in maximal
-    /// naturally aligned blocks.
-    fn add_range(&mut self, start: usize, end: usize) {
+    /// Free `[start, end)` (page aligned, allocated) greedily in maximal
+    /// naturally aligned blocks; returns the number of frames.
+    fn free_range(&mut self, start: usize, end: usize) -> usize {
         let mut cur = start;
         while cur < end {
             let mut order = (cur >> PAGE_SHIFT).trailing_zeros().min(MAX_ORDER as u32) as usize;
             while order > 0 && cur + (PAGE_SIZE << order) > end {
                 order -= 1;
             }
-            self.total_frames += 1 << order;
             self.free(cur, order);
             cur += PAGE_SIZE << order;
         }
+        (end - start) >> PAGE_SHIFT
+    }
+
+    /// Add `[start, end)` (page aligned) as free memory.
+    fn add_range(&mut self, start: usize, end: usize) {
+        self.total_frames += self.free_range(start, end);
     }
 }
 
@@ -220,6 +225,29 @@ pub fn free_frames(pa: PhysAddr, order: usize) {
     let mut a = FRAMES.lock();
     assert!(a.in_range(pa.0), "free_frames: address outside managed RAM");
     a.free(pa.0, order);
+}
+
+/// Allocate `npages` contiguous frames whose start is aligned to
+/// `PAGE_SIZE << align_order`: a block of the smallest order that holds
+/// both, with the frames past `npages` handed straight back. Release with
+/// [`free_pages`] (any page-aligned sub-range may be released on its own).
+pub fn alloc_pages(npages: usize, align_order: usize) -> Option<PhysAddr> {
+    let order = order_for(npages.max(1) * PAGE_SIZE).max(align_order);
+    let mut a = FRAMES.lock();
+    let pa = a.alloc(order)?;
+    a.free_range(pa.0 + npages * PAGE_SIZE, pa.0 + (PAGE_SIZE << order));
+    Some(pa)
+}
+
+/// Release `npages` frames at `pa` obtained from [`alloc_pages`] (or any
+/// page-aligned run of frames the caller owns).
+pub fn free_pages(pa: PhysAddr, npages: usize) {
+    let mut a = FRAMES.lock();
+    assert!(
+        pa.is_page_aligned() && a.in_range(pa.0) && a.in_range(pa.0 + (npages.max(1) - 1) * PAGE_SIZE),
+        "free_pages: bad range"
+    );
+    a.free_range(pa.0, pa.0 + npages * PAGE_SIZE);
 }
 
 /// `(free_frames, total_frames)` managed by the allocator.

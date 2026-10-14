@@ -7,8 +7,8 @@ package main
 // everything is released the kernel's memory use must come back down.
 //
 // With -limits-strict the final MemFree must be within limitsSlackKB of the
-// baseline; without it the delta is only reported (D87: heap frames are not
-// yet returned to the frame allocator).
+// baseline (D87: the kernel heap returns freed frames); without it the
+// delta is only reported. scripts/test-sysfuzz.sh always passes it.
 
 import (
 	"bufio"
@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -34,7 +35,11 @@ func limFail(format string, args ...any) {
 	os.Exit(1)
 }
 
+// limMemFreeKB reads MemFree after Go returned what it can to the OS:
+// the check is about the kernel's memory, not what Go keeps resident
+// (the fd slices above reach several MiB).
 func limMemFreeKB() int {
+	debug.FreeOSMemory()
 	f, err := os.Open("/proc/meminfo")
 	if err != nil {
 		limFail("open /proc/meminfo: %v", err)

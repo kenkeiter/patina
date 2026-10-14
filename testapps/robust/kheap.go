@@ -25,7 +25,7 @@ func (m kheapMem) String() string {
 const (
 	kheapPipes   = 50000
 	kheapRings   = 50 // every 50th pipe gets a byte: 1000 64 KiB rings
-	kheapUnix    = 8000
+	kheapUnix    = 8500
 	kheapUDP     = 2000
 	kheapTCP     = 1000
 	kheapEpolls  = 10000
