@@ -33,6 +33,10 @@ scripts/test-gopkg.sh <pkg>... [--arch aarch64|x86_64|both] [--cpus N] [--run RE
                                                     # x86_64 (TCG) is slow: raise PATINA_TIMEOUT / GOPKG_TEST_TIMEOUT when the host is busy
 scripts/bench.sh [arch...] [--cpus 1,2] [--runs 3] [--novdso] [-n F] [--only L]
                                                     # Phase 5 per-syscall benchmarks (testapps/bench): table of medians per arch (D79)
+scripts/test-robust.sh [aarch64] [x86_64]           # Phase 5 robustness (testapps/robust): tickless idle, sub-tick timers, fault -> signal,
+                                                    # stack/page-table reclaim, OOM, signal/fd edge cases; 12 cases per arch (D77, D78, D80)
+scripts/run-qemu.sh <arch> <cpio> -- patina.stats=1 -- <args>
+                                                    # per-CPU timer IRQs / ticks / idle waits / switches + memory line at exit
 GO=go1.26.9 scripts/build-testapp.sh <name> <arch> <out>  # build a testapp with another Go toolchain (default GO=go)
 PATINA_NET=user scripts/run-qemu.sh <arch> -- patina.selftest=net   # virtio-net driver self-test (ARP against slirp)
 cargo test --workspace --exclude patina-kernel      # host tests
@@ -250,8 +254,8 @@ Runtime and scheduling:
 - [x] `sched_getaffinity` reports all vCPUs → `GOMAXPROCS` = `NumCPU` = vCPUs — **test-smp**, **threads-smp** (`GOMAXPROCS=4 NumCPU=4`)
 - [x] Per-thread CPU time (`Thread::cpu_time_ns`, `CLOCK_THREAD_CPUTIME_ID`, the process CPU clock) — **pproftest** (spinning thread +198.9–200.0 ms, sleeping thread +3.6–104 µs over 200 ms)
 - [x] x86_64 SMP memory safety: TLB shootdown IPIs with deferred frame reclaim (D52, `mm/tlb.rs`) — **tlbstress** (reproduced the stale-TLB free-list corruption before the fix, 8/8 after), **test-runtime**; aarch64 user-page invalidation broadcasts (`tlbi vale1is`) and needs no shootdown. Limits: a stopped CPU never advances its generation (pending batches stay pending after exit), remote flushes complete asynchronously (mprotect/munmap return before other CPUs flush)
-- [x] More than 4 vCPUs under the scheduler: Go's `runtime` tests at 8 vCPUs, 0 failed (aarch64 3 identical runs, x86_64 one run; also `sync`, `os/signal`, `runtime/pprof` at 8 on aarch64) — **test-gopkg-8cpu** (Phase 5)
-- [~] Tickless idle — not implemented: idle CPUs keep the 100 Hz tick
+- [x] More than 4 vCPUs under the scheduler: Go's `runtime` tests at 8 vCPUs, 0 failed (aarch64 3 identical runs, x86_64 one run; also `sync`, `os/signal`, `runtime/pprof` at 8 on aarch64) — **test-gopkg-8cpu** (Phase 5); also **robust-8cpu** (`test-smp.sh --cpus 8` smpstress / threads / sigstress on both arches, `test-signals.sh aarch64` and `test-robust.sh aarch64` at `PATINA_CPUS=8`)
+- [x] Tickless idle: idle CPUs stop the periodic tick and arm only the deadlines they own (D77) — **test-robust** `idle` (0–42 timer IRQs per CPU over a ~7 s mostly idle run at 4 and 8 vCPUs, ~700 with a 100 Hz tick)
 
 Signals (D42–D45):
 
@@ -259,20 +263,21 @@ Signals (D42–D45):
 - [x] `kill` (process) and `tgkill`/`tkill` (thread); Go's `SIGURG` async preemption — **test-signals**, **threads-p2**
 - [x] Linux `rt_sigframe` + `rt_sigreturn` on x86_64 (XSAVE fpstate) and aarch64 (`fpsimd_context`, kernel-mapped `rt_sigreturn` trampoline since Go sets no `SA_RESTORER`) — **test-signals** (1528 `rt_sigreturn` round trips, Go reading `siginfo`/`ucontext` for its crash line)
 - [x] Go's `SA_ONSTACK` handlers on its per-M `sigaltstack` — **test-signals**
-- [~] `sigaltstack` edge cases: `EPERM` while on the stack, `SS_AUTODISARM`, `ENOMEM` — implemented, untested
+- [~] `sigaltstack` edge cases: `ENOMEM` below `MINSIGSTKSZ`, `EINVAL` for bad flags, `SS_AUTODISARM` accepted and read back — **test-robust** `default`; `EPERM` while on the stack and the auto-disarm on delivery need a handler of our own (not reachable from Go): untested
 - [x] `SIG_DFL` termination: `[patina] exit signal NAME`, exit 128+signo — **test-signals** (`SIGTERM`, 143)
-- [~] `SIGKILL` (always terminates, 137) — implemented, untested
+- [x] `SIGKILL` (always terminates, 137) — **test-robust** `sigkill` (`kill(getpid(), SIGKILL)` → `[patina] exit signal SIGKILL`, 137) and `oomfault`
 - [x] Fault → `SIGSEGV` `SEGV_MAPERR` (nil dereference, both arches) — **test-signals** (recovered ×200; `-crash`: `code=0x1 addr=0x0`, exit 2)
 - [x] x86 `#DE` → `SIGFPE` `FPE_INTDIV` — **test-signals** (x86_64; arm64 does not trap, Go checks explicitly)
 - [x] `BRK` / `int3` → `SIGTRAP` — **test-signals** (`-breakpoint`: `SIGTRAP: trace trap`, exit 2 on both arches; D43)
-- [~] `SIGBUS` (`BUS_ADRALN`), `SIGILL` (`#UD` / undefined instruction), `#GP` → `SIGSEGV` `SI_KERNEL`, `SEGV_ACCERR`, `FPE_FLTINV` — implemented, untested
+- [x] `SIGBUS` `BUS_ADRALN` (aarch64 unaligned `LDAXR` crossing a 16-byte granule: `[signal SIGBUS: bus error code=0x1 addr=<the address> pc=…]`; HVF tolerates unaligned exclusives inside a granule), `SIGILL` (`UDF #0` → `sigcode=1`, `UD2` → `sigcode=2`), x86 `#GP` → `SIGSEGV` `SI_KERNEL` (non-canonical load: `code=0x80 addr=0x0`), `SEGV_ACCERR` (store to `PROT_READ`: `code=0x2`, `addr` = the address) — **test-robust** `sigbus`, `sigill`, `gp`, `accerr` (decoding matches arm64 `fault_info` / x86 `traps.c`)
+- [~] `FPE_FLTINV`: QEMU TCG raises no `#XM` for unmasked SSE exceptions (robust prints `skip`), arm64 FP traps are not implemented by the hardware here — unverifiable on this host
 - [x] Syscall restart: `ERESTARTSYS` under `SA_RESTART` (blocking pipe read) — **test-signals** (strace `read = -errno 512` ×7, then success)
 - [x] `nanosleep` → `EINTR` with `rem` when a handler runs (`ERESTART_RESTARTBLOCK`) — **test-signals** (`nanosleep interrupted after 81ms, rem 4.92s`)
-- [~] `restart_syscall` continuation when no handler runs (ignored/`SIG_DFL`-ignore signal during a sleep) — implemented, untested
-- [~] `rt_sigsuspend`, x86 `pause`, `rt_sigpending` — implemented, untested
-- [~] `epoll_pwait` `EINTR`; the temporary-sigmask (`saved_mask`) path of `epoll_pwait`/`ppoll` — implemented, untested
-- [~] `SIGPIPE` to the writer on `EPIPE` — implemented; **fdtest** `ok EPIPE` exercises the `EPIPE` return but does not check the signal
-- [~] x86_64 FXSAVE-only frames (CPU without XSAVE) — implemented, untested (**selftest-smp-x86** ran `-xsave` but no signals)
+- [x] `restart_syscall` continuation when no handler runs — **test-robust** `restart` (a 200 ms `nanosleep` woken by SIGUSR1 whose disposition became `SIG_IGN` before delivery: strace `nanosleep = -errno 516`, `restart_syscall = 0`, 205–208 ms in total; an ignored SIGUSR1 is dropped at send, as Linux)
+- [x] `rt_sigsuspend` (EINTR after the handler), x86 `pause`, `rt_sigpending` (a blocked timer signal shows up) — **test-robust** `default`
+- [x] `epoll_pwait` `EINTR` (not restarted under Go's `SA_RESTART`) and its temporary sigmask (a blocked SIGUSR2 waits out the timeout, delivered afterwards) — **test-robust** `default`; the `ppoll` sigmask path shares `set_temp_mask` but is not exercised
+- [x] `SIGPIPE` to the writer on `EPIPE` (pipe on fd ≥ 3, `signal.Notify(SIGPIPE)` receives it) and `SIG_DFL` SIGPIPE → 141 — **test-robust** `default`, `sigpipe`
+- [x] x86_64 FXSAVE-only frames — **fxsave-only**: `test-signals.sh x86_64` and `test-smp.sh --app smpstress --cpus 2 x86_64` with `PATINA_QEMU_EXTRA="-cpu max,-xsave"` and with `-cpu Nehalem` (no XSAVE/AVX/FSGSBASE/SMEP/SMAP: `fp state fxsave (512 bytes)`), robust `default`/`gp`/`sigill` on Nehalem; nothing needed fixing
 - [ ] `rt_sigtimedwait`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo` — `ENOSYS` by design (D42)
 
 File descriptors (D46; design §8 had these in Phase 3, the netpoller needs them now):
@@ -283,8 +288,8 @@ File descriptors (D46; design §8 had these in Phase 3, the netpoller needs them
 - [x] epoll: `epoll_create1`/`epoll_ctl`/`epoll_pwait`, LT, ET, `ONESHOT` + `MOD`, timeouts, HUP/ERR, auto-removal on close; Go's netpoller — **fdtest**, **threads-p2**
 - [x] `ppoll` — **fdtest**
 - [x] `fstat` on pipes (`S_IFIFO`) — **fdtest**
-- [~] `readv`/`writev`, `pread64`/`pwrite64`/`lseek` (`ESPIPE`), `epoll_pwait2`, `FIONBIO`/`FIONREAD`/`FIOCLEX`/`FIONCLEX` — implemented, untested
-- [~] x86_64-only entry points `poll`, `epoll_wait`, `epoll_create`, `dup2`, `pipe`, `eventfd` — implemented, not exercised by any test
+- [x] `readv`/`writev`, `pread64`/`pwrite64`/`lseek` (`ESPIPE` on pipes; offsets on a file), `epoll_pwait2`, `FIONBIO`/`FIONREAD`/`FIOCLEX`/`FIONCLEX` — **test-robust** `default`
+- [x] x86_64-only entry points `poll`, `epoll_wait`, `epoll_create` (+ `EINVAL` for 0), `dup2` (incl. onto itself), `pipe`, `eventfd` — **test-robust** `default` (x86_64)
 
 SMP and timers (arch layer, D47/D48):
 
@@ -295,7 +300,7 @@ SMP and timers (arch layer, D47/D48):
 - [x] Sub-tick deadlines: the sleep list arms the per-CPU one-shot timer (`sched::arm_deadline`); sleeps and timeouts are never early (D50) — **sleep-latency** (200 × `Sleep(500µs)` 2.001 s → 248 ms), **test-smp**
 - [x] `setitimer`/`getitimer`, `timer_create`/`settime`/`gettime`/`getoverrun`/`delete` (`SIGEV_THREAD_ID`, `SI_TIMER` / `SI_KERNEL`), CPU-clock timers (D51) — **pproftest** (SIGALRM after 21–31 ms, 10–17 SIGUSR1 per 100 ms from a 5 ms timer, Go's per-M `timer_create(0x3, …)` in strace)
 - [x] pprof CPU profiles (Go's per-M `CLOCK_THREAD_CPUTIME_ID` SIGPROF timers and `ITIMER_PROF`) — **pproftest** (94–200 samples per run at 100 Hz)
-- [~] `alarm`, `getrusage`, `times`, `clock_nanosleep` on CPU clocks (`EINVAL`/`ENOTSUP`), `TIMER_ABSTIME`, `ITIMER_VIRTUAL`, overrun accounting under load — implemented, untested
+- [x] `alarm` (x86_64; Linux rounding), `getrusage` (self and thread grow by the spin), `times`, `clock_nanosleep` `TIMER_ABSTIME` on `MONOTONIC` and `REALTIME` (never early, sub-tick on average), on the thread CPU clock (`EINVAL`), `ITIMER_VIRTUAL`, sub-tick `timer_settime`/`setitimer(ITIMER_REAL)` (D77), overrun accounting (fixed in D77: it read ≤ 1) — **test-robust** `default`; the process-CPU-clock `ENOTSUP` is untested
 - [x] `getrandom`/`AT_RANDOM` seeded from `cpu::hw_random` (RNDR / RDSEED / RDRAND), logged as `[patina] random: seeded from …` (D50) — every **test-smp** log shows the line; HVF on this host has no RNDR, only TCG `-cpu max` does. Since Phase 3 the generator is a ChaCha20 DRBG seeded from virtio-rng as well (D60, **rng-seed**)
 - [~] x2APIC IPIs, APIC ids > 254, > 8 CPUs, PSCI SMC on real firmware — implemented, untested
 - [~] Firecracker x86_64 + aarch64, KVM / Cloud Hypervisor: SMP and scheduler code written to the spec, never booted (needs a KVM host)
@@ -546,3 +551,29 @@ by-design ones).
 
 - [x] Two-version matrix (go1.26.9, go1.27.1): same ENOSYS set, no behavioural difference — **gomatrix-1.26**, **gomatrix-os-1.26**
 - [x] Go 1.27.1 syscall numbers (`runtime/sys_linux_{amd64,arm64}.s`, `internal/runtime/syscall/linux`, `internal/syscall/unix`, `syscall`, `os`, `net`, `internal/poll`, `crypto/rand`, `time`) diffed against `kernel/src/syscall/mod.rs`: nothing on a normal path is missing; the unimplemented ones are listed in D79
+
+### Robustness
+
+Decisions D77 (tickless idle, sub-tick wall timers, overrun fix), D78
+(commit accounting, OOM), D80 (kernel stack and page-table reclaim).
+`scripts/test-robust.sh [aarch64] [x86_64]` runs testapps/robust per arch
+(logs in `out/test/robust/`; vCPUs from `PATINA_CPUS`, `idle` uses at
+least 4, `reclaim-4cpu` 4, `oom`/`oomfault` `PATINA_MEM=256`).
+
+| Name | Command | Observed |
+|---|---|---|
+| **test-robust** | `scripts/test-robust.sh aarch64 x86_64` (also `PATINA_CPUS=4`) | 24/24 PASS (12 cases per arch: default, idle, restart, reclaim, reclaim-4cpu, sigill, accerr, sigkill, sigpipe, oom, oomfault, sigbus on aarch64 / gp on x86_64). Sub-tick timers (100 sequential 500 µs expiries, never early): `timer_settime` 63.5 ms (aarch64) / 138–173 ms (x86_64 TCG), `CLOCK_REALTIME` absolute timer and `setitimer(ITIMER_REAL)` the same; abs `clock_nanosleep` 130–160 µs late on aarch64, ~1.2 ms on TCG; `timer_getoverrun 19` after 40 ms blocked at 2 ms (was 1); `ITIMER_VIRTUAL` after 24–40 ms of CPU; `time.Sleep(1s)` 1.0004–1.004 s on idle 4 vCPUs |
+| **tickless-idle** | `test-robust.sh` case `idle` (`patina.stats=1`, 4 vCPUs: 3 × `Sleep(1s)` then 3 s idle, ~7 s uptime) | timer IRQs per CPU: aarch64 `1, 33, 10, 0`, x86_64 `14, 42, 2, 26`; at 8 vCPUs (aarch64) `4, 34, 1, 0, 0, 0, 7, 0` — a 100 Hz tick would give ~700 each. The busiest CPU is the one running sysmon / the timer goroutine |
+| **reclaim** | `test-robust.sh` cases `reclaim` (1 vCPU) and `reclaim-4cpu` | kernel-held frames (MemTotal − MemFree − VmRSS) over 5 × 2000 thread exits after a warm-up round: aarch64 +5 / −3, x86_64 +6 / −10 (4 vCPUs: deferred shootdown path); before D80 every stack stayed pooled (2000 × 8 frames). 1 GiB `MAP_NORESERVE` touched every 2 MiB: 513 page-table frames, all returned by `munmap` (delta 0). `patina.selftest=vm`: `1 frames held by page tables` (was 7) |
+| **oom** | `test-robust.sh` cases `oom` / `oomfault` (`PATINA_MEM=256`) | `[patina] memory: commit limit 226 MiB (15 MiB kernel reserve)`; the third 64 MiB chunk: `[patina] mmap: 65536 KiB refused, commit limit reached (184400 of 232344 KiB committed, D78)`, Go prints `fatal error: runtime: out of memory`, exit 2 (both arches). Before: `out of memory filling user page`, `SIGSEGV code=0x2`, `fatal error: fault`. `oomfault`: `[patina] out of memory: no free frame for user page 0x7eff8836d000 (0 of 64211 frames free, 12158 of 58086 pages committed); killing the program (SIGKILL)`, `[patina] exit signal SIGKILL`, 137 |
+| **robust-8cpu** | `PATINA_CPUS=8`: `test-smp.sh --cpus 8 --app smpstress` / `threads` / `sigstress` on `aarch64 x86_64`, `test-signals.sh aarch64`, `test-robust.sh aarch64` | all PASS: `[patina] smp: 8 cpus online`, `GOMAXPROCS=8 NumCPU=8`, smpstress `200 x Sleep(500us) 252 ms` (aarch64) / `285 ms` (x86_64), 6/6 signal cases, 12/12 robust cases |
+| **fxsave-only** | `PATINA_QEMU_EXTRA="-cpu max,-xsave"` and `"-cpu Nehalem"`: `test-signals.sh x86_64`, `test-smp.sh --app smpstress --cpus 2 x86_64`; robust `default`/`gp`/`sigill` on Nehalem | all PASS; `[patina] early: cpu: no fsgsbase (FS_BASE msr), no smep/smap, fp state fxsave (512 bytes)` on Nehalem; `AT_HWCAP2` 0 there (Linux: `HWCAP2_FSGSBASE` only when enabled) |
+
+- [x] Tickless idle (D77) — **tickless-idle**, **test-robust**; pproftest, sleep latency and the signal suite unchanged (**p5-robust-regression**)
+- [x] Sub-tick POSIX/itimer wall-clock timers, overrun accounting fix (D77) — **test-robust** `default`
+- [x] Fault → signal paths: SIGBUS `BUS_ADRALN`, SIGILL, `#GP` → `SI_KERNEL`, `SEGV_ACCERR` with the right `si_addr`/`si_code` — **test-robust**
+- [x] Kernel stacks and user page tables returned to the frame allocator (D80) — **reclaim**
+- [x] `mmap` beyond RAM → ENOMEM through commit accounting; fault-time OOM → SIGKILL with a clear line (D78) — **oom**
+- [x] > 4 vCPUs (8) — **robust-8cpu**
+- [x] x86_64 FXSAVE-only CPUs — **fxsave-only**
+- [~] `FPE_FLTINV`, `sigaltstack` `EPERM`/auto-disarm on delivery, `ppoll`'s temporary sigmask, `clock_nanosleep` on the process CPU clock: not reachable on this host or from Go
