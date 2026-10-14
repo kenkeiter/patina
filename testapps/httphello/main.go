@@ -4,7 +4,8 @@
 // needs no host networking (except -dns).
 //
 // Handlers: / (the greeting), /big (a deterministic 4 MiB body, see bigByte),
-// /echo (the request body back).
+// /echo (the request body back), /info (GOMAXPROCS, NumCPU, GOOS/GOARCH; for
+// scripts/bench-http.sh).
 //
 // Flags: -nohandler installs no signal handler, so SIGTERM kills the
 // process (exit status 143 by SIG_DFL); -dns <name> adds a lookup through
@@ -23,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -59,6 +61,10 @@ func main() {
 	mux.HandleFunc("/big", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write(big)
+	})
+	mux.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "GOMAXPROCS=%d NumCPU=%d GOOS=%s GOARCH=%s\n",
+			runtime.GOMAXPROCS(0), runtime.NumCPU(), runtime.GOOS, runtime.GOARCH)
 	})
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(w, r.Body)
