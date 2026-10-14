@@ -115,8 +115,13 @@ for arch in "${arches[@]}"; do
     'send:{"op":"signal","sig":"SIGKILL","id":6}' 'wait:"msg":"signal not injectable"' \
     'send:{"op":"stop","grace_ms":5000}' 'wait:"ev":"exit"' \
     -- -enosys
+  # On VZ the ENOSYS log event is emitted at program start, before a late
+  # client attached through the proxy (which replays only `ready`), so it
+  # is checked on serial only there.
+  log_ev='"ev":"log","level":"warn","msg":"ENOSYS 9999 '
+  [[ $vz == 1 ]] && log_ev='"ev":"ready"'
   check "$arch ready-ping" 0 '"ev":"ready","go":"go1\.[0-9]+' '"cpus":2' '"ev":"pong","id":42,"uptime_ms":[0-9]+' \
-    '"ev":"log","level":"warn","msg":"ENOSYS 9999 ' \
+    "$log_ev" \
     '"ev":"exit","code":0,"forced":false' -- '^\[patina\] smp: 2 cpus online' '^signals: syscall 9999: function not implemented' \
     '^PASS signals \(handler\)'
 
