@@ -1,8 +1,10 @@
 //! virtio-net (virtio 1.2 §5.1), decision D69: one receive/transmit queue
 //! pair, no offloads, behind the `net::device::NetDevice` seam.
 //!
-//! * Features: `VIRTIO_NET_F_MAC` and `VIRTIO_NET_F_STATUS` when offered;
-//!   nothing else (no `MRG_RXBUF`, checksum/GSO offloads, control queue or
+//! * Features: `VIRTIO_NET_F_MAC`, `VIRTIO_NET_F_STATUS` and
+//!   `VIRTIO_NET_F_MTU` when offered (Apple VZ refuses `FEATURES_OK` unless
+//!   the driver accepts `MTU`; the device MTU is only logged, frames never
+//!   exceed 1514 bytes); nothing else (no `MRG_RXBUF`, checksum/GSO offloads, control queue or
 //!   multiqueue). The MAC comes from config space (or is generated,
 //!   locally administered, when the device does not offer one).
 //! * Header (`virtio_net_hdr`): 10 bytes on a legacy transport, 12 (with
@@ -36,6 +38,9 @@ use crate::sync::{OnceCell, SpinLock};
 
 /// VIRTIO_NET_F_MAC: config space holds the MAC.
 const F_MAC: u64 = 1 << 5;
+/// VIRTIO_NET_F_MTU: config space holds the device's maximum MTU. Apple VZ
+/// offers it and fails `FEATURES_OK` when the driver does not accept it.
+const F_MTU: u64 = 1 << 3;
 /// VIRTIO_NET_F_STATUS: config space holds the link status.
 const F_STATUS: u64 = 1 << 16;
 /// `status` bit VIRTIO_NET_S_LINK_UP.
@@ -219,7 +224,7 @@ pub fn init() {
         return;
     };
     let t = dev.transport;
-    let feats = match negotiate(&*t, F_MAC | F_STATUS) {
+    let feats = match negotiate(&*t, F_MAC | F_STATUS | F_MTU) {
         Ok(f) => f,
         Err(e) => {
             crate::kprintln!("[patina] virtio-net: {}", e);
@@ -238,6 +243,8 @@ pub fn init() {
         m
     };
     let link_up = feats & F_STATUS == 0 || t.config_read16(6) & S_LINK_UP != 0;
+    // config: mac[6], status u16, max_virtqueue_pairs u16, mtu u16.
+    let mtu = if feats & F_MTU != 0 { t.config_read16(10) } else { 0 };
     let mk = || -> Option<Net> {
         let rx = VirtQueue::new(&*t, 0, RX_WANT)?;
         let tx = VirtQueue::new(&*t, 1, TX_WANT)?;
@@ -277,13 +284,14 @@ pub fn init() {
         attach_irq(line, irq);
     }
     crate::kprintln!(
-        "[patina] virtio-net: mac {}, queues rx {} / tx {}, link {} ({}, hdr {} B{})",
+        "[patina] virtio-net: mac {}, queues rx {} / tx {}, link {} ({}, hdr {} B{}{})",
         fmt_mac(&mac),
         nrx,
         ntx,
         if link_up { "up" } else { "down" },
         loc,
         hdr,
+        if mtu != 0 { alloc::format!(", device mtu {}", mtu) } else { String::new() },
         if dev.irq.is_some() { "" } else { ", no irq" }
     );
     crate::net::device::register(Box::new(VirtioNet { mac }));
