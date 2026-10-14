@@ -18,10 +18,13 @@
 //!   memory access goes through the address space (`mm`) and the direct map,
 //!   so a fault in kernel mode is always a kernel bug and is fatal.
 //!
-//! Until the core lands, the bodies here are just enough for the arch
-//! self-tests (`patina.selftest=user|userfault|timer|switch`): `write(1, …)`
-//! prints, `exit_group(n)` exits with `n`, anything else is `ENOSYS`, user
-//! faults are fatal, the tick only counts.
+//! Once the loader has created the process, syscalls go to
+//! `syscall::dispatch` and user faults to the process address space
+//! (`mm::vm::AddressSpace::handle_fault`). Before that (the arch self-tests
+//! `patina.selftest=user|userfault|timer|switch` run without a process)
+//! the minimal fallback remains: `write(1, …)` prints, `exit_group(n)`
+//! exits with `n`, anything else is `ENOSYS`, user faults are fatal. The
+//! tick only counts (W2b: preemption).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -76,6 +79,10 @@ pub static TICKS: AtomicU64 = AtomicU64::new(0);
 /// A syscall from user mode. `frame.syscall_nr()` / `frame.syscall_args()`
 /// give the request; the result goes back with `frame.set_syscall_ret()`.
 pub fn syscall(frame: &mut TrapFrame) {
+    if crate::task::try_process().is_some() {
+        crate::syscall::dispatch(frame);
+        return;
+    }
     let n = frame.syscall_nr();
     let a = frame.syscall_args();
     let ret: isize = match n {
@@ -96,6 +103,14 @@ pub fn syscall(frame: &mut TrapFrame) {
 /// retry the access; on an unrecoverable fault the core terminates the
 /// program itself (dump + exit) and does not return.
 pub fn user_fault(frame: &mut TrapFrame, addr: usize, access: Access, kind: FaultKind) {
+    let proc = crate::task::try_process();
+    if kind != FaultKind::Alignment
+        && let Some(p) = proc
+        && p.space.lock().handle_fault(addr, access)
+    {
+        return;
+    }
+    // Phase 2: deliver SIGSEGV (SEGV_MAPERR/ACCERR) / SIGBUS instead.
     crate::kprintln!(
         "[patina] fatal: user {:?} fault ({:?}) at {:#x}",
         access,
@@ -103,6 +118,9 @@ pub fn user_fault(frame: &mut TrapFrame, addr: usize, access: Access, kind: Faul
         addr
     );
     frame.dump();
+    if let Some(p) = proc {
+        p.space.lock().dump();
+    }
     crate::exit(128 + 11)
 }
 

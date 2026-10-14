@@ -15,11 +15,15 @@ mod arch;
 mod bootinfo;
 mod cmdline;
 mod console;
+mod loader;
 mod mm;
 mod panic;
+mod random;
 mod selftest;
 mod selftest_user;
 mod sync;
+mod syscall;
+mod task;
 mod trap;
 
 use alloc::format;
@@ -79,13 +83,22 @@ pub fn kernel_main(bi: &'static BootInfo) -> ! {
         human(bi.kernel.len())
     );
     kprintln!("[patina] cmdline: \"{}\"", bi.cmdline);
+    let cl = patina_cmdline::Cmdline::parse(bi.cmdline);
     let params: alloc::vec::Vec<&str> = cmdline::params(bi.cmdline).collect();
     kprintln!("[patina] params: {:?}", params);
     kprintln!("[patina] argv: {:?}", {
         let mut v = alloc::vec![alloc::string::String::from("/app")];
-        v.extend(cmdline::args(bi.cmdline));
+        v.extend(cl.argv.iter().cloned());
         v
     });
+    for e in &cl.errors {
+        kprintln!(
+            "[patina] cmdline: ignoring {}={:?}: {}",
+            e.key,
+            e.value,
+            e.reason
+        );
+    }
     match bi.initrd {
         Some(r) => kprintln!(
             "[patina] initrd: {:#x}-{:#x} ({} bytes)",
@@ -112,5 +125,8 @@ pub fn kernel_main(bi: &'static BootInfo) -> ! {
 
     selftest::run(bi.cmdline);
 
+    if bi.initrd.is_some() {
+        loader::run(bi, &cl);
+    }
     exit(0)
 }

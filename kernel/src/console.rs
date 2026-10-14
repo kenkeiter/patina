@@ -57,6 +57,23 @@ pub fn _print(args: fmt::Arguments<'_>) {
     }
 }
 
+/// Write raw bytes (user `write(1/2, ...)` output), translating `\n` to
+/// `\r\n` like `kprint!`. Bytes need not be UTF-8.
+pub fn write_bytes(bytes: &[u8]) {
+    let guard = CONSOLE.lock();
+    if let Some(c) = *guard {
+        let mut rest = bytes;
+        while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+            c.write_bytes(&rest[..pos]);
+            c.write_bytes(b"\r\n");
+            rest = &rest[pos + 1..];
+        }
+        if !rest.is_empty() {
+            c.write_bytes(rest);
+        }
+    }
+}
+
 /// Print from a context that must not deadlock on the console lock (panic,
 /// fatal exception). Spins briefly, then force-unlocks.
 pub fn panic_write_fmt(args: fmt::Arguments<'_>) {
