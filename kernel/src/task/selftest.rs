@@ -45,7 +45,10 @@ fn spinner() {
             preempted += 1;
         }
         if timer::now_ns() - t0 > 5_000 * MS {
-            panic!("selftest sched: timed out (sleeps {})", SLEEPS.load(Ordering::Relaxed));
+            panic!(
+                "selftest sched: timed out (sleeps {})",
+                SLEEPS.load(Ordering::Relaxed)
+            );
         }
         core::hint::spin_loop();
     }
@@ -65,7 +68,10 @@ fn spinner() {
     );
     assert!(SLEEPS.load(Ordering::Relaxed) == 3, "sleeps incomplete");
     assert!(WOKEN.load(Ordering::Relaxed), "waiter not woken");
-    assert!(TIMED_OUT.load(Ordering::Relaxed), "timed wait did not time out");
+    assert!(
+        TIMED_OUT.load(Ordering::Relaxed),
+        "timed wait did not time out"
+    );
     assert!(preempted >= 3, "spinner was not preempted by the tick");
     assert!(slots == 3 && free == 2, "exited threads' stacks not freed");
     crate::kprintln!("[patina] selftest sched: ok");
@@ -121,7 +127,10 @@ fn overflow() {
         st.top
     );
     let n = recurse(0);
-    crate::kprintln!("[patina] selftest kstack: recursion returned {} (no fault!)", n);
+    crate::kprintln!(
+        "[patina] selftest kstack: recursion returned {} (no fault!)",
+        n
+    );
 }
 
 /// `patina.selftest=kstack`: overflow a kernel thread's stack. Expected:

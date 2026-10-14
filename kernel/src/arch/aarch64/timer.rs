@@ -36,7 +36,9 @@ fn cntfrq() -> u64 {
 fn cntvct() -> u64 {
     let v: u64;
     // SAFETY: read-only; the isb keeps the read from being speculated early.
-    unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags))
+    };
     v
 }
 
@@ -106,7 +108,9 @@ pub(super) fn rearm() {
     let period = PERIOD.load(Ordering::Relaxed);
     let cval: u64;
     // SAFETY: reads this CPU's timer compare value.
-    unsafe { asm!("mrs {}, cntv_cval_el0", out(reg) cval, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        asm!("mrs {}, cntv_cval_el0", out(reg) cval, options(nomem, nostack, preserves_flags))
+    };
     let now = cntvct();
     let mut next = cval.wrapping_add(period);
     if next <= now {

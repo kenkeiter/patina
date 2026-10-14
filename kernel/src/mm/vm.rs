@@ -760,14 +760,22 @@ pub fn selftest() {
     assert_eq!(s.resident.len(), 0);
     // Same hint again: taken, so top-down below MMAP_BASE.
     let r2 = s.mmap(hint, 1 << 20, RW, anon, -1, 0).unwrap();
-    assert!(r2 != hint && r2 + (1 << 20) <= MMAP_BASE, "fallback {:#x}", r2);
+    assert!(
+        r2 != hint && r2 + (1 << 20) <= MMAP_BASE,
+        "fallback {:#x}",
+        r2
+    );
     // FIXED RW over part of the reservation; uaccess faults pages in.
     s.mmap(hint + 0x10000, 0x4000, RW, fixed, -1, 0).unwrap();
     assert_eq!(s.vmas.len(), 4); // none | rw | none, + r2
-    s.copy_to_user(hint + 0x10ff0, b"patina vm selftest!").unwrap();
+    s.copy_to_user(hint + 0x10ff0, b"patina vm selftest!")
+        .unwrap();
     assert_eq!(s.resident.len(), 2); // crosses a page boundary
     let mut buf = [0u8; 19];
-    assert!(s.copy_from_user(hint + 0x0ff0, &mut buf).is_err(), "read of PROT_NONE");
+    assert!(
+        s.copy_from_user(hint + 0x0ff0, &mut buf).is_err(),
+        "read of PROT_NONE"
+    );
     // mprotect NONE keeps the frames; reads fail; back to RW: data intact.
     s.mprotect(hint + 0x10000, 0x4000, NONE).unwrap();
     assert_eq!(s.vmas.len(), 2, "PROT_NONE ranges not merged"); // reservation + r2
@@ -781,7 +789,10 @@ pub fn selftest() {
     s.write_val(m + 0x1000, &0xdead_beef_u64).unwrap();
     let blocker = s.mmap(m + 0x2000, 0x1000, NONE, fixed, -1, 0).unwrap();
     assert_eq!(blocker, m + 0x2000);
-    assert!(s.mremap(m, 0x2000, 0x8000, 0).is_err(), "grew over a mapping");
+    assert!(
+        s.mremap(m, 0x2000, 0x8000, 0).is_err(),
+        "grew over a mapping"
+    );
     let m2 = s.mremap(m, 0x2000, 0x8000, MREMAP_MAYMOVE).unwrap();
     assert!(m2 != m);
     assert_eq!(s.read_val::<u64>(m2 + 0x1000).unwrap(), 0xdead_beef);

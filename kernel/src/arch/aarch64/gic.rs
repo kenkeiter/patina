@@ -162,9 +162,13 @@ fn gic() -> &'static Gic {
 fn init_dist(g: &Gic) {
     if g.version == 3 {
         wr32(g.dist + GICD_CTLR, 0);
-        spin_until("GICD_CTLR.RWP", || rd32(g.dist + GICD_CTLR) & GICD_CTLR_RWP == 0);
+        spin_until("GICD_CTLR.RWP", || {
+            rd32(g.dist + GICD_CTLR) & GICD_CTLR_RWP == 0
+        });
         wr32(g.dist + GICD_CTLR, GICD_CTLR_V3);
-        spin_until("GICD_CTLR.RWP", || rd32(g.dist + GICD_CTLR) & GICD_CTLR_RWP == 0);
+        spin_until("GICD_CTLR.RWP", || {
+            rd32(g.dist + GICD_CTLR) & GICD_CTLR_RWP == 0
+        });
     } else {
         // Group 0 interrupts signalled as IRQ; enable both groups.
         wr32(g.dist + GICD_CTLR, 0b11);
@@ -190,7 +194,11 @@ fn find_rd(g: &Gic) -> usize {
             break; // Last
         }
         // GICv4 (VLPIS) frames have two extra 64 KiB pages.
-        off += if typer & (1 << 1) != 0 { 0x4_0000 } else { 0x2_0000 };
+        off += if typer & (1 << 1) != 0 {
+            0x4_0000
+        } else {
+            0x2_0000
+        };
     }
     panic!("gic: no redistributor for affinity {:#x}", aff);
 }

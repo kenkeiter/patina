@@ -123,7 +123,8 @@ read_sysreg!(read_id_aa64pfr0, "id_aa64pfr0_el1");
 /// HWCAP2 is 0.
 pub fn hwcap() -> (u64, u64) {
     use patina_abi::aarch64::hwcap;
-    let mut h = hwcap::from_id_aa64isar0(read_id_aa64isar0()) | hwcap::FP | hwcap::ASIMD | hwcap::CPUID;
+    let mut h =
+        hwcap::from_id_aa64isar0(read_id_aa64isar0()) | hwcap::FP | hwcap::ASIMD | hwcap::CPUID;
     let pfr0 = read_id_aa64pfr0();
     if (pfr0 >> 16) & 0xf == 1 {
         h |= hwcap::FPHP;

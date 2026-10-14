@@ -111,7 +111,9 @@ impl TrapFrame {
     }
     #[inline]
     pub fn syscall_args(&self) -> [u64; 6] {
-        [self.x[0], self.x[1], self.x[2], self.x[3], self.x[4], self.x[5]]
+        [
+            self.x[0], self.x[1], self.x[2], self.x[3], self.x[4], self.x[5],
+        ]
     }
     #[inline]
     pub fn set_syscall_ret(&mut self, v: u64) {
@@ -308,7 +310,10 @@ pub fn new_kernel_context(
     entry: extern "C" fn(usize) -> !,
     arg: usize,
 ) -> KernelContext {
-    assert!(stack_top.is_multiple_of(16), "kernel stack top not 16-aligned");
+    assert!(
+        stack_top.is_multiple_of(16),
+        "kernel stack top not 16-aligned"
+    );
     let mut c = KernelContext::new();
     c.x19_28[0] = entry as *const () as u64;
     c.x19_28[1] = arg as u64;

@@ -351,11 +351,7 @@ pub fn exit_current() -> ! {
 pub(super) extern "C" fn user_thread_entry(_tid: usize) -> ! {
     finish_switch(this_cpu());
     let t = current();
-    let start = t
-        .start
-        .lock()
-        .take()
-        .expect("thread started twice");
+    let start = t.start.lock().take().expect("thread started twice");
     let frame: ctx::TrapFrame = (*start.frame).clone();
     ctx::fp_restore(&start.fp);
     drop(start);

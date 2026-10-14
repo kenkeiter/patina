@@ -29,8 +29,8 @@
 use core::arch::asm;
 
 use super::paging::{
-    ADDR_MASK, AP_RO, ATTR_IDX_DEVICE, DESC_TABLE, DESC_VALID, ENTRIES, MapError,
-    MapFlags, UXN, alloc_table, leaf_attrs, table_ptr,
+    ADDR_MASK, AP_RO, ATTR_IDX_DEVICE, DESC_TABLE, DESC_VALID, ENTRIES, MapError, MapFlags, UXN,
+    alloc_table, leaf_attrs, table_ptr,
 };
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, frame, phys_to_virt};
 
@@ -68,7 +68,11 @@ impl UserTables {
         if !va.is_multiple_of(PAGE_SIZE) || !pa.is_page_aligned() {
             return Err(MapError::Misaligned);
         }
-        assert!(va < USER_VA_END, "uspace::map: {:#x} is not a user address", va);
+        assert!(
+            va < USER_VA_END,
+            "uspace::map: {:#x} is not a user address",
+            va
+        );
         let slot = self.slot(va, true)?.ok_or(MapError::NoMemory)?;
         // SAFETY: `slot` points into a live table frame reached via the direct map.
         if unsafe { slot.read_volatile() } != 0 {

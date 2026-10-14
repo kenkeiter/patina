@@ -94,7 +94,12 @@ pub fn exit(code: u64) -> ! {
 pub fn futex(uaddr: usize, op: i32, val: u32, timeout: usize, val3: u32) -> SysResult {
     let cmd = op & FUTEX_CMD_MASK;
     let realtime = op & FUTEX_CLOCK_REALTIME != 0;
-    if realtime && !matches!(cmd, FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI | FUTEX_LOCK_PI2) {
+    if realtime
+        && !matches!(
+            cmd,
+            FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI | FUTEX_LOCK_PI2
+        )
+    {
         return Err(Errno(ENOSYS));
     }
     match cmd {

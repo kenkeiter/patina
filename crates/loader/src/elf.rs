@@ -370,8 +370,8 @@ pub fn parse(data: &[u8], machine: Machine) -> Result<Image<'_>, Error> {
     let mut pt_phdr: Option<u64> = None;
     let mut stack_exec = true;
     for index in 0..usize::from(phnum) {
-        let ph = read_phdr(data, phoff_us + index * usize::from(PHDR_SIZE))
-            .ok_or(Error::Truncated)?;
+        let ph =
+            read_phdr(data, phoff_us + index * usize::from(PHDR_SIZE)).ok_or(Error::Truncated)?;
         let bad = |reason| Error::BadSegment { index, reason };
         match ph.ty {
             PT_INTERP | PT_DYNAMIC => return Err(Error::Dynamic),
@@ -723,7 +723,10 @@ mod tests {
             &[load(rx, 0, USER_VA_END - 0x1000, 0x100, 0x1000)],
             0x3000,
         );
-        assert_eq!(parse(&d, Machine::X86_64).unwrap().highest_mapped_vaddr(), USER_VA_END);
+        assert_eq!(
+            parse(&d, Machine::X86_64).unwrap().highest_mapped_vaddr(),
+            USER_VA_END
+        );
         // Unsorted
         assert_eq!(
             bad(&[

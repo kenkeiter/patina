@@ -432,7 +432,9 @@ mod tests {
             .map(|i| format!("arg-{i}-{}", "x".repeat(i % 37)).into_bytes())
             .collect();
         let argv: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
-        let envs: Vec<Vec<u8>> = (0..300).map(|i| format!("K{i}=v{i}").into_bytes()).collect();
+        let envs: Vec<Vec<u8>> = (0..300)
+            .map(|i| format!("K{i}=v{i}").into_bytes())
+            .collect();
         let envp: Vec<&[u8]> = envs.iter().map(|v| v.as_slice()).collect();
         check(&argv, &envp, b"aarch64", b"/app");
     }
@@ -467,7 +469,15 @@ mod tests {
         );
         for k in [AT_NULL, AT_RANDOM, AT_PLATFORM, AT_EXECFN] {
             assert_eq!(
-                build(TOP, &[], &[], &[(AT_PAGESZ, 4096), (k, 1)], &RANDOM, b"", b"/app"),
+                build(
+                    TOP,
+                    &[],
+                    &[],
+                    &[(AT_PAGESZ, 4096), (k, 1)],
+                    &RANDOM,
+                    b"",
+                    b"/app"
+                ),
                 Err(Error::ReservedAuxKey(k))
             );
         }

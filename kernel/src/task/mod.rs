@@ -247,12 +247,10 @@ impl Thread {
         let mut w = self.sched_word.load(Ordering::Acquire);
         loop {
             let new = (w & !ST_MASK & (!ST_TIMED_OUT | keep)) | v;
-            match self.sched_word.compare_exchange_weak(
-                w,
-                new,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .sched_word
+                .compare_exchange_weak(w, new, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => break,
                 Err(cur) => w = cur,
             }

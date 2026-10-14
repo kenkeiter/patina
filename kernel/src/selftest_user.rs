@@ -52,7 +52,10 @@ fn user(map_data: bool) -> ! {
     let mut tables = uspace::UserTables::new().expect("selftest: UserTables::new");
 
     let code = ctx::selftest_user_code();
-    assert!(code.len() <= PAGE_SIZE, "selftest user code does not fit a page");
+    assert!(
+        code.len() <= PAGE_SIZE,
+        "selftest user code does not fit a page"
+    );
     let code_pa = alloc_page();
     // SAFETY: freshly allocated frame, reached through the direct map.
     unsafe {
@@ -109,9 +112,8 @@ pub fn user_write(va: usize, len: usize) -> isize {
         let n = (PAGE_SIZE - off).min(len - done);
         // SAFETY: the page is mapped in the user tables, hence RAM reachable
         // through the direct map.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(phys_to_virt(pa).as_ptr::<u8>().add(off), n)
-        };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(phys_to_virt(pa).as_ptr::<u8>().add(off), n) };
         crate::kprint!("{}", core::str::from_utf8(bytes).unwrap_or("<non-utf8>"));
         done += n;
     }
@@ -169,7 +171,10 @@ fn switch_test() -> ! {
         let other = OTHER_CTX.lock().as_ptr();
         // SAFETY: `other` was built by new_kernel_context / saved by switch.
         unsafe { ctx::switch(main, other) };
-        crate::kprintln!("[patina] selftest switch: back in boot context (round {})", round);
+        crate::kprintln!(
+            "[patina] selftest switch: back in boot context (round {})",
+            round
+        );
     }
     arch::irq::restore(flags);
     crate::kprintln!("[patina] selftest switch: ok");

@@ -50,7 +50,9 @@
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 
-use super::ctx::{self, FRAME_SIZE, OFF_ELR, OFF_ESR, OFF_FPCR, OFF_SP, OFF_TPIDR, OFF_V, TrapFrame};
+use super::ctx::{
+    self, FRAME_SIZE, OFF_ELR, OFF_ESR, OFF_FPCR, OFF_SP, OFF_TPIDR, OFF_V, TrapFrame,
+};
 use super::{cpu, irq};
 use crate::console::panic_write_fmt;
 use crate::trap::{self, Access, Exception, FaultKind};
@@ -425,7 +427,11 @@ fn fatal(tf: &TrapFrame, kind: u64) -> ! {
         "unhandled {} exception: {}{} (ESR={:#x} FAR={:#x} ELR={:#x})",
         name,
         ec_name(ec),
-        if overflow { ", kernel stack overflow" } else { "" },
+        if overflow {
+            ", kernel stack overflow"
+        } else {
+            ""
+        },
         tf.esr,
         tf.far,
         tf.elr

@@ -202,7 +202,6 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::CLONE => thread::clone(frame, a),
         nr::FUTEX => thread::futex(u(0), i(1), a[2] as u32, u(3), a[5] as u32),
         // clone3 → ENOSYS makes glibc/Go fall back to clone.
-
         _ => enosys(n),
     }
 }
