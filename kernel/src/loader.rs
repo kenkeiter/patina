@@ -1,8 +1,8 @@
 //! Load `/app` from the initrd and start it (design §4 "ELF loading",
 //! "Stacks", §7 auxv).
 //!
-//! 1. Find `app` in the newc initrd (`patina_cpio`, read through the
-//!    direct map).
+//! 1. Unpack the newc initrd into the root filesystem (`fs::rootfs`;
+//!    file pages stay borrowed from the initrd) and look `/app` up there.
 //! 2. Validate it with `patina_loader::elf::parse` (static, non-PIE, this
 //!    arch).
 //! 3. Each `PT_LOAD` becomes an ELF VMA, populated eagerly: a zeroed frame
@@ -25,7 +25,6 @@ use patina_abi::auxv::*;
 use patina_abi::mm::ProtFlags;
 use patina_abi::signal::SigAction;
 use patina_cmdline::Cmdline;
-use patina_cpio::{FileType, Reader};
 use patina_loader::elf::{self, Machine};
 use patina_loader::stack;
 
@@ -53,27 +52,31 @@ fn fatal(code: i32, args: core::fmt::Arguments<'_>) -> ! {
     crate::exit(code)
 }
 
-/// Find `app` (`app`, `./app` or `/app`) in the initrd.
-fn find_app(data: &'static [u8]) -> &'static [u8] {
-    for e in Reader::initramfs(data) {
-        let e = match e {
-            Ok(e) => e,
-            Err(err) => fatal(
-                127,
-                format_args!("initrd is not a valid newc cpio archive ({})", err),
-            ),
-        };
-        if e.path() == b"app" {
-            if e.file_type() != FileType::Regular {
-                fatal(
-                    126,
-                    format_args!("/app in the initrd is not a regular file"),
-                );
-            }
-            return e.data;
+/// Find `/app` in the root filesystem (populated from the initrd). Its
+/// pages are borrowed from the initrd, so this does not copy.
+fn find_app() -> &'static [u8] {
+    use patina_vfs::FileType as T;
+    let r = crate::fs::vfs::with(|fs| {
+        let ino = fs.resolve(fs.root(), EXE_PATH, true).ok()?;
+        if fs.file_type(ino) != Ok(T::Regular) || fs.special(ino).is_some() {
+            return Some(Err(()));
         }
+        if let Some(d) = fs.static_contents(ino) {
+            return Some(Ok(d));
+        }
+        let mut v = vec![0u8; fs.size(ino).ok()? as usize];
+        let n = fs.read_at(ino, 0, &mut v).ok()?;
+        v.truncate(n);
+        Some(Ok(&*v.leak()))
+    });
+    match r {
+        Some(Ok(d)) => d,
+        Some(Err(())) => fatal(
+            126,
+            format_args!("/app in the initrd is not a regular file"),
+        ),
+        None => fatal(127, format_args!("/app not found in the initrd")),
     }
-    fatal(127, format_args!("/app not found in the initrd"))
 }
 
 /// argv (`/app` + args), envp (`K=V`, last duplicate wins, first-seen
@@ -123,7 +126,13 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
     // (MemKind::Initrd) and covered by the direct map; it is never written.
     let data: &'static [u8] =
         unsafe { core::slice::from_raw_parts(phys_to_virt(rd.start).as_ptr::<u8>(), rd.len()) };
-    let file = find_app(data);
+    if let Err(err) = crate::fs::rootfs::init(Some(data), c) {
+        fatal(
+            127,
+            format_args!("initrd is not a valid newc cpio archive ({})", err),
+        );
+    }
+    let file = find_app();
     let img = match elf::parse(file, MACHINE) {
         Ok(i) => i,
         Err(e) => fatal(126, format_args!("/app: {}", e)),
@@ -258,6 +267,8 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
         strace,
         epoch_ns,
         files: SpinLock::new(crate::fs::FdTable::with_console()),
+        cwd: SpinLock::new(crate::fs::vfs::root_ref()),
+        umask: core::sync::atomic::AtomicU32::new(0o022),
     });
     let t0 = task::create_thread0(frame);
     task::start_thread0(t0)

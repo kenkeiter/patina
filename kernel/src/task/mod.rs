@@ -62,6 +62,11 @@ pub struct Process {
     pub epoch_ns: u64,
     /// File descriptors, shared by all threads (design §8).
     pub files: SpinLock<crate::fs::FdTable>,
+    /// Current directory: an inode holding a VFS reference, changed only
+    /// with the VFS lock held (`fs::namei::set_cwd`).
+    pub cwd: SpinLock<patina_vfs::Ino>,
+    /// File-creation mask (`umask`).
+    pub umask: AtomicU32,
 }
 
 static PROCESS: OnceCell<Process> = OnceCell::new();

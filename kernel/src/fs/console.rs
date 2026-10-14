@@ -17,6 +17,10 @@ impl File for Console {
         "console"
     }
 
+    fn proc_name(&self) -> alloc::vec::Vec<u8> {
+        b"/dev/console".to_vec()
+    }
+
     fn read(&self, _buf: &mut [u8], _flags: FileFlags) -> Result<usize, Errno> {
         Ok(0)
     }

@@ -115,6 +115,11 @@ impl FdTable {
         self.slots.take_matching(|e| e.cloexec)
     }
 
+    /// The open fd numbers (ascending).
+    pub fn fds(&self) -> Vec<i32> {
+        self.slots.iter().map(|(fd, _)| fd as i32).collect()
+    }
+
     /// Number of open fds.
     pub fn len(&self) -> usize {
         self.slots.len()

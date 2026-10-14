@@ -159,3 +159,145 @@ pub fn arch_prctl(frame: &mut crate::arch::ctx::TrapFrame, code: i32, addr: u64)
         _ => Err(Errno(EINVAL)),
     }
 }
+
+// ---- Tier-3 stubs (design §7; policy in doc/decisions.md D57) ----------
+
+/// `prctl`: thread name, dumpable, no_new_privs, VMA names; else `EINVAL`.
+pub fn prctl(op: i32, arg2: u64) -> SysResult {
+    use patina_abi::misc::{
+        PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_SET_DUMPABLE, PR_SET_NAME,
+        PR_SET_NO_NEW_PRIVS, PR_SET_VMA, TASK_COMM_LEN,
+    };
+    match op {
+        PR_SET_NAME => {
+            let mut name = [0u8; TASK_COMM_LEN];
+            // strncpy_from_user of at most 15 bytes: read byte-wise so a
+            // short name near the end of a mapping does not fault.
+            for (i, slot) in name.iter_mut().take(TASK_COMM_LEN - 1).enumerate() {
+                let b: u8 = with_space(|s| s.read_val(arg2 as usize + i))?;
+                if b == 0 {
+                    break;
+                }
+                *slot = b;
+            }
+            *task::current().name.lock() = name;
+            Ok(0)
+        }
+        PR_GET_NAME => {
+            let name = *task::current().name.lock();
+            with_space(|s| s.write_val(arg2 as usize, &name))?;
+            Ok(0)
+        }
+        PR_SET_DUMPABLE => {
+            if arg2 > 1 {
+                return Err(Errno(EINVAL));
+            }
+            Ok(0)
+        }
+        PR_GET_DUMPABLE => Ok(1),
+        PR_SET_NO_NEW_PRIVS => Ok(0),
+        PR_GET_NO_NEW_PRIVS => Ok(0),
+        PR_SET_VMA => Ok(0),
+        _ => Err(Errno(EINVAL)),
+    }
+}
+
+/// `capget`: version negotiation, then empty capability sets.
+pub fn capget(hdr: usize, data: usize) -> SysResult {
+    use patina_abi::misc::{
+        CapUserData, CapUserHeader, LINUX_CAPABILITY_VERSION_1, LINUX_CAPABILITY_VERSION_2,
+        LINUX_CAPABILITY_VERSION_3,
+    };
+    let mut h: CapUserHeader = with_space(|s| s.read_val(hdr))?;
+    let n = match h.version {
+        LINUX_CAPABILITY_VERSION_1 => 1,
+        LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => 2,
+        _ => {
+            h.version = LINUX_CAPABILITY_VERSION_3;
+            with_space(|s| s.write_val(hdr, &h))?;
+            return if data == 0 { Ok(0) } else { Err(Errno(EINVAL)) };
+        }
+    };
+    if h.pid < 0 {
+        return Err(Errno(EINVAL));
+    }
+    if data != 0 {
+        let d = [CapUserData::default(); 2];
+        for (i, v) in d.iter().take(n).enumerate() {
+            with_space(|s| s.write_val(data + i * size_of::<CapUserData>(), v))?;
+        }
+    }
+    Ok(0)
+}
+
+/// `sched_setaffinity`: accepted if the mask names an online CPU (no
+/// migration is done).
+pub fn sched_setaffinity(pid: i32, len: usize, mask: usize) -> SysResult {
+    if !valid_pid(pid) {
+        return Err(Errno(ESRCH));
+    }
+    if len == 0 {
+        return Err(Errno(EINVAL));
+    }
+    let mut buf = [0u8; 8];
+    let n = len.min(8);
+    with_space(|s| s.copy_from_user(mask, &mut buf[..n]))?;
+    let m = u64::from_le_bytes(buf);
+    if m & crate::task::sched::online_mask() == 0 {
+        return Err(Errno(EINVAL));
+    }
+    Ok(0)
+}
+
+/// `getcpu(cpu, node, cache)`.
+pub fn getcpu(cpu: usize, node: usize) -> SysResult {
+    let c = crate::arch::cpu::id() as u32;
+    if cpu != 0 {
+        with_space(|s| s.write_val(cpu, &c))?;
+    }
+    if node != 0 {
+        with_space(|s| s.write_val(node, &0u32))?;
+    }
+    Ok(0)
+}
+
+/// `sysinfo`: uptime, memory from the frame allocator, one process.
+pub fn sysinfo(buf: usize) -> SysResult {
+    let (free, total) = crate::mm::frame::stats();
+    let page = crate::mm::PAGE_SIZE as u64;
+    let info = patina_abi::misc::Sysinfo {
+        uptime: (crate::arch::timer::now_ns() / 1_000_000_000) as i64,
+        totalram: total as u64 * page,
+        freeram: free as u64 * page,
+        procs: crate::task::live_threads().min(u16::MAX as usize) as u16,
+        mem_unit: 1,
+        ..Default::default()
+    };
+    with_space(|s| s.write_val(buf, &info))?;
+    Ok(0)
+}
+
+/// `getresuid`/`getresgid`: everything is 0 (root).
+pub fn getres(a: usize, b: usize, c: usize) -> SysResult {
+    for p in [a, b, c] {
+        with_space(|s| s.write_val(p, &0u32))?;
+    }
+    Ok(0)
+}
+
+/// `sched_getparam`: `sched_priority` 0.
+pub fn sched_getparam(pid: i32, param: usize) -> SysResult {
+    if !valid_pid(pid) {
+        return Err(Errno(ESRCH));
+    }
+    with_space(|s| s.write_val(param, &0i32))?;
+    Ok(0)
+}
+
+/// `getpgid`/`getsid` of ourselves: 1.
+pub fn own_id(pid: i32) -> SysResult {
+    if !valid_pid(pid) {
+        return Err(Errno(ESRCH));
+    }
+    Ok(1)
+}
