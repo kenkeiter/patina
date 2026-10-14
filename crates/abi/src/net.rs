@@ -241,6 +241,19 @@ pub const VMADDR_CID_LOCAL: u32 = 1;
 pub const VMADDR_CID_HOST: u32 = 2;
 pub const VMADDR_PORT_ANY: u32 = u32::MAX;
 
+/// AF_VSOCK socket options (level `AF_VSOCK`, `linux/vm_sockets.h`).
+pub const SO_VM_SOCKETS_BUFFER_SIZE: i32 = 0;
+pub const SO_VM_SOCKETS_BUFFER_MIN_SIZE: i32 = 1;
+pub const SO_VM_SOCKETS_BUFFER_MAX_SIZE: i32 = 2;
+pub const SO_VM_SOCKETS_PEER_HOST_VM_ID: i32 = 3;
+pub const SO_VM_SOCKETS_TRUSTED: i32 = 5;
+/// `struct __kernel_old_timeval`; the 64-bit `SO_VM_SOCKETS_CONNECT_TIMEOUT`.
+pub const SO_VM_SOCKETS_CONNECT_TIMEOUT_OLD: i32 = 6;
+pub const SO_VM_SOCKETS_NONBLOCK_TXRX: i32 = 7;
+pub const SO_VM_SOCKETS_CONNECT_TIMEOUT_NEW: i32 = 8;
+/// `IOCTL_VM_SOCKETS_GET_LOCAL_CID` = `_IO(7, 0xb9)` on `/dev/vsock`.
+pub const IOCTL_VM_SOCKETS_GET_LOCAL_CID: u32 = 0x7b9;
+
 /// `struct sockaddr_storage` size.
 pub const SOCKADDR_STORAGE_SIZE: usize = 128;
 
