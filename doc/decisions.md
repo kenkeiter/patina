@@ -2329,3 +2329,86 @@ from a signal handler); the vvar refault after `madvise(DONTNEED)` and
 `munmap`/`mremap` of the vDSO (no test does it); Go's SIGPROF traceback
 through vDSO frames under heavy profiling (the `pproftest` case of
 `test-runtime.sh` passes, but it does not target vDSO PCs).
+
+## D79: Benchmarks and the Go version matrix
+*2026-10-14 · Phase 5*
+
+**What is measured.** `testapps/bench` (std only) prints one
+`bench <name>: <value> <unit>` line per benchmark and `PASS bench`. Each
+benchmark warms up with a tenth of its count, then runs a fixed count
+(latency rows: ns or µs per op) or a fixed duration (throughput rows: 1 s
+for pipes, 2 s for TCP/AF_UNIX, 64 KiB writes, MB/s = 10^6 B/s); `-n F`
+scales both, `-only` picks rows. Rows: `getpid` through `RawSyscall` (bare
+entry/exit) and `Syscall` (+ Go's `entersyscall`/`exitsyscall`); raw
+`clock_gettime` and 32-byte `getrandom` syscalls against `time.Now()` and
+`crypto/rand.Read` (vDSO, D75); a raw `FUTEX_WAIT`/`FUTEX_WAKE` ping-pong
+between two `LockOSThread`ed goroutines, plus channel and
+`sync.Mutex`+`Cond` ping-pongs for context; a blocking-pipe ping-pong
+between two locked threads and pipe throughput; an `os.Pipe` ping-pong
+(non-blocking fds through Go's netpoller: the epoll wakeup path); TCP
+(`TCP_NODELAY`) and AF_UNIX round trip and throughput over loopback; a
+locked goroutine that exits (Go kills its M: one clone + one thread exit);
+1 MiB anonymous `mmap` + one touched page + `munmap`; `kill(self,
+SIGUSR1)` to a `signal.Notify` channel. The raw ping-pongs raise
+GOMAXPROCS to 2 for their duration: with one P, the thread blocked in the
+futex would hold it and the partner could only run after sysmon retakes
+it (≥ 20 µs), which measures Go, not the kernel. `scripts/bench.sh` builds
+kernel and program, runs each (arch, vCPU count) 3 times under
+`run-qemu.sh` (`PATINA_MEM=512`, 600 s timeout), with `--novdso` reruns
+the clock rows with `patina.novdso=1`, and prints medians. The host runs
+other agents' guests concurrently, so a single run can be 10–30 % off; the
+median of 3 is what `doc/status.md` records. x86_64 is TCG on this host:
+its numbers are an emulator's, kept to catch regressions and ratios only.
+
+**Results (aarch64, HVF, 1 vCPU).** Syscall entry/exit 57 ns; vDSO
+`time.Now` 60 ns vs 266 ns without (Go then makes two syscalls per call);
+futex round trip 0.65 µs; pipe ping-pong 1.0 µs; TCP RTT 4.3 µs, 690 MB/s;
+AF_UNIX RTT 1.9 µs, 2.8 GB/s; thread create+exit 3.8 µs; signal round
+trip 3.2 µs. None reaches the pathology thresholds set for this task
+(futex > 50 µs, pipe ping-pong > 100 µs, TCP loopback < 200 MB/s, signal >
+100 µs on HVF), so no kernel change came out of it.
+
+**Known costs (explained, not fixed).** (1) TCP loopback carries ~4× less
+than AF_UNIX and has ~2.3× its round trip: every segment goes through
+smoltcp (segmentation, checksums, ACK processing) under the single stack
+lock and the net task (D67), while AF_UNIX has no protocol stack in the
+path (D71). (2) With 2 vCPUs, `signal-rtt` (3.2
+→ 6.9 µs) and `thread-create-exit` (3.8 → 6.6 µs) roughly double on HVF:
+the woken thread is placed on the other CPU, which costs a Reschedule IPI
+to a CPU idling in `wfi` (an HVF exit and re-entry); futex and pipe
+ping-pongs grow less (0.65 → 0.90, 1.0 → 1.4 µs). (3) x86_64
+`mmap-munmap-1M` at 2 vCPUs is 3× the 1-vCPU cost: `munmap` on x86 sends
+an `IpiKind::TlbFlush` IPI to the other CPU (`mm/tlb.rs`), which TCG
+makes expensive; aarch64 uses broadcast `tlbi …is` and shows no change.
+
+**Go version matrix.** Design §13 asks for the latest two Go releases.
+`scripts/build-testapp.sh` takes `GO=<go command>` (default `go`, so no
+behaviour change); go1.26.9 was installed through `golang.org/dl` outside
+the repo. hello, threads, fdtest, fileio, signals, sockets, unixsock,
+httphello `-selftest` and bench built with go1.26.9 pass on both arches
+under `patina.strace=1`, as with go1.27.1; the ENOSYS set is the same for
+both (`copy_file_range`, silent, Go falls back) and the distinct-syscall
+sets match up to timing noise. `scripts/test-os.sh aarch64` with go1.26.9
+first in `PATH` (test-gopkg.sh calls plain `go`; the knob does not reach
+it, a PATH shim does) gives 247 passed / 0 failed, ENOSYS `pidfd_open`
+only; 1.27 has one more top-level test (248).
+
+**Static diff of Go 1.27.1's syscalls against the dispatch table.** Every
+`SYS_*` number referenced by `runtime/sys_linux_{amd64,arm64}.s`,
+`internal/runtime/syscall/linux`, `internal/syscall/unix` (incl. its
+`*Trap` numbers), `syscall` (incl. `_SYS_clone3`, `_SYS_faccessat2`,
+`_SYS_fchmodat2`), `os`, `os/signal`, `net`, `internal/poll`,
+`crypto/rand` and `time` was compared with `kernel/src/syscall/mod.rs`.
+Nothing a normal `os`/`net`/runtime path issues is missing. Not
+implemented (fall to `enosys`, logged once): `inotify_init`/`inotify_init1`/
+`inotify_add_watch`/`inotify_rm_watch` (D57; `syscall` wrappers only, no
+std path uses them), `select` (amd64) and `pselect6` (arm64) — only
+`syscall.Select`, no std path, but third-party code calling it gets
+ENOSYS, the most plausible gap; `utime` and `ustat` (amd64 legacy
+wrappers; `os.Chtimes` uses `utimensat`); privileged or exec-only calls
+`ptrace`, `mount`, `pivot_root`, `unshare`, `acct`, `adjtimex`,
+`settimeofday`, `reboot`, `sethostname`, `setdomainname`, `syslog`,
+`ioperm`, `iopl`. `fcntl64` and the `*32` id calls are 32-bit-only names.
+ENOSYS by design and handled by Go: `pidfd_open`, `pidfd_send_signal`,
+`clone3`, `openat2`, `copy_file_range`, `execve`, `rseq`, `membarrier`,
+`set_robust_list` (D57).

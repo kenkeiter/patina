@@ -4,6 +4,9 @@
 #   scripts/build-testapp.sh <name> <aarch64|x86_64> <out>
 #
 # e.g. scripts/build-testapp.sh hello aarch64 out/hello-aarch64
+#
+# GO names the Go command to build with (default `go`), e.g.
+# GO=go1.26.9 for the two-version matrix (design §13, decision D79).
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
@@ -28,5 +31,5 @@ out_abs=$(cd "$(dirname "$out")" && pwd)/$(basename "$out")
 
 cd "$root/testapps"
 GOOS=linux GOARCH=$goarch CGO_ENABLED=0 \
-  go build -trimpath -ldflags=-extldflags=-static -o "$out_abs" "./$name"
+  "${GO:-go}" build -trimpath -ldflags=-extldflags=-static -o "$out_abs" "./$name"
 echo "$out_abs"
