@@ -32,7 +32,7 @@ use alloc::vec::Vec;
 
 use patina_abi::current::{EpollEvent, Stat};
 use patina_abi::epoll::EpollFlags;
-use patina_abi::errno::{EEXIST, EINVAL, ENOENT, EPERM, Errno};
+use patina_abi::errno::{EEXIST, EINTR, EINVAL, ENOENT, EPERM, Errno};
 use patina_abi::fs::S_IFREG;
 
 use super::file::{File, OpenFile, PollHook, PollList, alloc_ino, anon_stat};
@@ -248,9 +248,15 @@ impl Epoll {
 
     /// Collect up to `max` events. With `block`, waits until at least one
     /// is available or `deadline` (monotonic ns; `None` = forever) passes;
-    /// without, returns at once (`timeout == 0`).
-    // TODO(signals): the block below must become interruptible (EINTR).
-    pub fn wait(&self, max: usize, block: bool, deadline: Option<u64>) -> Vec<EpollEvent> {
+    /// without, returns at once (`timeout == 0`). The wait is
+    /// interruptible: a pending signal ends it with `EINTR` (never
+    /// restarted, as Linux's `ep_poll`).
+    pub fn wait(
+        &self,
+        max: usize,
+        block: bool,
+        deadline: Option<u64>,
+    ) -> Result<Vec<EpollEvent>, Errno> {
         let mut out = Vec::new();
         let mut may_block = block;
         loop {
@@ -309,7 +315,7 @@ impl Epoll {
             if !out.is_empty() || !may_block {
                 drop(g);
                 drop(dead_items);
-                return out;
+                return Ok(out);
             }
             if !g.ready.is_empty() {
                 // Something was queued while we polled: look again.
@@ -318,14 +324,16 @@ impl Epoll {
                 continue;
             }
             if deadline.is_some_and(|d| crate::arch::timer::now_ns() >= d) {
-                return out;
+                return Ok(out);
             }
             // `dead_items` holds no file reference; dropping it under the
             // lock is fine, but keep it simple and drop first.
             drop(dead_items);
-            if wait::block(g, waiters, 0, 0, deadline) == WakeReason::TimedOut {
+            match wait::block_interruptible(g, waiters, 0, 0, deadline) {
                 // One last non-blocking look (Linux re-checks too).
-                may_block = false;
+                WakeReason::TimedOut => may_block = false,
+                WakeReason::Interrupted => return Err(Errno(EINTR)),
+                WakeReason::Woken => {}
             }
         }
     }

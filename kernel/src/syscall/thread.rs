@@ -13,6 +13,7 @@ use patina_abi::time::Timespec;
 use super::{SysResult, with_space};
 use crate::arch::ctx::{self, TrapFrame};
 use crate::arch::timer;
+use crate::task::signal::{ERESTART_RESTARTBLOCK, ERESTARTSYS, RestartBlock};
 use crate::task::{self, futex, sched};
 
 /// `clone(flags, stack, ptid, ctid/tls, tls/ctid)` (argument order per
@@ -51,7 +52,7 @@ pub fn clone(frame: &TrapFrame, a: &[u64; 6]) -> SysResult {
     // kernel). aarch64: FP state is in the frame; this is a no-op.
     let mut fp = ctx::FpState::default();
     ctx::fp_save(&mut fp);
-    let mask = task::current().sig.lock().mask;
+    let mask = task::current().blocked();
     let cleartid = if flags.contains(CloneFlags::CHILD_CLEARTID) {
         args.child_tid
     } else {
@@ -127,8 +128,7 @@ pub fn futex(uaddr: usize, op: i32, val: u32, timeout: usize, val3: u32) -> SysR
             } else {
                 None
             };
-            futex::wait(uaddr, val, bits, deadline)?;
-            Ok(0)
+            futex_wait(uaddr, val, bits, deadline)
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             let bits = if cmd == FUTEX_WAKE {
@@ -144,6 +144,30 @@ pub fn futex(uaddr: usize, op: i32, val: u32, timeout: usize, val3: u32) -> SysR
             Ok(futex::wake(uaddr, n, bits) as isize)
         }
         _ => Err(Errno(ENOSYS)),
+    }
+}
+
+/// `FUTEX_WAIT` body (also `restart_syscall`'s continuation). Interrupted
+/// by a signal: without a timeout `ERESTARTSYS` (restarted if the handler
+/// has `SA_RESTART`, else `EINTR`); with one `ERESTART_RESTARTBLOCK` with
+/// the absolute deadline in the restart block (`EINTR` when a handler
+/// runs), as Linux's `futex_wait`.
+pub fn futex_wait(uaddr: usize, val: u32, bits: u32, deadline: Option<u64>) -> SysResult {
+    match futex::wait(uaddr, val, bits, deadline) {
+        Ok(()) => Ok(0),
+        Err(Errno(ERESTARTSYS)) => match deadline {
+            None => Err(Errno(ERESTARTSYS)),
+            Some(deadline) => {
+                *task::current().restart_block.lock() = Some(RestartBlock::FutexWait {
+                    uaddr,
+                    val,
+                    bits,
+                    deadline,
+                });
+                Err(Errno(ERESTART_RESTARTBLOCK))
+            }
+        },
+        Err(e) => Err(e),
     }
 }
 

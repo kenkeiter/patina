@@ -23,13 +23,13 @@
 //! entries (the thread timed out, or was woken through another path) fail
 //! the sequence check and are skipped.
 //!
-//! Phase 2 (signals): an interruptible block is ended by signal delivery
-//! with a third [`WakeReason`] (→ `EINTR`/restart).
+//! [`block_interruptible`] / [`sleep_until_interruptible`] are also ended
+//! by a pending signal ([`WakeReason::Interrupted`], → `EINTR`/restart).
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 
-use super::{Thread, WakeReason, sched, sleep};
+use super::{Thread, WakeReason, sched, signal, sleep};
 use crate::arch::irq;
 use crate::sync::SpinLockGuard;
 
@@ -109,16 +109,50 @@ impl WaitQueue {
 /// a waker removes it (`Woken`) or, with `deadline` (monotonic ns), until
 /// the deadline passes (`TimedOut`). `key`/`bits` are stored in the
 /// [`Waiter`] for the waker's matching. The guard is released before the
-/// switch; the lock is not held on return.
+/// switch; the lock is not held on return. Signals do not end this block
+/// (Linux `TASK_UNINTERRUPTIBLE`); see [`block_interruptible`].
 pub fn block<T: ?Sized>(
-    mut guard: SpinLockGuard<'_, T>,
+    guard: SpinLockGuard<'_, T>,
     queue: fn(&mut T) -> &mut WaitQueue,
     key: usize,
     bits: u32,
     deadline: Option<u64>,
 ) -> WakeReason {
+    block_impl(guard, queue, key, bits, deadline, false)
+}
+
+/// As [`block`], but the block also ends with [`WakeReason::Interrupted`]
+/// when a signal the thread does not block is (or already was) pending
+/// for it (`task::signal` queues it and calls `sched::kick`). The caller
+/// then returns one of the internal restart codes
+/// (`signal::ERESTARTSYS` for "restart if `SA_RESTART`, else `EINTR`",
+/// `ERESTARTNOHAND`, `ERESTART_RESTARTBLOCK`); signal delivery on the way
+/// back to user mode turns it into `EINTR` or re-executes the syscall.
+/// The thread is off the wait queue and the sleep list on return.
+pub fn block_interruptible<T: ?Sized>(
+    guard: SpinLockGuard<'_, T>,
+    queue: fn(&mut T) -> &mut WaitQueue,
+    key: usize,
+    bits: u32,
+    deadline: Option<u64>,
+) -> WakeReason {
+    block_impl(guard, queue, key, bits, deadline, true)
+}
+
+fn block_impl<T: ?Sized>(
+    mut guard: SpinLockGuard<'_, T>,
+    queue: fn(&mut T) -> &mut WaitQueue,
+    key: usize,
+    bits: u32,
+    deadline: Option<u64>,
+    intr: bool,
+) -> WakeReason {
     let t = sched::current_arc();
-    let seq = t.begin_block();
+    let seq = if intr {
+        t.begin_block_interruptible()
+    } else {
+        t.begin_block()
+    };
     queue(&mut guard).list.push_back(Waiter {
         thread: t.clone(),
         seq,
@@ -129,12 +163,21 @@ pub fn block<T: ?Sized>(
         sleep::add(d, t.clone(), seq);
     }
     let (lock, flags) = guard.unlock_irqs_masked();
-    sched::schedule();
+    // A signal that was queued before `begin_block` published the
+    // interruptible state was not able to kick us: check now (SeqCst on
+    // both sides, see `Thread::begin_block_interruptible`).
+    if !(intr && signal::deliverable(&t) && t.cancel_block(seq)) {
+        sched::schedule();
+    }
     let reason = t.wake_reason();
     match reason {
-        WakeReason::TimedOut => {
+        WakeReason::TimedOut | WakeReason::Interrupted => {
             let mut g = lock.lock();
             queue(&mut g).remove(&t, seq);
+            drop(g);
+            if reason == WakeReason::Interrupted && deadline.is_some() {
+                sleep::cancel(&t, seq);
+            }
         }
         WakeReason::Woken => {
             if deadline.is_some() {
@@ -156,4 +199,26 @@ pub fn sleep_until(deadline: u64) {
         sched::schedule();
     }
     irq::restore(flags);
+}
+
+/// Sleep until `deadline` (monotonic ns; `u64::MAX` = until a signal)
+/// unless a signal interrupts it: `TimedOut` when the deadline passed,
+/// `Interrupted` when a deliverable signal is pending.
+pub fn sleep_until_interruptible(deadline: u64) -> WakeReason {
+    let flags = irq::save_disable();
+    let mut reason = WakeReason::TimedOut;
+    if crate::arch::timer::now_ns() < deadline {
+        let t = sched::current_arc();
+        let seq = t.begin_block_interruptible();
+        sleep::add(deadline, t.clone(), seq);
+        if !(signal::deliverable(&t) && t.cancel_block(seq)) {
+            sched::schedule();
+        }
+        reason = t.wake_reason();
+        if reason == WakeReason::Interrupted {
+            sleep::cancel(&t, seq);
+        }
+    }
+    irq::restore(flags);
+    reason
 }

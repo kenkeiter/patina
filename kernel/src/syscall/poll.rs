@@ -2,21 +2,23 @@
 //! `epoll_pwait2`, x86 `epoll_create`/`epoll_wait`) and `ppoll` / x86
 //! `poll`, all over `File::poll` (see `fs/file.rs`, `fs/epoll.rs`).
 //!
-//! Signals: the temporary `sigmask` of `epoll_pwait`/`ppoll` is installed
-//! for the wait and restored afterwards. The waits are not interruptible
-//! yet. TODO(signals): use the interruptible block (→ `EINTR`) in
-//! `Epoll::wait` and `PollWaiter::wait`, and keep the temporary mask
-//! installed until a handler run for a signal that interrupted the wait
-//! returns (Linux `saved_sigmask` / `restore_saved_sigmask_unless`).
+//! Signals: the waits are interruptible. `epoll_pwait` returns `EINTR`
+//! (never restarted, as Linux); `ppoll`/`poll` return `ERESTARTNOHAND`
+//! (`EINTR` when a handler runs, transparently re-executed with the
+//! original timeout otherwise). The temporary `sigmask` of
+//! `epoll_pwait`/`ppoll` stays installed when the wait was interrupted, so
+//! the handler runs under it and the frame saves the original mask (Linux
+//! `saved_sigmask` / `restore_saved_sigmask_unless`); otherwise the
+//! original mask is restored on return.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use patina_abi::current::EpollEvent;
 use patina_abi::epoll::{EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EpollFlags};
-use patina_abi::errno::{EINVAL, Errno};
+use patina_abi::errno::{EINTR, EINVAL, Errno};
 use patina_abi::fs::{O_RDWR, POLLNVAL, PollFd};
-use patina_abi::signal::{SIGSET_SIZE, SigSet, UNBLOCKABLE};
+use patina_abi::signal::{SIGSET_SIZE, SigSet};
 use patina_abi::time::Timespec;
 use patina_abi::zerocopy::{FromZeros, IntoBytes};
 
@@ -25,7 +27,7 @@ use super::{SysResult, proc, with_space};
 use crate::arch::timer;
 use crate::fs::epoll::Epoll;
 use crate::fs::file::{OpenFile, PollHook, PollWaiter};
-use crate::task::{self, WakeReason};
+use crate::task::{WakeReason, signal};
 
 /// How long to wait: `block == false` → return at once.
 #[derive(Clone, Copy)]
@@ -71,25 +73,27 @@ impl Timeout {
 }
 
 /// Run `f` with the thread's signal mask temporarily set to the user mask
-/// at `mask` (if non-NULL).
-fn with_sigmask<R>(mask: usize, size: usize, f: impl FnOnce() -> R) -> Result<R, Errno> {
+/// at `mask` (if non-NULL). If `f` was interrupted by a signal (`EINTR` /
+/// `ERESTARTNOHAND`) the temporary mask stays until signal delivery
+/// restores the saved one.
+fn with_sigmask<R>(
+    mask: usize,
+    size: usize,
+    f: impl FnOnce() -> Result<R, Errno>,
+) -> Result<R, Errno> {
     if mask == 0 {
-        return Ok(f());
+        return f();
     }
     if size != SIGSET_SIZE {
         return Err(Errno(EINVAL));
     }
     let m: SigSet = with_space(|s| s.read_val(mask))?;
-    let t = task::current();
-    let old = {
-        let mut st = t.sig.lock();
-        let old = st.mask;
-        st.mask = m & !UNBLOCKABLE;
-        old
-    };
+    signal::set_temp_mask(m);
     let r = f();
-    t.sig.lock().mask = old;
-    Ok(r)
+    if !matches!(r, Err(Errno(EINTR)) | Err(Errno(signal::ERESTARTNOHAND))) {
+        signal::restore_saved_mask();
+    }
+    r
 }
 
 pub fn epoll_create1(flags: u32) -> SysResult {
@@ -233,16 +237,18 @@ fn do_poll(fds: usize, nfds: usize, tmo: Timeout, sigmask: usize, sigsetsize: us
         let mut block = tmo.block;
         loop {
             if !block {
-                return poll_once(&mut pfds, &files, None);
+                return Ok(poll_once(&mut pfds, &files, None));
             }
             let w = PollWaiter::new();
             let hook: Arc<dyn PollHook> = w.clone();
             let n = poll_once(&mut pfds, &files, Some(&hook));
             if n > 0 {
-                return n;
+                return Ok(n);
             }
-            if w.wait(tmo.deadline) == WakeReason::TimedOut {
-                block = false;
+            match w.wait(tmo.deadline) {
+                WakeReason::TimedOut => block = false,
+                WakeReason::Interrupted => return Err(Errno(signal::ERESTARTNOHAND)),
+                WakeReason::Woken => {}
             }
         }
     })?;

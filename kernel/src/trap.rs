@@ -32,8 +32,18 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use patina_abi::current::nr;
 use patina_abi::errno;
+use patina_abi::signal::{
+    BUS_ADRALN, FPE_FLTINV, FPE_INTDIV, SEGV_ACCERR, SEGV_MAPERR, SIGBUS, SIGFPE, SIGILL, SIGSEGV,
+    SIGTRAP, SigInfo,
+};
+#[cfg(target_arch = "aarch64")]
+use patina_abi::signal::{ILL_ILLOPC, TRAP_BRKPT};
+#[cfg(target_arch = "x86_64")]
+use patina_abi::signal::{ILL_ILLOPN, TRAP_TRACE};
 
 use crate::arch::ctx::TrapFrame;
+use crate::arch::sigframe;
+use crate::task::signal;
 
 /// Timer tick rate requested from `arch::timer::init` (Hz).
 pub const TICK_HZ: u64 = 100;
@@ -60,7 +70,7 @@ pub enum FaultKind {
 }
 
 /// A synchronous exception from user mode that is not a syscall or a page
-/// fault. Phase 2 maps these to signals.
+/// fault. `user_exception` maps these to signals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exception {
     /// `#UD` / undefined instruction → `SIGILL`.
@@ -130,35 +140,74 @@ pub fn syscall(frame: &mut TrapFrame) {
 
 /// A user-mode memory fault at `addr`. Returns normally once the fault has
 /// been resolved (e.g. a lazily mapped page was filled in) so the arch can
-/// retry the access; on an unrecoverable fault the core terminates the
-/// program itself (dump + exit) and does not return.
+/// retry the access. Otherwise the fault becomes a forced signal on the
+/// current thread (SIGSEGV with `SEGV_MAPERR` when no VMA covers `addr`,
+/// `SEGV_ACCERR` when one does but forbids the access; SIGBUS/`BUS_ADRALN`
+/// for alignment faults), delivered by [`before_return_to_user`]. Without
+/// a process (arch self-tests) the fault is fatal.
 pub fn user_fault(frame: &mut TrapFrame, addr: usize, access: Access, kind: FaultKind) {
-    let proc = crate::task::try_process();
-    if kind != FaultKind::Alignment
-        && let Some(p) = proc
-        && p.space.lock().handle_fault(addr, access)
-    {
+    let Some(p) = crate::task::try_process() else {
+        crate::kprintln!(
+            "[patina] fatal: user {:?} fault ({:?}) at {:#x}",
+            access,
+            kind,
+            addr
+        );
+        frame.dump();
+        crate::exit(128 + SIGSEGV)
+    };
+    if kind != FaultKind::Alignment && p.space.lock().handle_fault(addr, access) {
         return;
     }
-    // Phase 2: deliver SIGSEGV (SEGV_MAPERR/ACCERR) / SIGBUS instead.
-    crate::kprintln!(
-        "[patina] fatal: user {:?} fault ({:?}) at {:#x}",
-        access,
-        kind,
-        addr
+    let (sig, code) = if kind == FaultKind::Alignment {
+        (SIGBUS, BUS_ADRALN)
+    } else if p.space.lock().find(addr).is_some() {
+        (SIGSEGV, SEGV_ACCERR)
+    } else {
+        (SIGSEGV, SEGV_MAPERR)
+    };
+    signal::force_fault(
+        SigInfo::fault(sig, code, addr as u64),
+        Some(sigframe::fault_info(frame, addr as u64)),
     );
-    frame.dump();
-    if let Some(p) = proc {
-        p.space.lock().dump();
-    }
-    crate::exit(128 + 11)
 }
 
-/// A non-fault, non-syscall synchronous exception from user mode.
+/// A non-fault, non-syscall synchronous exception from user mode: forced
+/// signal as Linux sends it (SIGILL `ILL_ILLOPN` on x86_64 / `ILL_ILLOPC`
+/// on aarch64 with `si_addr` = pc; SIGTRAP: x86 `int3` is `SI_KERNEL`
+/// with rip after the `int3`, aarch64 `BRK` is `TRAP_BRKPT` with pc at the
+/// `BRK`; x86 `#DE` SIGFPE `FPE_INTDIV` at pc; x86 `#GP` SIGSEGV and `#SS`
+/// SIGBUS with `SI_KERNEL`).
 pub fn user_exception(frame: &mut TrapFrame, exc: Exception) {
-    crate::kprintln!("[patina] fatal: user exception {:?}", exc);
-    frame.dump();
-    crate::exit(128 + 4)
+    if crate::task::try_process().is_none() {
+        crate::kprintln!("[patina] fatal: user exception {:?}", exc);
+        frame.dump();
+        crate::exit(128 + SIGILL)
+    }
+    let pc = frame.pc();
+    #[cfg(target_arch = "x86_64")]
+    const ILL_CODE: i32 = ILL_ILLOPN;
+    #[cfg(target_arch = "aarch64")]
+    const ILL_CODE: i32 = ILL_ILLOPC;
+    let info = match exc {
+        Exception::IllegalInstruction => SigInfo::fault(SIGILL, ILL_CODE, pc),
+        #[cfg(target_arch = "x86_64")]
+        Exception::Breakpoint => SigInfo::kernel(SIGTRAP),
+        #[cfg(target_arch = "aarch64")]
+        Exception::Breakpoint => SigInfo::fault(SIGTRAP, TRAP_BRKPT, pc),
+        Exception::DivideError => SigInfo::fault(SIGFPE, FPE_INTDIV, pc),
+        Exception::FloatingPoint => SigInfo::fault(SIGFPE, FPE_FLTINV, pc),
+        #[cfg(target_arch = "x86_64")]
+        Exception::Other { code } => match code >> 32 {
+            1 => SigInfo::fault(SIGTRAP, TRAP_TRACE, pc),
+            12 => SigInfo::kernel(SIGBUS),
+            13 => SigInfo::kernel(SIGSEGV),
+            _ => SigInfo::fault(SIGILL, ILL_CODE, pc),
+        },
+        #[cfg(target_arch = "aarch64")]
+        Exception::Other { .. } => SigInfo::fault(SIGILL, ILL_CODE, pc),
+    };
+    signal::force_fault(info, Some(sigframe::exception_info(frame)));
 }
 
 /// Timer tick (IRQs masked). `from_user` is true when the interrupt
@@ -175,12 +224,13 @@ pub fn timer_tick(_frame: &mut TrapFrame, _from_user: bool) {
 /// Called by the arch on every return to user mode (after a syscall, fault
 /// or interrupt handled in `frame`), with interrupts disabled. Runs a
 /// pending reschedule (the thread may switch out here and resume later
-/// with `frame` intact on its kernel stack).
-///
-/// Phase 2: signal delivery hooks in here, after the reschedule (so it
-/// runs on the thread that is about to return to user mode): check the
-/// thread's and the process's pending sets against the mask and build the
-/// `rt_sigframe` by editing `frame`.
-pub fn before_return_to_user(_frame: &mut TrapFrame) {
+/// with `frame` intact on its kernel stack), then signal delivery for the
+/// thread about to return (`task::signal::deliver`: dequeue one
+/// deliverable signal, build its `rt_sigframe` by editing `frame`, resolve
+/// syscall restarts; a few loads when nothing is pending).
+pub fn before_return_to_user(frame: &mut TrapFrame) {
     crate::task::sched::before_return_to_user();
+    if crate::task::try_process().is_some() {
+        signal::deliver(frame);
+    }
 }

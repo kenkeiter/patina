@@ -24,7 +24,9 @@ use super::{SysResult, proc, with_space};
 use crate::fs::file::{OpenFile, wait_ready};
 use crate::fs::{eventfd, pipe};
 use crate::sync::SpinLock;
-use crate::task;
+use crate::task::signal::{self, ERESTARTSYS};
+use crate::task::{self, WakeReason};
+use patina_abi::signal::{SI_USER, SIGPIPE, SigInfo};
 
 const PATH_MAX: usize = 4096;
 /// Kernel bounce buffer per read/write step.
@@ -55,7 +57,11 @@ fn read_into(of: &OpenFile, kbuf: &mut [u8]) -> Result<usize, Errno> {
         let fl = of.flags();
         match of.file.read(kbuf, fl) {
             Err(Errno(EAGAIN)) if !fl.nonblocking() => {
-                wait_ready(&*of.file, EpollFlags::IN | EpollFlags::RDNORM, None);
+                if wait_ready(&*of.file, EpollFlags::IN | EpollFlags::RDNORM, None)
+                    == WakeReason::Interrupted
+                {
+                    return Err(Errno(ERESTARTSYS));
+                }
             }
             r => return r,
         }
@@ -81,12 +87,22 @@ fn write_from(of: &OpenFile, ubuf: usize, len: usize) -> SysResult {
                 Ok(0) => return Ok((done + off) as isize),
                 Ok(w) => off += w,
                 Err(Errno(EAGAIN)) if !fl.nonblocking() => {
-                    wait_ready(&*of.file, EpollFlags::OUT | EpollFlags::WRNORM, None);
+                    if wait_ready(&*of.file, EpollFlags::OUT | EpollFlags::WRNORM, None)
+                        == WakeReason::Interrupted
+                    {
+                        // Linux pipe_write: bytes written so far, else
+                        // -ERESTARTSYS.
+                        return partial(done + off, Errno(ERESTARTSYS));
+                    }
                 }
                 Err(e) => {
                     if e == Errno(EPIPE) {
-                        // TODO(signals): queue SIGPIPE to the writing thread
-                        // (signal::send_to_thread(task::current(), SIGPIPE)).
+                        // Linux `send_sig(SIGPIPE, current, 0)`.
+                        let pid = task::process().pid as i32;
+                        signal::send_to_thread(
+                            &task::sched::current_arc(),
+                            SigInfo::kill(SIGPIPE, SI_USER, pid, 0),
+                        );
                     }
                     return partial(done + off, e);
                 }

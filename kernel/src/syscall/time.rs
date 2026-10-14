@@ -11,7 +11,8 @@ use patina_abi::time::{
 
 use super::{SysResult, with_space};
 use crate::arch::timer;
-use crate::task;
+use crate::task::signal::{ERESTART_RESTARTBLOCK, ERESTARTNOHAND, RestartBlock};
+use crate::task::{self, WakeReason, wait};
 
 fn is_realtime(clk: i32) -> bool {
     matches!(
@@ -60,37 +61,50 @@ pub fn gettimeofday(tv: usize) -> SysResult {
     Ok(0)
 }
 
-/// Block until `now_ns() >= deadline` (monotonic), running other threads
-/// meanwhile (sleep list, tick granularity). No signals yet, so never
-/// interrupted (Phase 2: EINTR + `rem`).
-fn sleep_until(deadline: u64) {
-    task::wait::sleep_until(deadline);
-}
-
 fn read_timespec(p: usize) -> Result<u64, Errno> {
     let ts: Timespec = with_space(|s| s.read_val(p))?;
     ts.to_nanos().ok_or(Errno(EINVAL))
 }
 
-/// `rem` is only written on EINTR, which cannot happen before signals.
-pub fn nanosleep(req: usize, _rem: usize) -> SysResult {
-    let ns = read_timespec(req)?;
-    sleep_until(timer::now_ns().saturating_add(ns));
-    Ok(0)
+/// Sleep until `deadline` (monotonic ns), interruptible. On a signal:
+/// write the remaining time to `rem` (if non-zero) and return
+/// `ERESTART_RESTARTBLOCK` with a restart block, so the call becomes
+/// `EINTR` when a handler runs (whatever `SA_RESTART` says, as Linux) and
+/// continues to the same deadline through `restart_syscall` otherwise.
+pub fn sleep_restartable(deadline: u64, rem: usize) -> SysResult {
+    if wait::sleep_until_interruptible(deadline) != WakeReason::Interrupted {
+        return Ok(0);
+    }
+    if rem != 0 {
+        let left = deadline.saturating_sub(timer::now_ns());
+        with_space(|s| s.write_val(rem, &Timespec::from_nanos(left)))?;
+    }
+    *task::current().restart_block.lock() = Some(RestartBlock::Nanosleep { deadline, rem });
+    Err(Errno(ERESTART_RESTARTBLOCK))
 }
 
-pub fn clock_nanosleep(clk: i32, flags: i32, req: usize, _rem: usize) -> SysResult {
+pub fn nanosleep(req: usize, rem: usize) -> SysResult {
+    let ns = read_timespec(req)?;
+    sleep_restartable(timer::now_ns().saturating_add(ns), rem)
+}
+
+/// `clock_nanosleep`: relative sleeps behave like `nanosleep`; with
+/// `TIMER_ABSTIME` an interrupted sleep returns `ERESTARTNOHAND` (EINTR
+/// with a handler, transparently re-executed otherwise) and never writes
+/// `rem`.
+pub fn clock_nanosleep(clk: i32, flags: i32, req: usize, rem: usize) -> SysResult {
     let ns = read_timespec(req)?;
     clock_now(clk)?;
-    let deadline = if flags & TIMER_ABSTIME != 0 {
-        if is_realtime(clk) {
-            ns.saturating_sub(task::process().epoch_ns)
-        } else {
-            ns
-        }
+    if flags & TIMER_ABSTIME == 0 {
+        return sleep_restartable(timer::now_ns().saturating_add(ns), rem);
+    }
+    let deadline = if is_realtime(clk) {
+        ns.saturating_sub(task::process().epoch_ns)
     } else {
-        timer::now_ns().saturating_add(ns)
+        ns
     };
-    sleep_until(deadline);
-    Ok(0)
+    match wait::sleep_until_interruptible(deadline) {
+        WakeReason::Interrupted => Err(Errno(ERESTARTNOHAND)),
+        _ => Ok(0),
+    }
 }

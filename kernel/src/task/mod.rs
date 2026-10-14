@@ -11,12 +11,14 @@
 //! * [`wait`]: wait queues and the lost-wakeup-free `block` primitive;
 //! * [`sleep`]: the deadline-ordered sleep list expired from the tick;
 //! * [`futex`]: the futex hash table;
-//! * [`kstack`]: kernel stacks with guard pages.
+//! * [`kstack`]: kernel stacks with guard pages;
+//! * [`signal`]: pending sets, sending, delivery and `rt_sigreturn`.
 
 pub mod futex;
 pub mod kstack;
 pub mod sched;
 pub mod selftest;
+pub mod signal;
 pub mod sleep;
 pub mod wait;
 
@@ -25,7 +27,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use patina_abi::errno::{EAGAIN, ENOMEM, Errno};
 use patina_abi::signal::{SS_DISABLE, SigAction, SigSet, StackT};
@@ -88,11 +90,12 @@ pub struct KernelStack {
     pub top: usize,
 }
 
-/// Per-thread signal state.
+/// Per-thread signal state that only the thread itself touches (the
+/// blocked mask is [`Thread::blocked`], readable by senders).
 #[derive(Clone, Copy, Debug)]
 pub struct SigState {
-    /// Blocked signals (never contains SIGKILL/SIGSTOP).
-    pub mask: SigSet,
+    /// `sigaltstack` as Linux stores it: `ss_flags` is the raw value the
+    /// program passed (`SS_DISABLE` with sp = size = 0 when disabled).
     pub altstack: StackT,
 }
 
@@ -124,20 +127,36 @@ pub enum WakeReason {
     Woken,
     /// The deadline passed (sleep list).
     TimedOut,
+    /// A signal became pending for a thread in an interruptible block
+    /// (`wait::block_interruptible`); the syscall returns `EINTR` or is
+    /// restarted (see `task::signal`).
+    Interrupted,
 }
 
-// Packed scheduling word: bits 0..4 state, bit 4 wake reason (TimedOut),
-// bits 8.. the block sequence number. Every block increments the sequence,
-// so a wake-up carrying a stale sequence (a sleep-list entry or wait-queue
-// entry from an earlier block) fails its compare-exchange. One atomic word
-// keeps this correct when Phase 2 wakes threads from other CPUs.
+// Packed scheduling word: bits 0..4 state, bits 4..6 wake reason
+// (0 Woken, 1 TimedOut, 2 Interrupted), bit 6 "blocked interruptibly",
+// bits 8.. the block sequence number. Every block increments the
+// sequence, so a wake-up carrying a stale sequence (a sleep-list entry or
+// wait-queue entry from an earlier block) fails its compare-exchange. One
+// atomic word keeps this correct when Phase 2 wakes threads from other
+// CPUs.
 const ST_RUNNABLE: u64 = 0;
 const ST_RUNNING: u64 = 1;
 const ST_BLOCKED: u64 = 2;
 const ST_DEAD: u64 = 3;
 const ST_MASK: u64 = 0xf;
-const ST_TIMED_OUT: u64 = 1 << 4;
+const ST_REASON_SHIFT: u32 = 4;
+const ST_REASON_MASK: u64 = 0b11 << ST_REASON_SHIFT;
+const ST_INTR: u64 = 1 << 6;
 const SEQ_SHIFT: u32 = 8;
+
+const fn reason_bits(r: WakeReason) -> u64 {
+    (match r {
+        WakeReason::Woken => 0,
+        WakeReason::TimedOut => 1,
+        WakeReason::Interrupted => 2,
+    }) << ST_REASON_SHIFT
+}
 
 /// What a thread runs.
 #[derive(Clone, Copy, Debug)]
@@ -185,6 +204,25 @@ pub struct Thread {
     pub(crate) on_cpu: AtomicBool,
     /// CPU time consumed (user + system), ns; see `sched::current_cpu_time_ns`.
     pub(crate) cpu_time_ns: AtomicU64,
+    /// Blocked signals (never SIGKILL/SIGSTOP). Written only by the thread
+    /// itself; read by senders choosing a target.
+    pub blocked: AtomicU64,
+    /// Thread-directed pending signals (`tgkill`, faults, thread timers).
+    pub sigq: SpinLock<signal::PendingQueue>,
+    /// Bits of `sigq` (updated under its lock, read lock-free by the
+    /// return-to-user fast path).
+    pub sig_pending: AtomicU64,
+    /// Linux `saved_sigmask`: the mask to restore (and to save in the
+    /// signal frame) after `rt_sigsuspend` / `epoll_pwait` / `ppoll` with
+    /// a temporary mask; `signal::NO_SAVED_MASK` when none. Only the
+    /// thread itself touches it.
+    pub saved_mask: AtomicU64,
+    /// Internal `ERESTART*` code of the syscall this thread is returning
+    /// from (set by `syscall::dispatch`, consumed by signal delivery); 0
+    /// when none.
+    pub restart: AtomicI32,
+    /// `restart_syscall` state for `ERESTART_RESTARTBLOCK`.
+    pub restart_block: SpinLock<Option<signal::RestartBlock>>,
     switch: UnsafeCell<SwitchState>,
 }
 
@@ -204,6 +242,7 @@ impl Thread {
         start: Option<StartState>,
         fp: Box<ctx::FpState>,
         sig: SigState,
+        blocked: SigSet,
     ) -> Thread {
         let kctx = match kind {
             ThreadKind::User => {
@@ -226,6 +265,12 @@ impl Thread {
             cpu: AtomicUsize::new(0),
             on_cpu: AtomicBool::new(false),
             cpu_time_ns: AtomicU64::new(0),
+            blocked: AtomicU64::new(blocked),
+            sigq: SpinLock::new(signal::PendingQueue::new()),
+            sig_pending: AtomicU64::new(0),
+            saved_mask: AtomicU64::new(signal::NO_SAVED_MASK),
+            restart: AtomicI32::new(0),
+            restart_block: SpinLock::new(None),
             switch: UnsafeCell::new(SwitchState {
                 kctx,
                 fp,
@@ -247,6 +292,12 @@ impl Thread {
         }
     }
 
+    /// The blocked signal mask.
+    #[inline]
+    pub fn blocked(&self) -> SigSet {
+        self.blocked.load(Ordering::SeqCst)
+    }
+
     /// Set the state, keeping the sequence (and clearing the wake reason
     /// unless going to Running, which keeps it for the woken thread).
     pub(crate) fn set_state(&self, st: ThreadState) {
@@ -256,10 +307,10 @@ impl Thread {
             ThreadState::Blocked => ST_BLOCKED,
             ThreadState::Dead => ST_DEAD,
         };
-        let keep = if v == ST_RUNNING { ST_TIMED_OUT } else { 0 };
+        let keep = if v == ST_RUNNING { ST_REASON_MASK } else { 0 };
         let mut w = self.sched_word.load(Ordering::Acquire);
         loop {
-            let new = (w & !ST_MASK & (!ST_TIMED_OUT | keep)) | v;
+            let new = (w & !ST_MASK & !ST_INTR & (!ST_REASON_MASK | keep)) | v;
             match self
                 .sched_word
                 .compare_exchange_weak(w, new, Ordering::AcqRel, Ordering::Acquire)
@@ -274,35 +325,77 @@ impl Thread {
     /// sequence, state Blocked. Returns the new sequence, which wake-ups
     /// must quote.
     pub(crate) fn begin_block(&self) -> u64 {
+        self.begin_block_with(false)
+    }
+
+    /// As [`begin_block`](Self::begin_block), but a signal may end the
+    /// block (`sched::kick` → `WakeReason::Interrupted`).
+    pub(crate) fn begin_block_interruptible(&self) -> u64 {
+        self.begin_block_with(true)
+    }
+
+    fn begin_block_with(&self, intr: bool) -> u64 {
         let w = self.sched_word.load(Ordering::Acquire);
         let seq = (w >> SEQ_SHIFT) + 1;
+        let flag = if intr { ST_INTR } else { 0 };
+        // SeqCst: pairs with the sender's SeqCst pending-bit update (the
+        // blocker re-checks pending signals after this store, the sender
+        // reads this word after its store; one of them sees the other).
         self.sched_word
-            .store((seq << SEQ_SHIFT) | ST_BLOCKED, Ordering::Release);
+            .store((seq << SEQ_SHIFT) | ST_BLOCKED | flag, Ordering::SeqCst);
         seq
     }
 
     /// Blocked (in block `seq`) → Runnable with `reason`. False if the
-    /// thread was already woken or has blocked again since.
+    /// thread was already woken or has blocked again since, or (for
+    /// `Interrupted`) if the block is not interruptible.
     pub(crate) fn try_wake(&self, seq: u64, reason: WakeReason) -> bool {
-        let from = (seq << SEQ_SHIFT) | ST_BLOCKED;
-        let to = (seq << SEQ_SHIFT)
-            | ST_RUNNABLE
-            | if reason == WakeReason::TimedOut {
-                ST_TIMED_OUT
-            } else {
-                0
-            };
+        let mut w = self.sched_word.load(Ordering::Acquire);
+        loop {
+            if w >> SEQ_SHIFT != seq
+                || w & ST_MASK != ST_BLOCKED
+                || (reason == WakeReason::Interrupted && w & ST_INTR == 0)
+            {
+                return false;
+            }
+            let to = (seq << SEQ_SHIFT) | ST_RUNNABLE | reason_bits(reason);
+            match self
+                .sched_word
+                .compare_exchange(w, to, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(cur) => w = cur,
+            }
+        }
+    }
+
+    /// The calling thread, Blocked in block `seq` but not yet switched
+    /// out, found a pending signal: back to Running with reason
+    /// `Interrupted`. False if a waker got there first (it has then also
+    /// queued the thread; the caller must go through `schedule`).
+    pub(crate) fn cancel_block(&self, seq: u64) -> bool {
+        let from = self.sched_word.load(Ordering::Acquire);
+        if from >> SEQ_SHIFT != seq || from & ST_MASK != ST_BLOCKED {
+            return false;
+        }
+        let to = (seq << SEQ_SHIFT) | ST_RUNNING | reason_bits(WakeReason::Interrupted);
         self.sched_word
             .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
+    /// The block sequence if the thread is blocked interruptibly.
+    pub(crate) fn interruptible_seq(&self) -> Option<u64> {
+        let w = self.sched_word.load(Ordering::SeqCst);
+        (w & ST_MASK == ST_BLOCKED && w & ST_INTR != 0).then_some(w >> SEQ_SHIFT)
+    }
+
     /// Why the last block ended.
     pub(crate) fn wake_reason(&self) -> WakeReason {
-        if self.sched_word.load(Ordering::Acquire) & ST_TIMED_OUT != 0 {
-            WakeReason::TimedOut
-        } else {
-            WakeReason::Woken
+        match (self.sched_word.load(Ordering::Acquire) & ST_REASON_MASK) >> ST_REASON_SHIFT {
+            1 => WakeReason::TimedOut,
+            2 => WakeReason::Interrupted,
+            _ => WakeReason::Woken,
         }
     }
 
@@ -335,6 +428,11 @@ static LIVE: AtomicUsize = AtomicUsize::new(0);
 /// to "any thread not masking it", /proc/self/task).
 static THREADS: SpinLock<BTreeMap<u32, Arc<Thread>>> = SpinLock::new(BTreeMap::new());
 
+/// Snapshot of all live threads (signal target selection).
+pub fn threads() -> Vec<Arc<Thread>> {
+    THREADS.lock().values().cloned().collect()
+}
+
 /// Look a thread up by tid.
 pub fn thread_by_tid(tid: u32) -> Option<Arc<Thread>> {
     THREADS.lock().get(&tid).cloned()
@@ -347,7 +445,6 @@ pub fn live_threads() -> usize {
 
 fn default_sig() -> SigState {
     SigState {
-        mask: 0,
         altstack: StackT {
             ss_flags: SS_DISABLE,
             ..StackT::default()
@@ -377,6 +474,7 @@ pub fn create_thread0(frame: ctx::TrapFrame) -> Arc<Thread> {
         }),
         Box::default(),
         default_sig(),
+        0,
     );
     register(t)
 }
@@ -408,10 +506,8 @@ pub fn spawn_user_thread(
             fp: fp.clone(),
         }),
         fp,
-        SigState {
-            mask,
-            ..default_sig()
-        },
+        default_sig(),
+        mask,
     );
     t.clear_child_tid.store(clear_child_tid, Ordering::Relaxed);
     Ok(register(t))
@@ -429,6 +525,7 @@ pub fn spawn_kernel_thread(f: fn()) -> Arc<Thread> {
         None,
         Box::default(),
         default_sig(),
+        0,
     ));
     sched::make_runnable(t.clone());
     t

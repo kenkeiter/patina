@@ -34,7 +34,9 @@ fn id(q: &mut WaitQueue) -> &mut WaitQueue {
 /// `FUTEX_WAIT(_BITSET)`: if the u32 at `uaddr` (4-aligned, checked by the
 /// caller) equals `val`, sleep until woken by a [`wake`] whose bitset
 /// intersects `bits`, or until `deadline` (monotonic ns) → `ETIMEDOUT`.
-/// `EAGAIN` if the value differs, `EFAULT` if unreadable.
+/// `EAGAIN` if the value differs, `EFAULT` if unreadable. The wait is
+/// interruptible: a signal ends it with the internal `ERESTARTSYS` (the
+/// caller turns it into the right restart code).
 pub fn wait(uaddr: usize, val: u32, bits: u32, deadline: Option<u64>) -> Result<(), Errno> {
     let b = bucket(uaddr).lock();
     let cur: u32 = crate::syscall::with_space(|s| s.read_val(uaddr))?;
@@ -44,9 +46,10 @@ pub fn wait(uaddr: usize, val: u32, bits: u32, deadline: Option<u64>) -> Result<
     if deadline.is_some_and(|d| crate::arch::timer::now_ns() >= d) {
         return Err(Errno(ETIMEDOUT));
     }
-    match wait::block(b, id, uaddr, bits, deadline) {
+    match wait::block_interruptible(b, id, uaddr, bits, deadline) {
         WakeReason::Woken => Ok(()),
         WakeReason::TimedOut => Err(Errno(ETIMEDOUT)),
+        WakeReason::Interrupted => Err(Errno(super::signal::ERESTARTSYS)),
     }
 }
 

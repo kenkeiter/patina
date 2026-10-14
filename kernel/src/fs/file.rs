@@ -207,9 +207,10 @@ impl PollWaiter {
         })
     }
 
-    /// Block until notified (returns at once if already notified) or until
-    /// `deadline` (monotonic ns).
-    // TODO(signals): block_interruptible → EINTR on WakeReason::Interrupted.
+    /// Block until notified (returns at once if already notified), until
+    /// `deadline` (monotonic ns), or until a signal is pending for the
+    /// thread (`WakeReason::Interrupted`: the caller returns `EINTR` or an
+    /// internal restart code, see `task::signal`).
     pub fn wait(&self, deadline: Option<u64>) -> WakeReason {
         let g = self.st.lock();
         if g.notified {
@@ -218,7 +219,7 @@ impl PollWaiter {
         if deadline.is_some_and(|d| crate::arch::timer::now_ns() >= d) {
             return WakeReason::TimedOut;
         }
-        wait::block(g, waiter_queue, 0, 0, deadline)
+        wait::block_interruptible(g, waiter_queue, 0, 0, deadline)
     }
 }
 
@@ -364,7 +365,8 @@ impl Drop for OpenFile {
 /// Block the calling thread until `file` reports any of `want` (or
 /// ERR/HUP), or `deadline` passes. Returns at once if it already does.
 /// Wake-ups may be spurious; callers retry their operation.
-// TODO(signals): make interruptible (EINTR / restart).
+/// `WakeReason::Interrupted` when a signal is pending (callers return
+/// `ERESTARTSYS`: restarted under `SA_RESTART`, else `EINTR`).
 pub fn wait_ready(file: &dyn File, want: EpollFlags, deadline: Option<u64>) -> WakeReason {
     let w = PollWaiter::new();
     let hook: Arc<dyn PollHook> = w.clone();
