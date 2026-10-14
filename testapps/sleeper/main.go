@@ -23,6 +23,39 @@ func monoNow() time.Duration {
 	return time.Duration(ts.Nano())
 }
 
+// rawPhase times the kernel's sleeping syscalls directly, bypassing Go's
+// timers: Go's netpoller waits with epoll_pwait's millisecond timeout, so
+// a sub-millisecond time.Sleep becomes a 1 ms epoll wait.
+func rawPhase(n int) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	stat := func(what string, f func()) {
+		var sum, worst time.Duration
+		for i := 0; i < n; i++ {
+			s := monoNow()
+			f()
+			e := monoNow() - s
+			sum += e
+			if e > worst {
+				worst = e
+			}
+		}
+		fmt.Printf("sleeper: raw %s x%d: avg %s, worst %s\n", what, n, ms(sum/time.Duration(n)), ms(worst))
+	}
+	for _, d := range []time.Duration{500 * time.Microsecond, time.Millisecond, 2 * time.Millisecond, 10 * time.Millisecond} {
+		ts := syscall.NsecToTimespec(int64(d))
+		stat(fmt.Sprintf("nanosleep(%s)", d), func() { syscall.Nanosleep(&ts, nil) })
+	}
+	epfd, err := syscall.EpollCreate1(0)
+	if err != nil {
+		fmt.Printf("sleeper: epoll_create1: %v\n", err)
+		return
+	}
+	var evs [1]syscall.EpollEvent
+	stat("epoll_pwait(1ms)", func() { syscall.EpollWait(epfd, evs[:], 1) })
+	syscall.Close(epfd)
+}
+
 func ms(d time.Duration) string { return fmt.Sprintf("%.3f ms", float64(d)/1e6) }
 
 func main() {
@@ -32,6 +65,8 @@ func main() {
 	short := flag.Int("short", 200, "number of time.Sleep(500µs)")
 	tick := flag.Int("tick", 200, "ticks of a 1 ms ticker")
 	pp := flag.Int("pingpong", 20000, "cross-thread channel round trips")
+	raw := flag.Int("raw", 0, "if > 0: time this many raw nanosleep(500us), nanosleep(1ms) and epoll_pwait(1 ms) syscalls")
+	spin := flag.Bool("spin", false, "with -raw: a goroutine on its own thread spins during the raw phase")
 	flag.Parse()
 	fmt.Printf("sleeper: GOMAXPROCS=%d uptime at main %s\n", runtime.GOMAXPROCS(0), ms(entry))
 
@@ -84,6 +119,20 @@ func main() {
 	runtime.UnlockOSThread()
 	if *pp > 0 {
 		fmt.Printf("sleeper: %d ping-pongs across threads took %s (%.1f us/round trip)\n", *pp, ms(d), float64(d)/float64(*pp)/1e3)
+	}
+
+	if *raw > 0 {
+		if *spin {
+			// Keep a vCPU busy so the sleeping one is not the only
+			// runnable work (with 1 vCPU: no idle WFI during the sleeps).
+			go func() {
+				runtime.LockOSThread()
+				for {
+				}
+			}()
+			time.Sleep(10 * time.Millisecond)
+		}
+		rawPhase(*raw)
 	}
 
 	fmt.Printf("sleeper: total in main %s, uptime at end %s\n", ms(time.Since(start)), ms(monoNow()))
