@@ -8,11 +8,17 @@
 //! threads from the tick without leaving the interrupt active. Nothing here
 //! assumes the boot CPU: the GIC CPU interface is per-CPU and the
 //! redistributor is looked up per CPU.
+//!
+//! MSI (Phase 4, D70): [`alloc_msi`] maps a PCI device's MSI through the
+//! GICv3 ITS (`its.rs`) to an LPI (INTID >= 8192), which [`register`]
+//! binds like an SPI (LPIs are enabled in the ITS configuration table, not
+//! at the distributor) and [`configure`] ignores (LPIs are edge); without
+//! an ITS, through a GICv2m frame (`v2m.rs`) to an edge SPI.
 
 use core::arch::asm;
 
 use super::ctx::TrapFrame;
-use super::{gic, timer};
+use super::{gic, its, timer};
 use crate::sync::SpinLock;
 use crate::trap::IpiKind;
 
@@ -73,11 +79,33 @@ pub type Handler = fn(u32);
 const MAX_INTID: usize = 1020;
 
 static HANDLERS: SpinLock<[Option<Handler>; MAX_INTID]> = SpinLock::new([None; MAX_INTID]);
+static LPI_HANDLERS: SpinLock<[Option<Handler>; its::MAX_LPIS as usize]> =
+    SpinLock::new([None; its::MAX_LPIS as usize]);
+
+fn lpi_index(intid: u32) -> Option<usize> {
+    let i = intid.checked_sub(its::LPI_BASE)?;
+    (i < its::MAX_LPIS).then_some(i as usize)
+}
+
+/// Map an MSI/MSI-X message of PCI device `requester` (device id after
+/// `msi-map`) to an LPI through the GICv3 ITS: returns the INTID (for
+/// [`register`]) and the message (GITS_TRANSLATER, event id). Without a
+/// usable ITS, an SPI of a GICv2m frame (message = MSI_SETSPI_NS, INTID).
+/// `None` if neither exists.
+pub fn alloc_msi(requester: u32) -> Option<crate::drivers::pci::MsiMsg> {
+    if !gic::is_initialized() {
+        gic::init();
+    }
+    its::alloc(requester).or_else(super::v2m::alloc)
+}
 
 /// Set the trigger mode of device interrupt `intid` (an SPI; from the
 /// DTB `interrupts` flags) before [`register`]. GIC SPIs are active-high
 /// only, so `active_low` is ignored. Initializes the GIC if needed.
 pub fn configure(intid: u32, edge: bool, _active_low: bool) {
+    if lpi_index(intid).is_some() {
+        return;
+    }
     if !gic::is_initialized() {
         gic::init();
     }
@@ -90,6 +118,10 @@ pub fn configure(intid: u32, edge: bool, _active_low: bool) {
 /// the scheduler starts); the interrupt is taken once IRQs are unmasked.
 /// The handler runs with IRQs masked and must not block.
 pub fn register(intid: u32, handler: Handler) {
+    if let Some(i) = lpi_index(intid) {
+        LPI_HANDLERS.lock()[i] = Some(handler);
+        return;
+    }
     assert!(
         (intid as usize) < MAX_INTID,
         "irq::register: bad INTID {}",
@@ -125,7 +157,10 @@ pub(super) fn handle(tf: &mut TrapFrame, from_user: bool) {
         crate::trap::ipi(tf, kind);
         return;
     }
-    let h = HANDLERS.lock().get(intid as usize).copied().flatten();
+    let h = match lpi_index(intid) {
+        Some(i) => LPI_HANDLERS.lock()[i],
+        None => HANDLERS.lock().get(intid as usize).copied().flatten(),
+    };
     match h {
         Some(h) => h(intid),
         None => crate::kprintln!(

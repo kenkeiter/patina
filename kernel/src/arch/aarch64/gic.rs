@@ -333,6 +333,33 @@ pub fn is_initialized() -> bool {
     GIC.get().is_some()
 }
 
+/// GICv3 (`its.rs`). Initializes the GIC if needed.
+pub fn is_v3() -> bool {
+    if !is_initialized() {
+        init();
+    }
+    gic().version == 3
+}
+
+/// GICD_TYPER.LPIS: the distributor supports LPIs (GICv3).
+pub fn dist_has_lpis() -> bool {
+    rd32(gic().dist + 0x0004) & (1 << 17) != 0
+}
+
+/// RD_base VA of logical CPU `cpu`'s redistributor, once that CPU ran
+/// `init_cpu` (GICv3).
+pub fn rd_base_va(cpu: usize) -> Option<usize> {
+    let v = RD_BASE.get(cpu)?.load(Ordering::Relaxed);
+    (v != 0).then_some(v)
+}
+
+/// Physical address of [`rd_base_va`] (`map_device` maps linearly).
+pub fn rd_base_pa(cpu: usize) -> Option<usize> {
+    let g = gic();
+    let d = DESC.get()?;
+    Some(rd_base_va(cpu)? - g.cpu + d.cpu.0)
+}
+
 /// Configure SPI `intid` (>= 32) as edge- (`true`) or level-triggered.
 /// Call before [`enable`]. SGIs/PPIs are left alone.
 pub fn set_trigger(intid: u32, edge: bool) {
@@ -356,7 +383,7 @@ fn my_affinity_router() -> u64 {
 /// Acknowledge the highest-priority pending interrupt on this CPU:
 /// `(intid, token)`, where `token` is what [`eoi`] needs (the raw IAR value,
 /// which on GICv2 includes the SGI source CPU). `None` for a
-/// spurious/special INTID (nothing to EOI).
+/// spurious/special INTID (nothing to EOI). LPIs are returned too.
 pub fn ack() -> Option<(u32, u32)> {
     let g = gic();
     let (intid, raw) = if g.version == 3 {
@@ -368,7 +395,8 @@ pub fn ack() -> Option<(u32, u32)> {
         let v = rd32(g.cpu + GICC_IAR);
         (v & 0x3ff, v & 0x1fff)
     };
-    (intid < SPECIAL_INTID).then_some((intid, raw))
+    // 1020-1023 are special; LPIs (>= 8192, `its.rs`) are real interrupts.
+    (!(SPECIAL_INTID..super::its::LPI_BASE).contains(&intid)).then_some((intid, raw))
 }
 
 /// End of interrupt for the token returned by [`ack`] (priority drop +

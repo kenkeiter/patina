@@ -10,6 +10,7 @@
 //! that never answers must not hang the boot. Interrupts are attached for
 //! use once the scheduler runs.
 
+pub mod pci;
 pub mod virtio;
 
 use alloc::sync::Arc;
@@ -48,9 +49,10 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
         };
         virtio::register_transport(dev, d.source);
     }
+    n += pci::init(cmdline);
     if n == 0 {
         crate::kprintln!(
-            "[patina] virtio: no devices ({} mmio region(s) described)",
+            "[patina] virtio: no devices ({} mmio region(s) described, no virtio-pci)",
             found.len()
         );
     }

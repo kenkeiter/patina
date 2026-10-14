@@ -34,8 +34,15 @@
 #   PATINA_CONSOLE  hvc0: kernel console on virtio-console port 0 (a
 #                   virtconsole on the same virtio-serial bus) instead of the
 #                   UART; passes console=hvc0. Default: the UART.
-#   PATINA_VIRTIO   0: no virtio devices at all (default 1; 0 for x86 pc/q35,
-#                   which have no virtio-mmio bus)
+#   PATINA_VIRTIO   1: virtio-mmio devices (virtio-serial-device, ...; default
+#                   on aarch64 and x86 microvm); pci: the same devices as
+#                   virtio-pci (virtio-serial-pci, virtio-rng-pci; default
+#                   for x86 pc/q35, which have no virtio-mmio bus; not for
+#                   microvm); 0: no virtio devices at all
+#   PATINA_VIRTIO_PCI_OPTS  extra properties appended to every virtio-pci
+#                   device, e.g. ",disable-legacy=on" (modern-only device ids
+#                   0x1040+; the default is transitional, which also has the
+#                   modern capabilities the kernel uses)
 #
 # Serial output is streamed to the terminal and captured. Exit status:
 #   N    from the last "[patina] exit code N" line
@@ -115,7 +122,10 @@ case $arch in
       *) cpu=max ;;
     esac
     machine=${PATINA_MACHINE:-microvm}
-    [[ $machine == microvm* ]] || virtio=${PATINA_VIRTIO:-0}
+    [[ $machine == microvm* ]] || virtio=${PATINA_VIRTIO:-pci}
+    if [[ $machine == microvm* && $virtio == pci ]]; then
+      echo "error: PATINA_VIRTIO=pci needs PATINA_MACHINE=q35 or pc on x86_64" >&2; exit 2
+    fi
     console=ttyS0
     qargs=(-M "$machine" -accel "$accel" -cpu "$cpu"
            -smp "$cpus" -m "$mem" -nodefaults -no-user-config -display none -no-reboot
@@ -142,8 +152,12 @@ if [[ ${PATINA_CONSOLE:-} == hvc0 ]]; then
 fi
 cmdline="console=$console patina.epoch=$(date +%s)${params[*]:+ ${params[*]}} --${args[*]:+ ${args[*]}}"
 qargs+=(-append "$cmdline" -chardev stdio,id=con0,signal=off)
+# virtio transport suffix: virtio-<dev>-device (mmio) or virtio-<dev>-pci.
+vsuf=-device
+popts=
+if [[ $virtio == pci ]]; then vsuf=-pci; popts=${PATINA_VIRTIO_PCI_OPTS:-}; fi
 if [[ $virtio != 0 ]]; then
-  qargs+=(-device virtio-serial-device,id=vser0)
+  qargs+=(-device "virtio-serial$vsuf,id=vser0$popts")
   if [[ $console == hvc0 ]]; then
     # The first virtconsole on the bus is port 0 (the console port).
     qargs+=(-device virtconsole,bus=vser0.0,chardev=con0)
@@ -152,7 +166,7 @@ if [[ $virtio != 0 ]]; then
   fi
   qargs+=(-chardev "socket,id=ctl0,path=$ctl_sock,server=on,wait=${ctl_wait}"
           -device virtserialport,bus=vser0.0,chardev=ctl0,name=patina.ctl
-          -device virtio-rng-device)
+          -device "virtio-rng$vsuf$popts")
 else
   qargs+=(-serial chardev:con0)
 fi
