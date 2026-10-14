@@ -59,6 +59,10 @@ use crate::trap::Access;
 pub const MMAP_MIN_ADDR: usize = 0x1_0000;
 /// Top-down `mmap` allocation starts below this (under the stack).
 pub const MMAP_BASE: usize = 0x7f00_0000_0000;
+/// Most VMAs an address space may have (Linux `sysctl_max_map_count`
+/// default): `mmap`, and `munmap`/`mprotect` that would split a VMA, fail
+/// with ENOMEM beyond it, which bounds the kernel memory the VMA map uses.
+pub const MAX_MAP_COUNT: usize = 65530;
 
 pub type Result<T> = core::result::Result<T, Errno>;
 
@@ -142,7 +146,15 @@ fn pte_flags(prot: ProtFlags) -> PteFlags {
     f
 }
 
-/// Validate a user `prot` argument; returns the R/W/X part.
+/// The R/W/X part of an `mmap` `prot`. Linux `do_mmap` does not validate
+/// `prot`: bits other than R/W/X (`PROT_SEM`, `PROT_GROWSDOWN`/`GROWSUP`,
+/// arm64 `PROT_BTI`/`PROT_MTE` without MTE, unknown ones) are ignored.
+fn mmap_prot(prot: u32) -> ProtFlags {
+    ProtFlags::from_bits_truncate(prot) & (ProtFlags::READ | ProtFlags::WRITE | ProtFlags::EXEC)
+}
+
+/// Validate a user `prot` argument (`mprotect`: Linux
+/// `arch_validate_prot`); returns the R/W/X part.
 fn parse_prot(prot: u32) -> Result<ProtFlags> {
     #[cfg(target_arch = "aarch64")]
     let extra = patina_abi::aarch64::PROT_BTI;
@@ -165,6 +177,12 @@ fn page_len(start: usize, len: usize) -> Option<usize> {
     let l = len.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
     let end = start.checked_add(l)?;
     (end <= USER_VA_END).then_some(l)
+}
+
+/// Linux `access_ok`: `[addr, addr + len)` lies in the user half without
+/// overflowing. A range check only: the pages may still be unmapped.
+pub fn access_ok(addr: usize, len: usize) -> bool {
+    addr.checked_add(len).is_some_and(|end| end <= USER_VA_END)
 }
 
 /// The user address space: page tables + VMAs + resident-page set.
@@ -192,14 +210,37 @@ impl AddressSpace {
         })
     }
 
-    /// (committed pages, commit limit in pages) — `/proc/meminfo`.
+    /// (committed pages, commit limit in pages) — `/proc/meminfo`. The
+    /// committed pages include kernel memory charged to the program
+    /// (`heap::charge`, D87).
     pub fn commit(&self) -> (usize, usize) {
-        (self.committed, self.commit_limit)
+        (
+            self.committed + crate::mm::heap::charged_pages(),
+            self.commit_limit,
+        )
     }
 
     /// Set the commit limit (loader, once the image is mapped).
     pub fn set_commit_limit(&mut self, pages: usize) {
         self.commit_limit = pages;
+        self.publish();
+    }
+
+    /// Tell the heap's accounting the commit numbers (D87): kernel memory
+    /// charged to the program shares the limit. Only the program's space
+    /// has a limit; scratch spaces (self-tests) publish nothing.
+    fn publish(&self) {
+        if self.commit_limit != usize::MAX {
+            crate::mm::heap::publish_commit(self.committed, self.commit_limit);
+        }
+    }
+
+    /// ENOMEM if `extra` more VMAs would pass [`MAX_MAP_COUNT`].
+    fn map_count_check(&self, extra: usize) -> Result<()> {
+        if self.vmas.len() + extra > MAX_MAP_COUNT {
+            return Err(Errno(ENOMEM));
+        }
+        Ok(())
     }
 
     /// Charged pages of the VMAs overlapping `[start, end)`.
@@ -218,7 +259,11 @@ impl AddressSpace {
     /// ENOMEM unless `add` more charged pages (after releasing `release`)
     /// stay within the commit limit.
     fn commit_check(&self, add: usize, release: usize, what: &str) -> Result<()> {
-        let after = self.committed.saturating_sub(release).saturating_add(add);
+        let after = self
+            .committed
+            .saturating_sub(release)
+            .saturating_add(add)
+            .saturating_add(crate::mm::heap::charged_pages());
         if add > release && after > self.commit_limit {
             crate::kprintln!(
                 "[patina] {}: {} KiB refused, commit limit reached ({} of {} KiB committed, D78)",
@@ -263,7 +308,7 @@ impl AddressSpace {
     }
 
     /// Whether `[start, end)` is entirely covered by VMAs (no holes).
-    fn is_covered(&self, start: usize, end: usize) -> bool {
+    pub fn is_covered(&self, start: usize, end: usize) -> bool {
         let mut cur = start;
         while cur < end {
             match self.find(cur) {
@@ -312,6 +357,7 @@ impl AddressSpace {
         debug_assert!(self.is_free(vma.start, vma.end));
         if charged(&vma) {
             self.committed += (vma.end - vma.start) / PAGE_SIZE;
+            self.publish();
         }
         self.vmas.insert(vma.start, vma);
         self.merge_around(vma.start);
@@ -320,28 +366,33 @@ impl AddressSpace {
     /// Unmap every resident frame in `[start, end)`, handing the frames to
     /// `sd` to free once no CPU can reach them.
     fn release_frames(&mut self, start: usize, end: usize, sd: &mut Shootdown) {
-        let pages: Vec<usize> = self.resident.range(start..end).copied().collect();
+        // Page by page without collecting them first: a Vec of every
+        // resident page in a big range would be a kernel allocation sized
+        // by the program's memory, made while memory may be short.
         let mut last_region = usize::MAX;
-        let mut regions = Vec::new();
-        for va in pages {
+        let mut tables = Vec::new();
+        let mut cur = start;
+        while let Some(&va) = self.resident.range(cur..end).next() {
             self.resident.remove(&va);
             if let Some(pa) = self.tables.unmap(va) {
                 sd.free_frame(pa);
             }
             if va >> 21 != last_region {
+                // Free the page tables of the previous 2 MiB region that
+                // became empty (D80): all its pages in range are gone.
+                if last_region != usize::MAX {
+                    self.tables.prune(last_region << 21, &mut tables);
+                }
                 last_region = va >> 21;
-                regions.push(va);
             }
+            cur = va + PAGE_SIZE;
         }
-        // Free the page tables that became empty (D80): one walk per
-        // 2 MiB region that had resident pages. Their frames are freed
-        // only after the walk caches were invalidated (aarch64: broadcast,
-        // complete on return; x86_64: local here, other CPUs through the
-        // shootdown).
-        let mut tables = Vec::new();
-        for va in regions {
-            self.tables.prune(va, &mut tables);
+        if last_region != usize::MAX {
+            self.tables.prune(last_region << 21, &mut tables);
         }
+        // The table frames are freed only after the walk caches were
+        // invalidated (aarch64: broadcast, complete on return; x86_64:
+        // local here, other CPUs through the shootdown).
         if !tables.is_empty() {
             crate::arch::uspace::flush_table_walks();
             for pa in tables {
@@ -357,6 +408,7 @@ impl AddressSpace {
         self.committed = self
             .committed
             .saturating_sub(self.charged_pages(start, end));
+        self.publish();
         let keys: Vec<usize> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
         for k in keys {
             self.vmas.remove(&k);
@@ -525,7 +577,7 @@ impl AddressSpace {
         off: u64,
     ) -> Result<usize> {
         let mf = MmapFlags::from_bits_retain(flags);
-        let prot = parse_prot(prot)?;
+        let prot = mmap_prot(prot);
         if !mf.contains(MmapFlags::ANONYMOUS) {
             return Err(Errno(ENODEV));
         }
@@ -536,6 +588,8 @@ impl AddressSpace {
         if len == 0 || !off.is_multiple_of(PAGE_SIZE as u64) {
             return Err(Errno(EINVAL));
         }
+        // Linux do_mmap: `mm->map_count > sysctl_max_map_count` → ENOMEM.
+        self.map_count_check(1)?;
         let fixed = mf.contains(MmapFlags::FIXED);
         let noreplace = mf.contains(MmapFlags::FIXED_NOREPLACE);
         let len = len.checked_add(PAGE_SIZE - 1).ok_or(Errno(ENOMEM))? & !(PAGE_SIZE - 1);
@@ -596,27 +650,65 @@ impl AddressSpace {
             return Err(Errno(EINVAL));
         }
         let len = page_len(addr, len).ok_or(Errno(EINVAL))?;
+        // Punching a hole splits a VMA in two (Linux __split_vma).
+        if self.find(addr).is_some_and(|v| v.start < addr && v.end > addr + len) {
+            self.map_count_check(1)?;
+        }
         self.remove_range(addr, addr + len, &mut Shootdown::new());
         Ok(())
     }
 
+    /// `mprotect`, checking in Linux's order (`mm/mprotect.c
+    /// do_mprotect_pkey`): `PROT_GROWSDOWN|PROT_GROWSUP` together → EINVAL,
+    /// `addr` unaligned → EINVAL, `len` 0 → 0, overflow → ENOMEM, unknown
+    /// prot bits → EINVAL (`arch_validate_prot`), no VMA at `addr` →
+    /// ENOMEM; `PROT_GROWSDOWN` extends the range down to the start of
+    /// the VMA, which must be a grows-down one (EINVAL otherwise), and
+    /// `PROT_GROWSUP` is EINVAL (no VMA grows up on these arches); a hole
+    /// in the range → ENOMEM.
     pub fn mprotect(&mut self, addr: usize, len: usize, prot: u32) -> Result<()> {
-        if !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(Errno(EINVAL));
-        }
         let pflags = ProtFlags::from_bits_retain(prot);
-        let prot = parse_prot(prot & !(ProtFlags::GROWSDOWN | ProtFlags::GROWSUP).bits())?;
         if pflags.contains(ProtFlags::GROWSDOWN | ProtFlags::GROWSUP) {
             return Err(Errno(EINVAL));
         }
-        let len = page_len(addr, len).ok_or(Errno(ENOMEM))?;
+        if !addr.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno(EINVAL));
+        }
         if len == 0 {
             return Ok(());
         }
-        let end = addr + len;
+        let len = len.checked_add(PAGE_SIZE - 1).ok_or(Errno(ENOMEM))? & !(PAGE_SIZE - 1);
+        let end = addr.checked_add(len).ok_or(Errno(ENOMEM))?;
+        let prot = parse_prot(prot & !(ProtFlags::GROWSDOWN | ProtFlags::GROWSUP).bits())?;
+        let mut addr = addr;
+        if pflags.contains(ProtFlags::GROWSDOWN) {
+            // vma_find: the first VMA ending above addr.
+            let v = match self.find(addr) {
+                Some(v) => *v,
+                None => *self
+                    .vmas
+                    .range(addr..)
+                    .next()
+                    .map(|(_, v)| v)
+                    .ok_or(Errno(ENOMEM))?,
+            };
+            if v.start >= end {
+                return Err(Errno(ENOMEM));
+            }
+            if !v.flags.contains(MmapFlags::GROWSDOWN) && v.kind != VmaKind::Stack {
+                return Err(Errno(EINVAL));
+            }
+            addr = v.start;
+        } else {
+            self.find(addr).ok_or(Errno(ENOMEM))?;
+            if pflags.contains(ProtFlags::GROWSUP) {
+                return Err(Errno(EINVAL));
+            }
+        }
         if !self.is_covered(addr, end) {
             return Err(Errno(ENOMEM));
         }
+        self.map_count_check(2)?;
         self.split_at(addr);
         self.split_at(end);
         let keys: Vec<usize> = self.vmas.range(addr..end).map(|(k, _)| *k).collect();
@@ -639,6 +731,7 @@ impl AddressSpace {
             return Err(e);
         }
         self.committed = self.committed - before + after;
+        self.publish();
         // Whether some permission is revoked (other CPUs must then drop
         // their cached translations; adding permissions needs nothing).
         let mut reduced = false;
@@ -647,13 +740,12 @@ impl AddressSpace {
             reduced |= !prot.contains(v.prot);
             v.prot = prot;
         }
-        let pages: Vec<usize> = self.resident.range(addr..end).copied().collect();
         let mut sd = Shootdown::new();
-        if reduced && !pages.is_empty() {
+        if reduced && self.resident.range(addr..end).next().is_some() {
             sd.flush();
         }
         let f = pte_flags(prot);
-        for va in pages {
+        for &va in self.resident.range(addr..end) {
             self.tables.protect(va, f);
         }
         drop(sd);
@@ -668,22 +760,68 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// `madvise`, checking in Linux's order (`mm/madvise.c do_madvise`):
+    /// an unknown advice → EINVAL, `addr` unaligned → EINVAL, the rounded
+    /// length or the end overflowing → EINVAL, an empty range → 0; then a
+    /// range not fully mapped (including one beyond the user half) →
+    /// ENOMEM, after the mapped parts were advised.
     pub fn madvise(&mut self, addr: usize, len: usize, advice: i32) -> Result<()> {
+        let valid = matches!(
+            advice,
+            abimm::MADV_NORMAL
+                | abimm::MADV_RANDOM
+                | abimm::MADV_SEQUENTIAL
+                | abimm::MADV_WILLNEED
+                | abimm::MADV_DONTNEED
+                | abimm::MADV_DONTNEED_LOCKED
+                | abimm::MADV_FREE
+                | abimm::MADV_REMOVE
+                | abimm::MADV_DONTFORK
+                | abimm::MADV_DOFORK
+                | abimm::MADV_MERGEABLE
+                | abimm::MADV_UNMERGEABLE
+                | abimm::MADV_HUGEPAGE
+                | abimm::MADV_NOHUGEPAGE
+                | abimm::MADV_DONTDUMP
+                | abimm::MADV_DODUMP
+                | abimm::MADV_WIPEONFORK
+                | abimm::MADV_KEEPONFORK
+                | abimm::MADV_COLD
+                | abimm::MADV_PAGEOUT
+                | abimm::MADV_POPULATE_READ
+                | abimm::MADV_POPULATE_WRITE
+                | abimm::MADV_COLLAPSE
+        );
+        if !valid {
+            return Err(Errno(EINVAL));
+        }
         if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(Errno(EINVAL));
         }
-        let len = page_len(addr, len).ok_or(Errno(EINVAL))?;
-        let end = addr + len;
+        let rounded = len.checked_add(PAGE_SIZE - 1).map(|l| l & !(PAGE_SIZE - 1));
+        let len = match rounded {
+            Some(l) => l,
+            None => return Err(Errno(EINVAL)),
+        };
+        let end = addr.checked_add(len).ok_or(Errno(EINVAL))?;
+        if len == 0 {
+            return Ok(());
+        }
         match advice {
-            abimm::MADV_DONTNEED | abimm::MADV_FREE => {
-                if len == 0 {
-                    return Ok(());
-                }
+            abimm::MADV_DONTNEED | abimm::MADV_DONTNEED_LOCKED | abimm::MADV_FREE => {
                 self.release_frames(addr, end, &mut Shootdown::new());
                 if !self.is_covered(addr, end) {
                     return Err(Errno(ENOMEM));
                 }
                 Ok(())
+            }
+            // Linux madvise_remove: only shared file mappings.
+            abimm::MADV_REMOVE => {
+                if self.is_free(addr, end) {
+                    Err(Errno(ENOMEM))
+                } else {
+                    Err(Errno(EINVAL))
+                }
             }
             abimm::MADV_NORMAL
             | abimm::MADV_RANDOM
@@ -699,8 +837,12 @@ impl AddressSpace {
             | abimm::MADV_MERGEABLE
             | abimm::MADV_UNMERGEABLE
             | abimm::MADV_COLD
-            | abimm::MADV_PAGEOUT => {
-                if len != 0 && !self.is_covered(addr, end) {
+            | abimm::MADV_PAGEOUT
+            | abimm::MADV_WIPEONFORK
+            | abimm::MADV_KEEPONFORK
+            | abimm::MADV_POPULATE_READ
+            | abimm::MADV_POPULATE_WRITE => {
+                if !self.is_covered(addr, end) {
                     return Err(Errno(ENOMEM));
                 }
                 Ok(())
@@ -719,9 +861,23 @@ impl AddressSpace {
         new_len: usize,
         flags: u32,
     ) -> Result<usize> {
-        if !old.is_multiple_of(PAGE_SIZE)
-            || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+        // Linux mm/mremap.c (check_mremap_params): unknown flags, FIXED
+        // without MAYMOVE, DONTUNMAP without MAYMOVE or with a size
+        // change, an unaligned address, a zero (or wrapping) new length
+        // and a new length beyond the user address space are EINVAL.
+        if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+            || (flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0)
+            || (flags & MREMAP_DONTUNMAP != 0
+                && (flags & MREMAP_MAYMOVE == 0 || old_len != new_len))
+            || !old.is_multiple_of(PAGE_SIZE)
         {
+            return Err(Errno(EINVAL));
+        }
+        let new_len = new_len
+            .checked_add(PAGE_SIZE - 1)
+            .map(|l| l & !(PAGE_SIZE - 1))
+            .ok_or(Errno(EINVAL))?;
+        if new_len == 0 || new_len > USER_VA_END {
             return Err(Errno(EINVAL));
         }
         if flags & (MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 {
@@ -729,11 +885,7 @@ impl AddressSpace {
             return Err(Errno(EINVAL));
         }
         let old_len = page_len(old, old_len).ok_or(Errno(EINVAL))?;
-        let new_len = new_len
-            .checked_add(PAGE_SIZE - 1)
-            .map(|l| l & !(PAGE_SIZE - 1))
-            .ok_or(Errno(EINVAL))?;
-        if new_len == 0 || old_len == 0 {
+        if old_len == 0 {
             return Err(Errno(EINVAL));
         }
         let vma = *self.find(old).ok_or(Errno(EFAULT))?;
@@ -805,19 +957,42 @@ impl AddressSpace {
         self.brk
     }
 
-    /// `mincore`: 1 per resident page, 0 otherwise. `ENOMEM` if the range
-    /// is not fully mapped.
-    pub fn mincore(&mut self, addr: usize, len: usize) -> Result<Vec<u8>> {
-        if !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(Errno(EINVAL));
+    /// How many bytes from `va` (at most `len`) a kernel copy-out could
+    /// write: the length of the run of writable VMAs starting at `va`.
+    /// Syscalls that consume data (pipe/socket reads, epoll events,
+    /// directory positions) size their read by this before consuming
+    /// anything, so a bad buffer cannot make them drop data (D86). Walks
+    /// VMAs only: O(VMAs in range), no faults, no allocation.
+    pub fn writable_prefix(&self, va: usize, len: usize) -> usize {
+        let Some(end) = va.checked_add(len) else {
+            return 0;
+        };
+        let mut cur = va;
+        while cur < end {
+            match self.find(cur) {
+                Some(v) if v.allows(Access::Write) => cur = v.end,
+                _ => break,
+            }
         }
-        let len = page_len(addr, len).ok_or(Errno(ENOMEM))?;
-        if !self.is_covered(addr, addr + len) {
-            return Err(Errno(ENOMEM));
+        cur.min(end) - va
+    }
+
+    /// One step of `mincore` (Linux `mm/mincore.c do_mincore`): the
+    /// residency (1/0 per page) of the pages from `addr` (page aligned) to
+    /// the end of the VMA containing it, at most `pages` and `out.len()`
+    /// of them, written to `out`. Returns the number of pages done;
+    /// `ENOMEM` if no VMA contains `addr`. Costs O(resident pages in the
+    /// chunk), never allocates: the caller walks a huge range in bounded
+    /// chunks, dropping the address-space lock between them.
+    pub fn mincore_chunk(&self, addr: usize, pages: usize, out: &mut [u8]) -> Result<usize> {
+        let v = self.find(addr).ok_or(Errno(ENOMEM))?;
+        let n = pages.min(out.len()).min((v.end - addr) / PAGE_SIZE);
+        let out = &mut out[..n];
+        out.fill(0);
+        for &va in self.resident.range(addr..addr + n * PAGE_SIZE) {
+            out[(va - addr) / PAGE_SIZE] = 1;
         }
-        Ok((0..len / PAGE_SIZE)
-            .map(|i| self.resident.contains(&(addr + i * PAGE_SIZE)) as u8)
-            .collect())
+        Ok(n)
     }
 
     // ---------------------------------------------------------------

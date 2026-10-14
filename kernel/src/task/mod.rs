@@ -535,6 +535,9 @@ pub fn spawn_user_thread(
     if LIVE.load(Ordering::Relaxed) >= MAX_THREADS {
         return Err(Errno(EAGAIN));
     }
+    // A kernel stack (frames, and page tables to map it) and the thread's
+    // objects: only while the heap's low watermark holds (D87).
+    crate::mm::heap::reserve((kstack::KSTACK_PAGES + 2) * crate::mm::PAGE_SIZE)?;
     let kstack = kstack::alloc().ok_or(Errno(ENOMEM))?;
     let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let fp = Box::new(fp);

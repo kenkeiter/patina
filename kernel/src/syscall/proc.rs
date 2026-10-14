@@ -8,7 +8,7 @@ use core::sync::atomic::Ordering;
 use patina_abi::current::nr;
 
 use patina_abi::epoll::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
-use patina_abi::errno::{EINVAL, ESRCH, Errno};
+use patina_abi::errno::{EINVAL, EPERM, ESRCH, Errno};
 use patina_abi::misc::{
     RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_STACK, Rlimit, Utsname,
 };
@@ -87,22 +87,31 @@ static RLIMITS: SpinLock<[Rlimit; RLIM_NLIMITS as usize]> = SpinLock::new({
 
 /// `prlimit64(pid, resource, new, old)` (also getrlimit/setrlimit).
 /// Limits are stored and reported, not enforced.
+///
+/// Checks in Linux's order (`kernel/sys.c` `prlimit64`, `do_prlimit`): the
+/// new limit is copied in first (EFAULT), then the pid (ESRCH), the
+/// resource (EINVAL), `rlim_cur > rlim_max` (EINVAL).
 pub fn prlimit64(pid: i32, res: u32, new: usize, old: usize) -> SysResult {
+    let newv: Option<Rlimit> = if new != 0 {
+        Some(with_space(|s| s.read_val(new))?)
+    } else {
+        None
+    };
     if !valid_pid(pid) {
         return Err(Errno(ESRCH));
     }
     if res >= RLIM_NLIMITS {
         return Err(Errno(EINVAL));
     }
-    let newv: Option<Rlimit> = if new != 0 {
-        let v: Rlimit = with_space(|s| s.read_val(new))?;
+    if let Some(v) = &newv {
         if v.rlim_cur > v.rlim_max {
             return Err(Errno(EINVAL));
         }
-        Some(v)
-    } else {
-        None
-    };
+        // do_prlimit: the fd table cannot grow past fs.nr_open.
+        if res == RLIMIT_NOFILE && v.rlim_max > NR_OPEN {
+            return Err(Errno(EPERM));
+        }
+    }
     let prev = {
         let mut l = RLIMITS.lock();
         let prev = l[res as usize];
@@ -117,9 +126,13 @@ pub fn prlimit64(pid: i32, res: u32, new: usize, old: usize) -> SysResult {
     Ok(0)
 }
 
+/// Linux `sysctl_nr_open` (default 1024 * 1024): the largest
+/// `RLIMIT_NOFILE`.
+const NR_OPEN: u64 = 1 << 20;
+
 /// `RLIMIT_NOFILE`'s soft limit: fds must be below it (`EMFILE`).
 pub fn nofile_limit() -> usize {
-    RLIMITS.lock()[RLIMIT_NOFILE as usize].rlim_cur.min(1 << 20) as usize
+    RLIMITS.lock()[RLIMIT_NOFILE as usize].rlim_cur.min(NR_OPEN) as usize
 }
 
 /// `getrandom`: see `random.rs` (not cryptographic before Phase 3).

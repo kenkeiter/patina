@@ -52,6 +52,7 @@ use patina_inet::unix::StreamBuf;
 use crate::fs::file::{
     File, FileFlags, Notify, OpenFile, PollHook, PollList, alloc_ino, anon_stat,
 };
+use crate::mm::heap::{self, KBuf};
 use crate::net::socket::SocketOps;
 use crate::sync::SpinLock;
 
@@ -82,9 +83,10 @@ impl Anc {
     }
 }
 
-/// A queued datagram / seqpacket record.
+/// A queued datagram / seqpacket record. Its bytes are charged to the
+/// program while queued (`heap::KBuf`, D87).
 struct Msg {
-    data: Vec<u8>,
+    data: KBuf,
     /// The sender's bound name (empty: unnamed).
     from: Vec<u8>,
     anc: Anc,
@@ -93,6 +95,51 @@ struct Msg {
 enum Rx {
     Stream(StreamBuf<Anc>),
     Msgs { q: VecDeque<Msg>, bytes: usize },
+}
+
+/// Heap a stream buffer's storage takes: what is charged to the program
+/// for it (D87). It changes only when the buffer grows
+/// ([`stream_push`]) and when it is emptied (pop, clear).
+fn stream_charge(b: &StreamBuf<Anc>) -> usize {
+    heap::alloc_size(b.alloc_bytes())
+}
+
+/// Push to a stream buffer, growing its storage fallibly and charging the
+/// growth to the program: ENOBUFS (nothing queued) when memory is short,
+/// never a panic.
+fn stream_push(
+    b: &mut StreamBuf<Anc>,
+    data: &[u8],
+    anc: Option<Anc>,
+) -> Result<(usize, Option<Anc>), (Errno, Option<Anc>)> {
+    let before = b.alloc_bytes();
+    let charged = stream_charge(b);
+    if b.try_grow(data.len()).is_err() {
+        return Err((Errno(ENOBUFS), anc));
+    }
+    let more = stream_charge(b) - charged;
+    if !heap::charge(more) {
+        b.shrink_to(before);
+        return Err((Errno(ENOBUFS), anc));
+    }
+    Ok(b.push(data, anc))
+}
+
+/// Pop from a stream buffer, returning the charge of storage it frees.
+fn stream_pop(b: &mut StreamBuf<Anc>, buf: &mut [u8]) -> (usize, Option<Anc>) {
+    let charged = stream_charge(b);
+    let r = b.pop(buf);
+    heap::uncharge(charged - stream_charge(b));
+    r
+}
+
+impl Drop for Rx {
+    fn drop(&mut self) {
+        // Queued datagrams uncharge themselves (KBuf).
+        if let Rx::Stream(b) = self {
+            heap::uncharge(stream_charge(b));
+        }
+    }
 }
 
 impl Rx {
@@ -122,9 +169,11 @@ impl Rx {
     fn clear(&mut self, trash: &mut Rights) {
         match self {
             Rx::Stream(b) => {
+                let before = stream_charge(b);
                 for a in b.clear() {
                     trash.extend(a.rights);
                 }
+                heap::uncharge(before - stream_charge(b));
             }
             Rx::Msgs { q, bytes } => {
                 for m in q.drain(..) {

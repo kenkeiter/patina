@@ -420,6 +420,13 @@ impl PortTable {
         }
     }
 
+    /// Move where ephemeral allocation continues to positions picked by
+    /// `seed` (the table may be created before a real seed exists).
+    pub fn reseed(&mut self, seed: u64) {
+        let fresh = PortTable::new(seed);
+        self.cursor = fresh.cursor;
+    }
+
     fn conflicts(&self, k: Key, cover: &Cover, reuse: Reuse) -> bool {
         self.ports.get(&k).is_some_and(|v| {
             v.iter().any(|e| {
@@ -677,6 +684,18 @@ mod tests {
         };
         assert_eq!(t.bind(10, Proto::Udp, 53, any6, rp), Ok(53));
         assert_eq!(t.bind(11, Proto::Udp, 53, any6, rp), Ok(53));
+    }
+
+    #[test]
+    fn reseed_moves_ephemeral_start() {
+        let any4 = Cover::of(AF_INET, None, false);
+        let mut a = PortTable::new(0);
+        let mut b = PortTable::new(0);
+        b.reseed(0x1234_5678_9abc);
+        let pa = a.bind(1, Proto::Tcp, 0, any4, Reuse::default()).unwrap();
+        let pb = b.bind(1, Proto::Tcp, 0, any4, Reuse::default()).unwrap();
+        assert_ne!(pa, pb);
+        assert!((EPHEMERAL_LOW..=EPHEMERAL_HIGH).contains(&pb));
     }
 
     #[test]

@@ -34,9 +34,9 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use patina_abi::current::Stat;
 use patina_abi::epoll::EpollFlags;
@@ -53,6 +53,7 @@ use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 use super::socket::{self as so, RecvInfo, SocketOps};
 use super::stack::{self, Stack};
 use crate::fs::file::{File, FileFlags, Notify, PollHook, PollList, alloc_ino, anon_stat};
+use crate::mm::heap;
 
 pub const TCP_RX_BUF: usize = 64 * 1024;
 pub const TCP_TX_BUF: usize = 64 * 1024;
@@ -171,15 +172,51 @@ fn tcp_sock<'a>(
     sockets.get::<tcp::Socket>(h)
 }
 
-fn new_tcp(opts: &Opts) -> tcp::Socket<'static> {
-    let mut t = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; TCP_RX_BUF]),
-        tcp::SocketBuffer::new(vec![0; TCP_TX_BUF]),
-    );
+/// Heap a TCP socket's buffers take, charged to the program from
+/// [`new_tcp`] until the socket leaves the set ([`remove_tcp`], D87).
+const TCP_BUFS: usize = heap::alloc_size(TCP_RX_BUF) + heap::alloc_size(TCP_TX_BUF);
+/// The same for a UDP socket ([`new_udp`]): two payload rings and two
+/// metadata arrays.
+const UDP_BUFS: usize = 2
+    * (heap::alloc_size(UDP_PAYLOAD)
+        + heap::alloc_size(UDP_PACKETS * size_of::<udp::PacketMetadata>()));
+
+/// `n` copies of `v`, allocated fallibly.
+fn try_vec<T: Clone>(n: usize, v: T) -> Option<Vec<T>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(n).ok()?;
+    out.resize(n, v);
+    Some(out)
+}
+
+/// A TCP socket with its 2 × 64 KiB buffers, charged to the program
+/// (ENOBUFS when the charge or the allocation fails: never a panic). The
+/// charge is returned by [`remove_tcp`] / [`discard_tcp`].
+fn new_tcp(opts: &Opts) -> Result<tcp::Socket<'static>, Errno> {
+    if !heap::charge(TCP_BUFS) {
+        return Err(Errno(ENOBUFS));
+    }
+    let (Some(rx), Some(tx)) = (try_vec(TCP_RX_BUF, 0u8), try_vec(TCP_TX_BUF, 0u8)) else {
+        heap::uncharge(TCP_BUFS);
+        return Err(Errno(ENOBUFS));
+    };
+    let mut t = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
     // Quick ACKs: delayed ACKs only cost latency over loopback.
     t.set_ack_delay(None);
     apply_tcp_opts(opts, &mut t);
-    t
+    Ok(t)
+}
+
+/// Drop a [`new_tcp`] socket that never joined the set.
+fn discard_tcp(t: tcp::Socket<'static>) {
+    drop(t);
+    heap::uncharge(TCP_BUFS);
+}
+
+/// Remove a TCP socket from the set (its buffers are freed).
+fn remove_tcp(sockets: &mut smoltcp::iface::SocketSet<'static>, h: SocketHandle) {
+    sockets.remove(h);
+    heap::uncharge(TCP_BUFS);
 }
 
 fn apply_tcp_opts(o: &Opts, t: &mut tcp::Socket) {
@@ -196,17 +233,26 @@ fn apply_tcp_opts(o: &Opts, t: &mut tcp::Socket) {
     });
 }
 
-fn new_udp() -> udp::Socket<'static> {
-    udp::Socket::new(
-        udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
-            vec![0; UDP_PAYLOAD],
-        ),
-        udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
-            vec![0; UDP_PAYLOAD],
-        ),
-    )
+/// A UDP socket with its buffers, charged like [`new_tcp`] (returned when
+/// it is removed in `close_sock`).
+fn new_udp() -> Result<udp::Socket<'static>, Errno> {
+    if !heap::charge(UDP_BUFS) {
+        return Err(Errno(ENOBUFS));
+    }
+    let bufs = (
+        try_vec(UDP_PACKETS, udp::PacketMetadata::EMPTY),
+        try_vec(UDP_PAYLOAD, 0u8),
+        try_vec(UDP_PACKETS, udp::PacketMetadata::EMPTY),
+        try_vec(UDP_PAYLOAD, 0u8),
+    );
+    let (Some(rm), Some(rp), Some(tm), Some(tp)) = bufs else {
+        heap::uncharge(UDP_BUFS);
+        return Err(Errno(ENOBUFS));
+    };
+    Ok(udp::Socket::new(
+        udp::PacketBuffer::new(rm, rp),
+        udp::PacketBuffer::new(tm, tp),
+    ))
 }
 
 fn ip_of(a: IpAddress) -> IpAddr {
@@ -380,14 +426,19 @@ impl Stack {
                 }
                 tcp::State::Listen | tcp::State::Closed => {
                     l.pending.remove(i);
-                    sockets.remove(h);
+                    remove_tcp(sockets, h);
                 }
                 _ => i += 1,
             }
         }
         while l.listening.len() < LISTEN_POOL.min(l.backlog) && l.pending.len() < l.backlog {
-            let mut t = new_tcp(&opts);
+            // Out of memory: the pool stays short (SYNs find no listening
+            // socket) until the next refill.
+            let Ok(mut t) = new_tcp(&opts) else {
+                break;
+            };
             if t.listen(l.ep).is_err() {
+                discard_tcp(t);
                 break;
             }
             l.listening.push(sockets.add(t));
@@ -461,7 +512,7 @@ impl Stack {
                 || st == tcp::State::TimeWait
                 || st == tcp::State::Listen;
             if gone {
-                sockets.remove(h);
+                remove_tcp(sockets, h);
                 return false;
             }
             if st != tcp::State::Closed && (t.recv_queue() > 0 || now_ns > deadline) {
@@ -523,11 +574,12 @@ impl Stack {
         match sock.kind {
             Kind::Udp(u) => {
                 self.sockets.remove(u.h);
+                heap::uncharge(UDP_BUFS);
             }
             Kind::Tcp(Tcp::Idle) => {}
             Kind::Tcp(Tcp::Listen(l)) => {
                 for h in l.listening {
-                    self.sockets.remove(h);
+                    remove_tcp(&mut self.sockets, h);
                 }
                 for h in l.pending {
                     self.sockets.get_mut::<tcp::Socket>(h).abort();
@@ -559,6 +611,9 @@ pub struct InetSocket {
     ino: u64,
 }
 
+/// Whether the port table got its post-boot seed ([`create`]).
+static PORTS_SEEDED: AtomicBool = AtomicBool::new(false);
+
 /// `socket(family, ty, protocol)` for AF_INET/AF_INET6 (`ty` without the
 /// flag bits).
 pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Errno> {
@@ -576,7 +631,18 @@ pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Er
         SOCK_SEQPACKET | SOCK_RDM => return Err(Errno(ESOCKTNOSUPPORT)),
         _ => return Err(Errno(EINVAL)),
     };
+    // The port table is made at boot, before the RNG has its real seed
+    // (virtio-rng comes later): pick the ephemeral starting points again
+    // at the first socket, so source ports differ between boots.
+    let seed = (!PORTS_SEEDED.swap(true, Ordering::Relaxed)).then(|| {
+        let mut b = [0u8; 8];
+        crate::random::fill(&mut b);
+        u64::from_ne_bytes(b)
+    });
     let id = stack::with(false, |s| {
+        if let Some(seed) = seed {
+            s.ports.reseed(seed);
+        }
         if s.socks.len() >= MAX_SOCKETS {
             return Err(Errno(ENFILE));
         }
@@ -584,7 +650,7 @@ pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Er
             Kind::Tcp(Tcp::Idle)
         } else {
             Kind::Udp(Udp {
-                h: s.sockets.add(new_udp()),
+                h: s.sockets.add(new_udp()?),
                 peer: None,
                 local: None,
             })
@@ -1059,17 +1125,19 @@ impl SocketOps for InetSocket {
             if lip.is_some_and(|l| l.is_ipv4() != ip.is_ipv4()) {
                 return Err(Errno(ENETUNREACH));
             }
-            let mut t = new_tcp(&sock.opts);
+            let mut t = new_tcp(&sock.opts)?;
             let remote = IpEndpoint::new(ip.into(), port);
             let local = IpListenEndpoint {
                 addr: lip.map(Into::into),
                 port: lport,
             };
-            t.connect(s.iface.context(), remote, local)
-                .map_err(|e| match e {
+            if let Err(e) = t.connect(s.iface.context(), remote, local) {
+                discard_tcp(t);
+                return Err(match e {
                     tcp::ConnectError::InvalidState => Errno(EISCONN),
                     tcp::ConnectError::Unaddressable => Errno(EADDRNOTAVAIL),
-                })?;
+                });
+            }
             let local = t.local_endpoint();
             let h = s.sockets.add(t);
             let sock = s.sock(self.id)?;

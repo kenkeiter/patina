@@ -36,8 +36,15 @@ fn umask() -> u32 {
 
 // ---- open ----------------------------------------------------------------
 
+/// Before a call creates inodes or open files: the heap's low watermark
+/// must hold (D87). Linux tmpfs out of inodes is ENOSPC.
+fn create_reserve() -> Result<(), Errno> {
+    crate::mm::heap::reserve(4096).map_err(|_| Errno(patina_abi::errno::ENOSPC))
+}
+
 pub fn openat(dirfd: i32, path: usize, flags: u32, mode: u32) -> SysResult {
     let p = upath(path)?;
+    crate::mm::heap::reserve(4096)?;
     let of = namei::open(dirfd, &p, flags, mode)?;
     install(of, flags & O_CLOEXEC != 0)
 }
@@ -46,6 +53,7 @@ pub fn openat(dirfd: i32, path: usize, flags: u32, mode: u32) -> SysResult {
 
 pub fn mkdirat(dirfd: i32, path: usize, mode: u32) -> SysResult {
     let p = upath(path)?;
+    create_reserve()?;
     let base = Base::new(dirfd, &p)?;
     let mode = mode & 0o1777 & !umask();
     vfs::with(|fs| {
@@ -59,6 +67,7 @@ pub fn mkdirat(dirfd: i32, path: usize, mode: u32) -> SysResult {
 /// (devices come from the initrd or the kernel's `/dev`).
 pub fn mknodat(dirfd: i32, path: usize, mode: u32, _dev: u64) -> SysResult {
     let p = upath(path)?;
+    create_reserve()?;
     let t = mode & S_IFMT;
     match t {
         0 | S_IFREG | S_IFIFO => {}
@@ -94,6 +103,7 @@ pub fn unlinkat(dirfd: i32, path: usize, flags: u32) -> SysResult {
 
 pub fn renameat2(od: i32, op: usize, nd: i32, np: usize, flags: u32) -> SysResult {
     let (op, np) = (upath(op)?, upath(np)?);
+    create_reserve()?;
     let (ob, nb) = (Base::new(od, &op)?, Base::new(nd, &np)?);
     vfs::with(|fs| {
         let (os, ns) = (ob.start(fs)?, nb.start(fs)?);
@@ -105,6 +115,7 @@ pub fn renameat2(od: i32, op: usize, nd: i32, np: usize, flags: u32) -> SysResul
 pub fn symlinkat(target: usize, dirfd: i32, path: usize) -> SysResult {
     let t = upath(target)?;
     let p = upath(path)?;
+    create_reserve()?;
     let base = Base::new(dirfd, &p)?;
     vfs::with(|fs| {
         let s = base.start(fs)?;

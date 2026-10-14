@@ -28,9 +28,11 @@ use patina_abi::net::*;
 use patina_abi::signal::{SI_USER, SIGPIPE, SigInfo};
 use patina_inet::{AddrError, SOCKADDR_MAX, SockAddr};
 
-use super::fs::{get, install, read_iov};
+use super::fs::{MAX_RW, OBJ_RESERVE, clamp_iov_out, get, install, out_room, read_iov};
 use super::{SysResult, with_space};
 use crate::fs::file::{OpenFile, wait_ready};
+use crate::mm::heap;
+use crate::mm::vm::access_ok;
 use crate::net::socket::SocketOps;
 use crate::task::signal::ERESTARTSYS;
 use crate::task::{self, WakeReason};
@@ -60,10 +62,38 @@ pub fn read_addr(ptr: usize, len: usize) -> Result<SockAddr, Errno> {
     }
     let mut b = [0u8; SOCKADDR_MAX];
     with_space(|s| s.copy_from_user(ptr, &mut b[..len]))?;
-    SockAddr::parse(&b[..len]).map_err(|e| match e {
+    parse_addr(&b[..len])
+}
+
+fn parse_addr(b: &[u8]) -> Result<SockAddr, Errno> {
+    SockAddr::parse(b).map_err(|e| match e {
         AddrError::Invalid => Errno(EINVAL),
         AddrError::Family(_) => Errno(EAFNOSUPPORT),
     })
+}
+
+/// Linux `sysctl_optmem_max` (6.6 default): `sendmsg` control data of
+/// this size or more cannot be allocated (`sock_kmalloc` → ENOBUFS).
+const OPTMEM_MAX: usize = 20480;
+
+/// The checks of Linux `net/socket.c __copy_msghdr` on a copied-in
+/// `msghdr`: a NULL `msg_name` means length 0; a negative `msg_namelen`
+/// → EINVAL; more than `sizeof(struct sockaddr_storage)` (128) is clamped
+/// to it (not an error); more than `UIO_MAXIOV` iovecs → EMSGSIZE.
+/// Returns the name length to use.
+fn check_msghdr(m: &Msghdr) -> Result<usize, Errno> {
+    let namelen = if m.msg_name == 0 {
+        0
+    } else {
+        m.msg_namelen as i32
+    };
+    if namelen < 0 {
+        return Err(Errno(EINVAL));
+    }
+    if m.msg_iovlen > patina_abi::fs::UIO_MAXIOV as u64 {
+        return Err(Errno(EMSGSIZE));
+    }
+    Ok((namelen as usize).min(SOCKADDR_MAX))
 }
 
 /// Store `addr` at `uaddr` (truncated to `*ulenp`) and its full length at
@@ -174,6 +204,7 @@ fn split_type(ty: i32) -> Result<(u32, u32), Errno> {
 
 pub fn socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
     let (ty, flags) = split_type(ty)?;
+    heap::reserve(OBJ_RESERVE)?;
     let file: Arc<dyn crate::fs::file::File> = match u16::try_from(domain) {
         Ok(AF_INET | AF_INET6) => crate::net::inet::create(domain as u16, ty, protocol)?,
         Ok(AF_UNIX) => crate::net::unix::create(ty, protocol)?,
@@ -191,6 +222,7 @@ pub fn socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
 
 pub fn socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> SysResult {
     let (ty, flags) = split_type(ty)?;
+    heap::reserve(OBJ_RESERVE)?;
     let (a, b) = match u16::try_from(domain) {
         Ok(AF_INET | AF_INET6) => return Err(Errno(EOPNOTSUPP)),
         Ok(AF_UNIX) => crate::net::unix::pair(ty, protocol)?,
@@ -240,6 +272,7 @@ pub fn accept4(fd: i32, addr: usize, alenp: usize, flags: u32) -> SysResult {
         return Err(Errno(EINVAL));
     }
     let of = sock(fd)?;
+    heap::reserve(OBJ_RESERVE)?;
     let o = ops(&of);
     let until = deadline(o.timeouts().0);
     let (file, peer) = loop {
@@ -374,7 +407,7 @@ fn send_common(
         if total > o.max_dgram() {
             return Err(Errno(EMSGSIZE));
         }
-        let mut k = vec![0u8; total];
+        let mut k = heap::try_zeroed(total)?;
         iov.gather(&mut k)?;
         loop {
             match o.send(&k, to.as_ref(), flags, control) {
@@ -385,7 +418,7 @@ fn send_common(
             }
         }
     }
-    let mut k = vec![0u8; total.clamp(1, CHUNK)];
+    let mut k = heap::try_zeroed(total.clamp(1, CHUNK))?;
     let mut done = 0;
     // Ancillary data goes with the first bytes sent only.
     let mut control = control;
@@ -437,7 +470,7 @@ fn recv_common(
     let want = EpollFlags::IN | EpollFlags::RDNORM;
     let total = iov.total();
     if !o.is_stream() {
-        let mut k = vec![0u8; total.min(o.max_dgram() + 1)];
+        let mut k = heap::try_zeroed(total.min(o.max_dgram() + 1))?;
         loop {
             match o.recv_msg(&mut k, flags, room) {
                 Err(Errno(EAGAIN)) if !nonblock => wait(of, want, until)?,
@@ -466,7 +499,7 @@ fn recv_common(
         }
     }
     let waitall = flags.contains(MsgFlags::WAITALL) && !flags.contains(MsgFlags::PEEK);
-    let mut k = vec![0u8; total.clamp(1, CHUNK)];
+    let mut k = heap::try_zeroed(total.clamp(1, CHUNK))?;
     let mut got = 0;
     let mut control = Vec::new();
     let mut out = MsgFlags::empty();
@@ -517,6 +550,12 @@ fn recv_common(
 }
 
 pub fn sendto(fd: i32, buf: usize, len: usize, flags: u32, addr: usize, alen: usize) -> SysResult {
+    // Linux __sys_sendto: import_ubuf (clamp, access_ok → EFAULT) before
+    // the socket lookup, the address (move_addr_to_kernel) after it.
+    let len = len.min(MAX_RW);
+    if !access_ok(buf, len) {
+        return Err(Errno(EFAULT));
+    }
     let of = sock(fd)?;
     let to = if addr != 0 {
         Some(read_addr(addr, alen)?)
@@ -525,11 +564,35 @@ pub fn sendto(fd: i32, buf: usize, len: usize, flags: u32, addr: usize, alen: us
     };
     send_common(
         &of,
-        Iov::new(vec![(buf, len.min(isize::MAX as usize))]),
+        Iov::new(vec![(buf, len)]),
         to,
         MsgFlags::from_bits_retain(flags),
         &[],
     )
+}
+
+/// Whether `len` bytes at `p` can be written by a copy-out (checked
+/// before data is consumed for results written after it, D86).
+fn writable(p: usize, len: usize) -> bool {
+    access_ok(p, len) && with_space(|s| s.writable_prefix(p, len)) == len
+}
+
+/// Before a receive consumes data: the source address goes to
+/// `uaddr`/`ulenp` after the data, so both must be writable now (`EFAULT`
+/// otherwise; Linux finds out in `move_addr_to_user` after the data is
+/// gone).
+fn check_addr_out(uaddr: usize, ulenp: usize) -> Result<(), Errno> {
+    if uaddr == 0 || ulenp == 0 {
+        return Ok(());
+    }
+    if !writable(ulenp, size_of::<u32>()) {
+        return Err(Errno(EFAULT));
+    }
+    let ulen: i32 = with_space(|s| s.read_val(ulenp))?;
+    if ulen > 0 && !writable(uaddr, (ulen as usize).min(SOCKADDR_MAX)) {
+        return Err(Errno(EFAULT));
+    }
+    Ok(())
 }
 
 pub fn recvfrom(
@@ -540,10 +603,18 @@ pub fn recvfrom(
     addr: usize,
     alenp: usize,
 ) -> SysResult {
+    // Linux __sys_recvfrom: import_ubuf (clamp, access_ok → EFAULT)
+    // before the socket lookup.
+    let len = len.min(MAX_RW);
+    if !access_ok(buf, len) {
+        return Err(Errno(EFAULT));
+    }
     let of = sock(fd)?;
+    let room = out_room(buf, len)?;
+    check_addr_out(addr, alenp)?;
     let r = recv_common(
         &of,
-        Iov::new(vec![(buf, len.min(isize::MAX as usize))]),
+        Iov::new(vec![(buf, room)]),
         MsgFlags::from_bits_retain(flags),
         0,
     )?;
@@ -556,35 +627,73 @@ pub fn recvfrom(
     Ok(r.ret as isize)
 }
 
+/// `sendmsg`, checking in Linux's order (`___sys_sendmsg`,
+/// `copy_msghdr_from_user`, `____sys_sendmsg`): the msghdr (EFAULT), the
+/// name length ([`check_msghdr`]: EINVAL, clamped to 128), the name bytes
+/// (EFAULT), `msg_iovlen` (EMSGSIZE), the iovecs ([`read_iov`]),
+/// `msg_controllen` > `INT_MAX` or too large to allocate → ENOBUFS, the
+/// control bytes (EFAULT, also for a NULL `msg_control` with a length),
+/// and only then the address itself (the protocol's EINVAL/EAFNOSUPPORT).
 pub fn sendmsg(fd: i32, msg: usize, flags: u32) -> SysResult {
     let of = sock(fd)?;
     let m: Msghdr = with_space(|s| s.read_val(msg))?;
-    let to = if m.msg_name != 0 && m.msg_namelen > 0 {
-        Some(read_addr(m.msg_name as usize, m.msg_namelen as usize)?)
+    let namelen = check_msghdr(&m)?;
+    let mut name = [0u8; SOCKADDR_MAX];
+    if namelen > 0 {
+        with_space(|s| s.copy_from_user(m.msg_name as usize, &mut name[..namelen]))?;
+    }
+    let iov = Iov::new(read_iov(m.msg_iov as usize, m.msg_iovlen as usize)?);
+    let clen = m.msg_controllen as usize;
+    if clen > i32::MAX as usize || clen >= OPTMEM_MAX {
+        return Err(Errno(ENOBUFS));
+    }
+    let mut control = Vec::new();
+    if clen > 0 {
+        control
+            .try_reserve_exact(clen)
+            .map_err(|_| Errno(ENOBUFS))?;
+        control.resize(clen, 0);
+        with_space(|s| s.copy_from_user(m.msg_control as usize, &mut control))?;
+    }
+    let to = if namelen > 0 {
+        Some(parse_addr(&name[..namelen])?)
     } else {
         None
     };
-    let iov = Iov::new(read_iov(m.msg_iov as usize, m.msg_iovlen as usize)?);
-    let clen = (m.msg_controllen as usize).min(MAX_OPT);
-    let mut control = vec![0u8; if m.msg_control != 0 { clen } else { 0 }];
-    if !control.is_empty() {
-        with_space(|s| s.copy_from_user(m.msg_control as usize, &mut control))?;
-    }
     send_common(&of, iov, to, MsgFlags::from_bits_retain(flags), &control)
 }
 
 pub fn recvmsg(fd: i32, msg: usize, flags: u32) -> SysResult {
     let of = sock(fd)?;
     let mut m: Msghdr = with_space(|s| s.read_val(msg))?;
-    if (m.msg_namelen as i32) < 0 {
-        return Err(Errno(EINVAL));
+    // Linux __copy_msghdr: NULL name → 0, negative → EINVAL, clamped to
+    // 128, more than UIO_MAXIOV iovecs → EMSGSIZE.
+    m.msg_namelen = check_msghdr(&m)? as u32;
+    let mut iovs = read_iov(m.msg_iov as usize, m.msg_iovlen as usize)?;
+    // Everything written after the data is consumed must be writable
+    // first (D86): the iovecs (trimmed to what can be filled), the
+    // msghdr, the name; control data is sized to what can be stored.
+    clamp_iov_out(&mut iovs)?;
+    if !writable(msg, size_of::<Msghdr>()) {
+        return Err(Errno(EFAULT));
     }
-    let iov = Iov::new(read_iov(m.msg_iov as usize, m.msg_iovlen as usize)?);
+    if m.msg_name != 0
+        && m.msg_namelen > 0
+        && !writable(m.msg_name as usize, (m.msg_namelen as usize).min(SOCKADDR_MAX))
+    {
+        return Err(Errno(EFAULT));
+    }
     let room = if m.msg_control != 0 {
-        m.msg_controllen as usize
+        let want = m.msg_controllen as usize;
+        if access_ok(m.msg_control as usize, want) {
+            with_space(|s| s.writable_prefix(m.msg_control as usize, want))
+        } else {
+            0
+        }
     } else {
         0
     };
+    let iov = Iov::new(iovs);
     let r = recv_common(&of, iov, MsgFlags::from_bits_retain(flags), room)?;
     // Linux (`____sys_recvmsg`) starts `msg_flags` from the caller's
     // MSG_CMSG_CLOEXEC and reports it back (Go's TestSCMCredentials).
@@ -604,7 +713,7 @@ pub fn recvmsg(fd: i32, msg: usize, flags: u32) -> SysResult {
     } else {
         m.msg_namelen = 0;
     }
-    let cn = r.control.len().min(m.msg_controllen as usize);
+    let cn = r.control.len().min(room);
     if cn < r.control.len() {
         out |= MsgFlags::CTRUNC;
     }

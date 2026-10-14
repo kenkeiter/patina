@@ -179,7 +179,13 @@ pub fn timer_create(clk: i32, sevp: usize, idp: usize) -> SysResult {
     Ok(0)
 }
 
+/// `timer_settime(id, flags, new, old)`: a NULL `new` is EINVAL (Linux
+/// `kernel/time/posix-timers.c`: checked before the copy), then the copy
+/// (EFAULT), then the timer id.
 pub fn timer_settime(id: i32, flags: i32, new: usize, old: usize) -> SysResult {
+    if new == 0 {
+        return Err(Errno(EINVAL));
+    }
     let (interval, value) = read_itimerspec(new)?;
     let prev = timers::settime(id, flags & TIMER_ABSTIME != 0, interval, value)?;
     if old != 0 {

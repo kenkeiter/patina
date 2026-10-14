@@ -11,8 +11,12 @@ use patina_abi::net::*;
 use patina_inet::unix::{CmsgWriter, SCM_MAX_FD, parse_cmsgs, rights_fds};
 
 use super::name::{self, Name};
-use super::{Anc, BUF_SIZE, Conn, MAX_DGRAM, Msg, Rx, Sock, UnixSocket, World, own_creds, with};
+use super::{
+    Anc, BUF_SIZE, Conn, MAX_DGRAM, Msg, Rx, Sock, UnixSocket, World, own_creds, stream_pop,
+    stream_push, with,
+};
 use crate::fs::file::File;
+use crate::mm::heap::KBuf;
 use crate::net::socket::{self as so, RecvInfo, SockAddr, SocketOps};
 
 const EVERYTHING: EpollFlags = EpollFlags::IN
@@ -151,7 +155,13 @@ impl UnixSocket {
             if b.space() == 0 {
                 return Err(Errno(EAGAIN));
             }
-            let (n, back) = b.push(data, anc.take());
+            let (n, back) = match stream_push(b, data, anc.take()) {
+                Ok(r) => r,
+                Err((e, back)) => {
+                    anc = back;
+                    return Err(e);
+                }
+            };
             anc = back;
             out.wake(w, peer, EpollFlags::IN | EpollFlags::RDNORM);
             Ok(n)
@@ -222,15 +232,18 @@ impl UnixSocket {
             let Rx::Msgs { q, bytes } = &mut ts.rx else {
                 return Err(Errno(EINVAL));
             };
+            // Charged while queued (D87): ENOBUFS when memory is short.
+            let data = KBuf::try_copy(data).ok_or(Errno(ENOBUFS))?;
+            let len = data.len();
             q.push_back(Msg {
-                data: data.to_vec(),
+                data,
                 from,
                 anc: anc.take().unwrap_or_default(),
             });
-            *bytes += data.len();
+            *bytes += len;
             out.wake(w, t, EpollFlags::IN | EpollFlags::RDNORM);
             w.sock(id)?.blocked_on = None;
-            Ok(data.len())
+            Ok(len)
         })
     }
 
@@ -278,7 +291,7 @@ impl UnixSocket {
                         (n, a.map(peek_anc))
                     } else {
                         let before = b.space();
-                        let r = b.pop(buf);
+                        let r = stream_pop(b, buf);
                         let thresh = BUF_SIZE / 4;
                         if before < thresh
                             && b.space() >= thresh

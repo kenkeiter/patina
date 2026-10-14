@@ -62,6 +62,12 @@ pub struct NetlinkSocket {
     st: SpinLock<State>,
 }
 
+impl Drop for NetlinkSocket {
+    fn drop(&mut self) {
+        crate::mm::heap::uncharge(self.st.lock().queued);
+    }
+}
+
 /// `socket(AF_NETLINK, ty, protocol)` (`ty` without the flag bits).
 pub fn create(ty: u32, protocol: i32) -> Result<Arc<NetlinkSocket>, Errno> {
     if ty != SOCK_RAW && ty != SOCK_DGRAM {
@@ -303,6 +309,10 @@ impl SocketOps for NetlinkSocket {
             if st.queued + bytes > RCVBUF {
                 return Err(Errno(ENOBUFS));
             }
+            // Queued replies are charged to the program until read (D87).
+            if !crate::mm::heap::charge(bytes) {
+                return Err(Errno(ENOBUFS));
+            }
             st.queued += bytes;
             let any = !replies.is_empty();
             st.queue.extend(replies);
@@ -335,6 +345,7 @@ impl SocketOps for NetlinkSocket {
         if !flags.contains(MsgFlags::PEEK) {
             st.queue.pop_front();
             st.queued -= full;
+            crate::mm::heap::uncharge(full);
         }
         Ok(RecvInfo {
             len: n,

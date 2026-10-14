@@ -1251,7 +1251,8 @@ priority 0, and `sched_get_priority_max`/`min` → 0. `getpriority` gives
 `personality` gives 0. `sysinfo` fills in uptime, `totalram`/`freeram`
 from the frame allocator, `procs` = live threads and `mem_unit` 1.
 `getcpu` gives the current CPU, node 0. `mlock*`/`munlock*`/`msync` give
-0. The `xattr` family gives `EOPNOTSUPP`. `inotify_*`, `memfd_create`,
+0 (their flags, alignment and range are checked as Linux does: bad flags
+EINVAL, a hole ENOMEM). The `xattr` family gives `EOPNOTSUPP`. `inotify_*`, `memfd_create`,
 `pidfd_open`, `kcmp`, `seccomp`, `*_mempolicy` and `ioprio_*` remain
 `ENOSYS` (logged once). Go handles all of these.
 ## D58: virtio is in-tree behind a `Transport` trait; no `virtio-drivers`
@@ -2856,3 +2857,85 @@ addresses (the guest answers in < 1 ms); the e2e test treats the first
 request as informational. Also noted: every accepted TCP connection sends
 one 1-byte segment right after the handshake (smoltcp keep-alive
 handling, harmless, not fixed).
+
+## D86: User buffers are checked before data is consumed
+*2026-10-14 · Phase 5*
+
+Reads that consume something (pipe and socket data, eventfd counters,
+directory positions, edge-triggered and one-shot epoll events) used to
+consume it into a kernel bounce buffer and only then copy it out; a bad
+buffer gave EFAULT after the data was gone, and a huge count with a
+kernel-half pointer was not refused up front. Now `read`, `readv`,
+`pread64`, `getdents64` (directories), `recvfrom`, `recvmsg` and
+`epoll_pwait`/`epoll_pwait2`/`epoll_wait` first do Linux's `access_ok`
+(`vm::access_ok`: the range is in the user half and does not overflow →
+otherwise EFAULT, at the point in the argument checks where Linux does
+it), then size the operation to `AddressSpace::writable_prefix`: the run of
+writable VMAs starting at the buffer (iovec arrays are trimmed the same
+way, `fs::clamp_iov_out`). Not one writable byte is EFAULT with nothing
+consumed. `recvmsg` also requires the `msghdr` and the name buffer to be
+writable before receiving, and offers control data only the writable part
+of `msg_control`; `recvfrom` checks `addrlen` and the address buffer. An
+epoll event whose copy-out still fails (a page that cannot be filled) is
+put back on the ready list (`Epoll::unreport`, Linux `ep_send_events`),
+`EPOLLONESHOT` items re-armed.
+
+Divergences. When a buffer is only partly valid, patina returns a short
+count sized to the valid part *before* reading, and leaves the rest of the
+data queued. Linux copies until the fault and returns the partial count for
+pipes, streams and files (the same result), but for a datagram it returns
+EFAULT and drops the datagram; patina delivers the valid prefix with
+`MSG_TRUNC` semantics (the rest of that datagram is lost, as with any short
+datagram read). A buffer with no writable byte at all (unmapped or
+read-only) is EFAULT at once, whereas Linux would first block until data
+arrives (and for epoll requeue the event); the errno is the same, the
+blocking is not. The check walks VMAs only (no faults, no allocation), so a
+page that is mapped but cannot be filled (out of memory, D78) can still
+fail the copy after consumption; that returns ENOMEM/EFAULT as before.
+
+## D87: Kernel heap exhaustion: charged buffers, a low watermark, fallible allocation
+*2026-10-14 · Phase 5*
+
+The kernel heap (`mm/heap.rs`, a buddy allocator) has no cap of its own:
+it grows from the frame allocator, in the same frames user pages come
+from, and never gives them back. Its allocations were infallible, so a
+program that raised `RLIMIT_NOFILE` to 2^20 and opened UDP sockets (64 KiB
+each), listening TCP sockets (4 × 128 KiB pool), written pipes (64 KiB
+ring), epolls, or wrote tmpfs files after committing most of RAM, panicked
+the kernel (`memory allocation of N bytes failed`). Now, in three layers:
+(1) long-lived memory held for the program — TCP/UDP socket buffers, pipe
+rings, queued AF_UNIX data (stream storage and datagrams, `heap::KBuf`),
+queued netlink replies, tmpfs file pages (a page hook in `patina-vfs`) —
+is charged (`heap::charge`/`uncharge`, buddy-rounded sizes) against the
+program's D78 commit limit, next to its writable mappings: `mmap` sees the
+charge and kernel buffers see the mappings, so the D78 kernel reserve
+stays for page tables, kernel stacks and kernel objects. A refused charge
+is ENOBUFS for sockets (`socket`, `connect`, sends; a listener's pool just
+stays short), ENOMEM for a pipe write, ENOSPC for tmpfs. `/proc/meminfo`
+`Committed_AS` includes the charge. (2) Syscalls that create kernel
+objects — `pipe2`, `eventfd2`, `socket`, `socketpair`, `accept4`,
+`epoll_create1`, `EPOLL_CTL_ADD`, `openat`, file creation (ENOSPC),
+`clone`, fd-table growth (up to 16 MiB), `ppoll`'s arrays — first call
+`heap::reserve`, which fails (ENOMEM) unless free frames plus free heap
+bytes stay above a low watermark of half the D78 reserve (RAM/32, 2–32
+MiB); the few hundred bytes they then allocate infallibly cannot run the
+kernel dry. (3) Buffers sized by user input (read/write/recv/send bounce
+buffers, `sendmsg` control data, socket buffers, pipe rings, fd table,
+VMA map) are allocated with `try_reserve*` (`heap::try_zeroed`): ENOMEM,
+never a panic. The heap now also grows by smaller blocks (down to the
+request's order) when RAM is too fragmented for a 2 MiB block. Bounded
+too: at most `MAX_MAP_COUNT` (65530, Linux `max_map_count`) VMAs (`mmap`
+and splitting `munmap`/`mprotect` → ENOMEM), and `munmap`/`madvise`/
+`mprotect` no longer collect every resident page of a range into a Vec.
+
+The fd table now remembers its lowest free slot, so filling it to 2^20
+is linear (it was quadratic: minutes). Known limits: freed heap memory is
+not returned to the frame allocator, so after a program frees many kernel
+buffers its own page faults can still hit the D78 backstop (SIGKILL); the
+x86_64 SMP shootdown list and the epoll ready snapshot stay infallible
+(bounded by RAM/512 and by registered items, which are gated). Verified
+with a throwaway program at `PATINA_MEM=256` on aarch64, which panicked
+the kernel before in every case: pipes until `write` ENOMEM (2875), UDP
+sockets until ENOBUFS (2787), 4096 listening sockets (then ENFILE), epolls
+until ENOMEM (734186), and tmpfs writes after committing all memory
+(ENOSPC); each exits 0.
