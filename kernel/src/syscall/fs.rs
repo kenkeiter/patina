@@ -72,6 +72,17 @@ pub(super) fn out_room(buf: usize, len: usize) -> Result<usize, Errno> {
 /// it to the segments (and the part of the last one) a copy-out can fill.
 /// `EFAULT` if not one byte of a non-empty request is writable.
 pub(super) fn clamp_iov_out(iovs: &mut Vec<(usize, usize)>) -> Result<(), Errno> {
+    clamp_iov(iovs, true)
+}
+
+/// [`clamp_iov_out`] for a copy-in (`writev`, `sendmsg`): trims the
+/// iovecs to the readable run, so a write stops where Linux's
+/// copy-until-fault would and reports the short count (D86).
+pub(super) fn clamp_iov_in(iovs: &mut Vec<(usize, usize)>) -> Result<(), Errno> {
+    clamp_iov(iovs, false)
+}
+
+fn clamp_iov(iovs: &mut Vec<(usize, usize)>, out: bool) -> Result<(), Errno> {
     let want: usize = iovs.iter().map(|v| v.1).sum();
     let mut keep = 0;
     let mut got = 0;
@@ -80,7 +91,13 @@ pub(super) fn clamp_iov_out(iovs: &mut Vec<(usize, usize)>) -> Result<(), Errno>
             keep += 1;
             continue;
         }
-        let r = with_space(|s| s.writable_prefix(v.0, v.1));
+        let r = with_space(|s| {
+            if out {
+                s.writable_prefix(v.0, v.1)
+            } else {
+                s.readable_prefix(v.0, v.1)
+            }
+        });
         got += r;
         if r > 0 {
             keep += 1;
@@ -95,6 +112,20 @@ pub(super) fn clamp_iov_out(iovs: &mut Vec<(usize, usize)>) -> Result<(), Errno>
         return Err(Errno(EFAULT));
     }
     Ok(())
+}
+
+/// Before a write copies `[buf, buf+len)` in (after `access_ok`): how
+/// many bytes are in readable VMAs from `buf`. A short run gives a short
+/// write, as Linux's copy-until-fault (`generic_perform_write`,
+/// `pipe_write`) returns the bytes copied; none at all is `EFAULT`.
+pub(super) fn in_room(buf: usize, len: usize) -> Result<usize, Errno> {
+    if len == 0 {
+        return Ok(0);
+    }
+    match with_space(|s| s.readable_prefix(buf, len)) {
+        0 => Err(Errno(EFAULT)),
+        n => Ok(n),
+    }
 }
 
 /// `n > 0` bytes done before error `e`: report the bytes, else the error.
@@ -272,7 +303,8 @@ pub fn write(fd: i32, buf: usize, len: usize) -> SysResult {
     if !access_ok(buf, len) {
         return Err(Errno(EFAULT));
     }
-    write_from(&of, buf, len.min(MAX_RW))
+    let len = in_room(buf, len.min(MAX_RW))?;
+    write_from(&of, buf, len)
 }
 
 /// Read and check a user iovec array as Linux `lib/iov_iter.c`
@@ -343,7 +375,8 @@ pub fn writev(fd: i32, iov: usize, cnt: usize) -> SysResult {
     if !of.flags().writable() {
         return Err(Errno(EBADF));
     }
-    let iovs = read_iov(iov, cnt)?;
+    let mut iovs = read_iov(iov, cnt)?;
+    clamp_iov_in(&mut iovs)?;
     let mut done = 0;
     for (base, len) in iovs {
         if len == 0 {
@@ -397,7 +430,8 @@ pub fn pwrite64(fd: i32, buf: usize, len: usize, off: i64) -> SysResult {
     if !access_ok(buf, len) {
         return Err(Errno(EFAULT));
     }
-    let mut k = heap::try_zeroed(len.min(CHUNK))?;
+    let len = in_room(buf, len.min(CHUNK))?;
+    let mut k = heap::try_zeroed(len)?;
     with_space(|s| s.copy_from_user(buf, &mut k))?;
     Ok(of.file.pwrite(&k, off as u64)? as isize)
 }

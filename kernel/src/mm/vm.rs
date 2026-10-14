@@ -964,13 +964,25 @@ impl AddressSpace {
     /// anything, so a bad buffer cannot make them drop data (D86). Walks
     /// VMAs only: O(VMAs in range), no faults, no allocation.
     pub fn writable_prefix(&self, va: usize, len: usize) -> usize {
+        self.access_prefix(va, len, Access::Write)
+    }
+
+    /// The copy-in counterpart of [`AddressSpace::writable_prefix`]: how
+    /// many bytes from `va` (at most `len`) are in readable VMAs. Writes
+    /// size their copy-in by it, so a buffer that ends in a hole or guard
+    /// page gives a short count, as Linux's copy-until-fault does (D86).
+    pub fn readable_prefix(&self, va: usize, len: usize) -> usize {
+        self.access_prefix(va, len, Access::Read)
+    }
+
+    fn access_prefix(&self, va: usize, len: usize, access: Access) -> usize {
         let Some(end) = va.checked_add(len) else {
             return 0;
         };
         let mut cur = va;
         while cur < end {
             match self.find(cur) {
-                Some(v) if v.allows(Access::Write) => cur = v.end,
+                Some(v) if v.allows(access) => cur = v.end,
                 _ => break,
             }
         }
