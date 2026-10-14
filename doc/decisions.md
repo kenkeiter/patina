@@ -1852,7 +1852,7 @@ identical. Without `-test.short` (2 vCPUs, both arches; the DNS and
 external-network tests then run over slirp and pass): 250 passed, 3 failed —
 the two multicast listener tests (`IP_ADD_MEMBERSHIP` etc. are
 `ENOPROTOOPT`: multicast is not implemented; `-short` skips them) and
-`TestSendfileWithLargeFile` (a multi-GiB file does not fit the RAM-backed
+`TestSendfileWithLargeFile` (its 2 GiB file does not fit the RAM-backed
 `/tmp`). `net/http` needs no list: 611 passed, 10 skipped, 0 failed with
 `-short` on both arches (616/5/0 without it, aarch64, 2 vCPUs). The `os` run
 (D65) now also runs `TestLargeCopyViaNetwork`; `TestSpliceFile`,
