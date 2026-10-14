@@ -35,6 +35,8 @@ scripts/bench.sh [arch...] [--cpus 1,2] [--runs 3] [--novdso] [-n F] [--only L]
                                                     # Phase 5 per-syscall benchmarks (testapps/bench): table of medians per arch (D79)
 scripts/test-robust.sh [aarch64] [x86_64]           # Phase 5 robustness (testapps/robust): tickless idle, sub-tick timers, fault -> signal,
                                                     # stack/page-table reclaim, OOM, signal/fd edge cases; 12 cases per arch (D77, D78, D80)
+scripts/test-sysfuzz.sh [aarch64] [x86_64]          # Phase 5 syscall validation (testapps/sysfuzz): 327/343 Linux-errno cases, seeded
+                                                    # random-argument fuzz at 1 and 4 vCPUs, bad rt_sigreturn frames; 17/20 cases per arch (D86, D87)
 scripts/run-qemu.sh <arch> <cpio> -- patina.stats=1 -- <args>
                                                     # per-CPU timer IRQs / ticks / idle waits / switches + memory line at exit
 GO=go1.26.9 scripts/build-testapp.sh <name> <arch> <out>  # build a testapp with another Go toolchain (default GO=go)
@@ -611,3 +613,71 @@ least 4, `reclaim-4cpu` 4, `oom`/`oomfault` `PATINA_MEM=256`).
 - [x] > 4 vCPUs (8) — **robust-8cpu**
 - [x] x86_64 FXSAVE-only CPUs — **fxsave-only**
 - [~] `FPE_FLTINV`, `sigaltstack` `EPERM`/auto-disarm on delivery, `ppoll`'s temporary sigmask, `clock_nanosleep` on the process CPU clock: not reachable on this host or from Go
+
+### Syscall validation
+
+Decisions D86 (user buffers checked before data is consumed, the short-count
+divergences) and D87 (kernel heap exhaustion: charged buffers, low
+watermark, fallible allocation). `scripts/test-sysfuzz.sh [aarch64]
+[x86_64]` runs testapps/sysfuzz per arch (logs in `out/test/sysfuzz/`):
+`cases` (deterministic argument combinations, each checked against the
+errno Linux returns, the Linux source function cited next to each),
+`fuzz-s<seed>-{1,4}cpu` (random syscalls from the arch table with random
+and edge arguments — NULL, unmapped, guard and kernel-half addresses, huge
+lengths, 32-bit-truncated and negative fds, random flags — from locked
+threads; fuzz.go documents the exclusion list; only "the kernel survived
+and the program exited 0" is asserted) and the `sigreturn-*` / `lastpage`
+crash modes (hand-built rt_sigreturn frames: accepted ones run
+`exit_group(42)`, rejected ones die by SIGSEGV; a syscall from the last
+user page). A kernel panic, `[patina] fatal: user`, timeout or missing exit
+sentinel fails a case.
+
+| Name | Command | Observed |
+|---|---|---|
+| **test-sysfuzz** | `scripts/test-sysfuzz.sh aarch64 x86_64` (seeds 1 2 3, 20000 calls each at 1 vCPU/2 workers and 4 vCPUs/4 workers) | all passed: aarch64 17/17 (`PASS sysfuzz cases (327)`, 6 fuzz runs, 9 sigreturn modes, lastpage by signal), x86_64 20/20 (`PASS sysfuzz cases (343)`, 6 fuzz runs, 12 sigreturn modes, lastpage 43: mmap refused). Fuzz also survived seeds 4–14 at 4 vCPUs on aarch64 during development. Before the fixes: the cases run panicked the kernel at the 16 TiB `mincore` (`memory allocation of 4294967296 bytes failed`), with it skipped 36 cases failed on aarch64 / 37 on x86_64 (listed below), `sigreturn-tf` hung (test-frame bug, fixed in the test) and `lastpage` mapped the top page on x86_64; every fuzz seed survived the unfixed kernel |
+| **exhaust** | Worker-side throwaway program at `PATINA_MEM=256` (aarch64): `RLIMIT_NOFILE` raised to 1048576, then pipes written once, UDP sockets, listening TCP sockets, epolls, and tmpfs writes after committing most of RAM | before D87 each panicked the kernel (`memory allocation of N bytes failed`); now `write` ENOMEM after 2875 pipes, ENOBUFS after 2787 UDP sockets, ENFILE at 4096 listeners, ENOMEM after 734186 epolls, ENOSPC for tmpfs; each exits 0. A `sysfuzz -mode exhaust` regression is reserved but not written (see the report) |
+| **p5-sysfuzz-merge** | on the merged branch: `scripts/test-sysfuzz.sh aarch64 x86_64`, `PATINA_CPUS_LIST="1 4" scripts/test-runtime.sh aarch64 x86_64`, `scripts/test-gopkg.sh runtime --cpus 4`, `scripts/test-gopkg.sh os net syscall`, `scripts/test-net.sh`, `scripts/test-ctl.sh`, `scripts/test-robust.sh` on both arches, `scripts/test-vz.sh`, host tests, clippy both targets | all PASS: test-runtime `all passed` (22 rows per arch), `runtime aarch64 (cpus=4): 385 passed, 141 skipped (11 by our list), 0 failed`, `runtime x86_64 (cpus=4): 386 passed, 143 skipped (11 by our list), 0 failed`, os 248/33(10)/0, net 254/55(1)/0, syscall 25/28(10)/0 on both arches, test-net 7/7 per arch, test-ctl 8/8 per arch, test-robust 12/12 per arch, test-vz 13/13 (incl. vsock), 233 host tests, clippy 0 warnings |
+
+Bugs fixed (one commit each; the cases that caught them, as they failed on
+the unfixed kernel):
+
+- `mincore` over a huge `PROT_NONE` reservation allocated len/4096 bytes
+  with IRQs off under the address-space lock and panicked the kernel; now
+  a bounded chunked walk (`mincore 16 TiB into 2 MiB`).
+- `read`/`readv`/`pread64`/`getdents64`/`recvfrom`/`recvmsg`/`epoll_wait`
+  consumed pipe/socket data or edge-triggered events before the copy-out
+  failed with EFAULT (`read huge count`, `read into hole`, `read into
+  read-only page`, `read after faults keeps data`, `pipe empty after
+  failed writev`, `epoll_pwait kernel events before fd`); `write`/`pwrite64`
+  filled the pipe ring before noticing a count beyond the user half
+  (`write huge count`); partial buffers now give Linux's short count
+  (`pread64/pwrite64/getrandom up to the guard page`, `read /dev/zero up
+  to the guard page`).
+- iovec/msghdr import: unchecked segments and the wrong errnos
+  (`writev kernel segment`, `writev huge segment`, `sendmsg iovlen 1025`
+  → EMSGSIZE).
+- Linux errno order: `pread64 negative offset bad fd`, `epoll_ctl bad
+  event before fd`, `ppoll bad sigsetsize first`, `prlimit64 kernel new
+  first`, `futex wait bad timeout before alignment`, `mprotect len 0 kernel
+  addr`, `mprotect growsdown on plain vma`, `madvise kernel` → ENOMEM,
+  `madvise len 0`, `utimensat fd NULL path with flags`.
+- Argument checks: `mmap unknown prot bit` (ignored), `mremap new_len >
+  TASK_SIZE` → EINVAL, `timer_settime NULL new` → EINVAL, `prlimit64
+  NOFILE above nr_open` → EPERM, `futex wake kernel` → EFAULT, `msync bad
+  flags` / `async|sync` / `unaligned` / `hole`, `mlock hole`, `mlockall 0`,
+  `mlock2 bad flags`, `eventfd2 bad flags`; x86_64 user space now ends at
+  `TASK_SIZE_MAX` (`lastpage` → mmap refused).
+- Kernel heap exhaustion (D87): socket buffers, pipe rings, AF_UNIX
+  queues, netlink replies and tmpfs pages are charged against the D78
+  commit limit; object-creating syscalls check a low watermark; every
+  user-sized buffer is allocated fallibly; VMAs capped at 65530; the fd
+  table fills in linear time (**exhaust**).
+- Ephemeral TCP/UDP ports were identical on every boot (the port table was
+  seeded before the RNG); the first inet `socket()` reseeds it.
+
+- [x] Deterministic Linux-errno syscall cases on both arches — **test-sysfuzz** `cases`
+- [x] Random-argument syscall stress survives at 1 and 4 vCPUs — **test-sysfuzz** `fuzz-*`
+- [x] Malformed `rt_sigreturn` frames and a syscall from the last user page — **test-sysfuzz** `sigreturn-*`, `lastpage`
+- [x] Kernel heap exhaustion answers with errnos, never a panic — **exhaust** (worker program; no in-tree regression yet)
+- [~] `sysfuzz -mode exhaust` (fd/socket/pipe/mmap exhaustion with a frame-count check) is reserved and not implemented
+
