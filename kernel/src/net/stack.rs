@@ -217,8 +217,8 @@ impl Stack {
                     dns.push_str(&format!("{}", d));
                 }
                 let (a, p) = new.addr.unwrap_or((Ipv4Addr::UNSPECIFIED, 0));
-                crate::kprintln!(
-                    "[patina] net: dhcp {} {}/{} via {}, dns {}{}{} ({} ms)",
+                let line = format!(
+                    "net: dhcp {} {}/{} via {}, dns {}{}{} ({} ms)",
                     if first { "lease" } else { "lease changed:" },
                     a,
                     p,
@@ -233,6 +233,13 @@ impl Stack {
                         .map_or(String::new(), |d| format!(", domain {}", d)),
                     ms
                 );
+                crate::kprintln!("[patina] {}", line);
+                // Also a control-channel log event: how `patina run` learns
+                // the guest's address (VZ NAT has no port forwarding).
+                crate::ctl::log_info(format_args!("{}", line));
+                if let (true, Some((ip, _)), Some(gw)) = (first, new.addr, new.gateway) {
+                    self.mux.tx.arp_request(ip, gw);
+                }
                 self.cfg = new;
             }
             None => {
