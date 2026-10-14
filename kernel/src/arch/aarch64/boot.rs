@@ -19,7 +19,7 @@ use core::arch::global_asm;
 use super::dtb::{self, UartKind};
 use super::{
     KERNEL_SIZE, KERNEL_VA_BASE, LOAD_PHYS, PHYS_OFFSET, console, cpu, gic, layout, paging, power,
-    timer,
+    smp, timer,
 };
 use crate::bootinfo::{BootInfo, MemKind, MemoryMap, PhysRange, PlatformInfo};
 use crate::mm::{PhysAddr, frame, heap};
@@ -86,40 +86,7 @@ _start_real:
     mov     x19, x0                     // x19 = DTB physical address
     msr     daifset, #0xf
 
-    // ---- Drop from EL2 to EL1h if needed.
-    mrs     x9, CurrentEL
-    ubfx    x9, x9, #2, #2
-    cmp     x9, #2
-    b.ne    1f
-    mov     x9, #(1 << 31)              // HCR_EL2.RW: EL1 is AArch64
-    msr     hcr_el2, x9
-    mrs     x9, cnthctl_el2
-    orr     x9, x9, #3                  // EL1PCTEN | EL1PCEN
-    msr     cnthctl_el2, x9
-    msr     cntvoff_el2, xzr
-    mov     x9, #0x33ff                 // CPTR_EL2: no FP/SIMD traps
-    msr     cptr_el2, x9
-    msr     hstr_el2, xzr
-    msr     vttbr_el2, xzr
-    mrs     x9, midr_el1
-    msr     vpidr_el2, x9
-    mrs     x9, mpidr_el1
-    msr     vmpidr_el2, x9
-    mrs     x9, id_aa64pfr0_el1         // GICv3 sysregs: allow EL1 access
-    ubfx    x9, x9, #24, #4
-    cbz     x9, 2f
-    mrs     x9, S3_4_C12_C9_5           // ICC_SRE_EL2
-    orr     x9, x9, #0xf                // SRE | DFB | DIB | Enable
-    msr     S3_4_C12_C9_5, x9
-    isb
-2:  ldr     x9, ={sctlr_res1}
-    msr     sctlr_el1, x9
-    mov     x9, #0x3c5                  // EL1h, DAIF masked
-    msr     spsr_el2, x9
-    adr     x9, 1f
-    msr     elr_el2, x9
-    eret
-1:
+    bl      __el2_to_el1
     // ---- EL1, MMU off.
     ldr     x9, ={sctlr_res1}
     msr     sctlr_el1, x9
@@ -201,16 +168,7 @@ _start_real:
     bl      __inval_dcache_range
 
     // ---- MMU on.
-    ldr     x9, ={mair}
-    msr     mair_el1, x9
-    ldr     x9, ={tcr}
-    mrs     x10, id_aa64mmfr0_el1
-    and     x10, x10, #7                // PARange
-    cmp     x10, #5
-    mov     x11, #5
-    csel    x10, x10, x11, ls           // cap at 48 bits
-    bfi     x9, x10, #32, #3            // TCR_EL1.IPS
-    msr     tcr_el1, x9
+    bl      __setup_mair_tcr
     msr     ttbr0_el1, x23
     msr     ttbr1_el1, x24
     isb
@@ -224,6 +182,99 @@ _start_real:
     dsb     nsh
     isb
     ldr     x9, =__boot_high
+    br      x9
+
+// Drop from EL2 to EL1h (DAIF masked) if entered at EL2, returning to x30
+// at EL1; plain return at EL1. Shared by the boot CPU and secondary CPUs
+// (PSCI CPU_ON starts a secondary at the caller's EL or at EL2, depending
+// on the VMM/firmware). Clobbers x9.
+__el2_to_el1:
+    mrs     x9, CurrentEL
+    ubfx    x9, x9, #2, #2
+    cmp     x9, #2
+    b.ne    1f
+    mov     x9, #(1 << 31)              // HCR_EL2.RW: EL1 is AArch64
+    msr     hcr_el2, x9
+    mrs     x9, cnthctl_el2
+    orr     x9, x9, #3                  // EL1PCTEN | EL1PCEN
+    msr     cnthctl_el2, x9
+    msr     cntvoff_el2, xzr
+    mov     x9, #0x33ff                 // CPTR_EL2: no FP/SIMD traps
+    msr     cptr_el2, x9
+    msr     hstr_el2, xzr
+    msr     vttbr_el2, xzr
+    mrs     x9, midr_el1
+    msr     vpidr_el2, x9
+    mrs     x9, mpidr_el1
+    msr     vmpidr_el2, x9
+    mrs     x9, id_aa64pfr0_el1         // GICv3 sysregs: allow EL1 access
+    ubfx    x9, x9, #24, #4
+    cbz     x9, 2f
+    mrs     x9, S3_4_C12_C9_5           // ICC_SRE_EL2
+    orr     x9, x9, #0xf                // SRE | DFB | DIB | Enable
+    msr     S3_4_C12_C9_5, x9
+    isb
+2:  ldr     x9, ={sctlr_res1}
+    msr     sctlr_el1, x9
+    mov     x9, #0x3c5                  // EL1h, DAIF masked
+    msr     spsr_el2, x9
+    msr     elr_el2, x30
+    eret
+1:  ret
+
+// Program MAIR/TCR (IPS from ID_AA64MMFR0_EL1.PARange, capped at 48 bits).
+// Clobbers x9-x11.
+__setup_mair_tcr:
+    ldr     x9, ={mair}
+    msr     mair_el1, x9
+    ldr     x9, ={tcr}
+    mrs     x10, id_aa64mmfr0_el1
+    and     x10, x10, #7                // PARange
+    cmp     x10, #5
+    mov     x11, #5
+    csel    x10, x10, x11, ls           // cap at 48 bits
+    bfi     x9, x10, #32, #3            // TCR_EL1.IPS
+    msr     tcr_el1, x9
+    ret
+
+// ---- Secondary CPU entry (PSCI CPU_ON target): physical address, MMU and
+// caches off, x0 = context_id = PA of `smp::AP_BOOT`, which the boot CPU
+// cleaned to the PoC before CPU_ON (reads here are non-cacheable). TTBR0 =
+// the boot identity map of the image (still intact in `.bss.boot_pt`,
+// never written after boot) so the instruction that turns the MMU on and
+// the branch after it stay mapped; TTBR1 = the final kernel tables. Then
+// continue at the link address (`__ap_high`).
+    .global __ap_entry
+__ap_entry:
+    msr     daifset, #0xf
+    mov     x19, x0
+    mrs     x20, CurrentEL              // entry EL (diagnostics)
+    ubfx    x20, x20, #2, #2
+    bl      __el2_to_el1
+    ldr     x9, ={sctlr_res1}
+    msr     sctlr_el1, x9
+    mov     x9, #(3 << 20)              // CPACR_EL1.FPEN: no FP/SIMD traps
+    msr     cpacr_el1, x9
+    ldr     x9, [x19, #{ap_cpu}]
+    msr     tpidr_el1, x9               // logical CPU id
+    isb
+    bl      __setup_mair_tcr
+    adrp    x9, __boot_pt_pool          // boot TTBR0 root (identity map)
+    add     x9, x9, :lo12:__boot_pt_pool
+    msr     ttbr0_el1, x9
+    ldr     x9, [x19, #{ap_ttbr1}]
+    msr     ttbr1_el1, x9
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    ldr     x9, ={sctlr_on}
+    msr     sctlr_el1, x9
+    isb
+    ic      iallu
+    dsb     nsh
+    isb
+    ldr     x9, =__ap_high
     br      x9
 
 // Map one 2 MiB block: x0 = L0 table PA, x1 = VA, x2 = PA, x3 = attributes.
@@ -292,6 +343,27 @@ __boot_high:
     bl      {early_main}
     b       __boot_hang
 
+// Secondary CPU, now at the link address on the kernel tables.
+__ap_high:
+    ldr     x19, ={ap_boot}             // the slot, through its link VA
+    ldr     x9, [x19, #{ap_ttbr0}]      // park TTBR0 on the empty table
+    msr     ttbr0_el1, x9
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    ldr     x9, [x19, #{ap_stack}]
+    mov     sp, x9
+    ldr     x9, =__exception_vectors
+    msr     vbar_el1, x9
+    isb
+    mov     x29, #0
+    mov     x30, #0
+    mrs     x0, tpidr_el1
+    mov     x1, x20                     // EL the CPU entered at
+    bl      {ap_rust_entry}
+    b       __boot_hang
+
     .section .bss.boot_pt, "aw", %nobits
     .balign 4096
 __boot_pt_pool:
@@ -307,6 +379,12 @@ __boot_pt_pool:
     phys_offset = const PHYS_OFFSET,
     pt_pages = const BOOT_PT_PAGES,
     early_main = sym early_main,
+    ap_boot = sym super::smp::AP_BOOT,
+    ap_rust_entry = sym super::smp::ap_rust_entry,
+    ap_cpu = const super::smp::AP_OFF_CPU,
+    ap_ttbr1 = const super::smp::AP_OFF_TTBR1,
+    ap_ttbr0 = const super::smp::AP_OFF_TTBR0,
+    ap_stack = const super::smp::AP_OFF_STACK,
 );
 
 static BOOT_INFO: OnceCell<BootInfo> = OnceCell::new();
@@ -419,6 +497,7 @@ pub extern "C" fn early_main(dtb_phys: usize, load_phys: usize) -> ! {
         paging::pool_used(),
         if pan { "on" } else { "unavailable" }
     );
+    smp::early_init(&plat);
 
     // ---- Allocators.
     frame::init(&map);

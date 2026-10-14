@@ -5,10 +5,17 @@
 //! Phase 2 secondary CPUs call [`init_cpu`]. Interrupts are configured as
 //! non-secure Group 1 (GICv3) with priority 0x80, EOImode 0 (EOI both drops
 //! priority and deactivates). [`ack`] / [`eoi`] work on the calling CPU.
-//! SGIs (IPIs) can be added on top: `ICC_SGI1R_EL1` (v3) / `GICD_SGIR` (v2).
+//!
+//! SGIs (IPIs): [`send_sgi`] writes `ICC_SGI1R_EL1` (v3: target by the
+//! affinity of the destination CPU's MPIDR) or `GICD_SGIR` (v2: target by
+//! the CPU-interface mask each CPU read from its banked `GICD_ITARGETSR0`
+//! in [`init_cpu`]). [`init_cpu`] enables [`SGI_RESCHEDULE`] and
+//! [`SGI_STOP`] on every CPU. On GICv2 the IAR value of an SGI carries the
+//! source CPU in bits 12:10 and must be written back unchanged to EOIR, so
+//! [`ack`] returns the raw value for [`eoi`].
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use super::cpu;
 use super::dtb::GicDesc;
@@ -27,6 +34,7 @@ const GICD_IGROUPR: usize = 0x0080;
 const GICD_ISENABLER: usize = 0x0100;
 const GICD_IPRIORITYR: usize = 0x0400;
 const GICD_ITARGETSR: usize = 0x0800;
+const GICD_SGIR: usize = 0x0f00;
 const GICD_IROUTER: usize = 0x6000;
 const GICD_CTLR_RWP: u32 = 1 << 31;
 // GICv3 GICD_CTLR (non-secure view / DS=1 view share these bit positions
@@ -67,6 +75,13 @@ static GIC: OnceCell<Gic> = OnceCell::new();
 static INIT_LOCK: SpinLock<()> = SpinLock::new(());
 /// Per-CPU GICv3 RD_base VA (0 = not yet located).
 static RD_BASE: [AtomicUsize; cpu::MAX_CPUS] = [const { AtomicUsize::new(0) }; cpu::MAX_CPUS];
+/// Per-CPU GICv2 CPU-interface mask (`GICD_ITARGETSR0` as read on that CPU).
+static V2_TARGET: [AtomicU8; cpu::MAX_CPUS] = [const { AtomicU8::new(0) }; cpu::MAX_CPUS];
+
+/// SGI used for `IpiKind::Reschedule`.
+pub const SGI_RESCHEDULE: u32 = 0;
+/// SGI used for `IpiKind::Stop`.
+pub const SGI_STOP: u32 = 1;
 
 /// Record the DTB's GIC description (boot code).
 pub(super) fn set_desc(d: GicDesc) {
@@ -239,9 +254,45 @@ pub fn init_cpu() {
         // SAFETY: barrier only.
         unsafe { asm!("isb", options(nostack, preserves_flags)) };
     } else {
+        // Banked: the byte for INTID 0 reads as this CPU's interface mask.
+        let mask = rd32(g.dist + GICD_ITARGETSR) as u8;
+        V2_TARGET[cpu::id().min(cpu::MAX_CPUS - 1)].store(mask, Ordering::Relaxed);
         wr32(g.cpu + GICC_PMR, 0xff);
         wr32(g.cpu + GICC_BPR, 0);
         wr32(g.cpu + GICC_CTLR, 0b11);
+    }
+    enable(SGI_RESCHEDULE);
+    enable(SGI_STOP);
+}
+
+/// Send SGI `sgi` (0-15) to the CPU with logical id `cpu` and hardware
+/// affinity `mpidr`. Lock-free; safe with IRQs masked. Prior normal-memory
+/// stores are ordered before the interrupt (`dsb ishst`).
+pub fn send_sgi(cpu: usize, mpidr: u64, sgi: u32) {
+    let g = gic();
+    // SAFETY: barrier only.
+    unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
+    if g.version == 3 {
+        // ICC_SGI1R_EL1: Aff3 [55:48], RS [47:44], Aff2 [39:32],
+        // INTID [27:24], Aff1 [23:16], TargetList [15:0] (Aff0 % 16).
+        let aff0 = mpidr & 0xff;
+        let aff1 = (mpidr >> 8) & 0xff;
+        let aff2 = (mpidr >> 16) & 0xff;
+        let aff3 = (mpidr >> 32) & 0xff;
+        let v = (aff3 << 48)
+            | ((aff0 >> 4) << 44)
+            | (aff2 << 32)
+            | (((sgi & 0xf) as u64) << 24)
+            | (aff1 << 16)
+            | (1 << (aff0 & 0xf));
+        sysreg_w!("S3_0_C12_C11_5", v);
+        // SAFETY: barrier only.
+        unsafe { asm!("isb", options(nostack, preserves_flags)) };
+    } else {
+        let mask = V2_TARGET[cpu.min(cpu::MAX_CPUS - 1)].load(Ordering::Relaxed) as u32;
+        // TargetListFilter 0 (use the list), CPUTargetList [23:16],
+        // NSATT 0 (Group 0, which is where `init_cpu` leaves SGIs on v2).
+        wr32(g.dist + GICD_SGIR, (mask << 16) | (sgi & 0xf));
     }
 }
 
@@ -278,30 +329,33 @@ fn my_affinity_router() -> u64 {
     (m & 0xff_ffff) | (m & (0xff << 32))
 }
 
-/// Acknowledge the highest-priority pending interrupt on this CPU; `None`
-/// for a spurious/special INTID (nothing to EOI).
-pub fn ack() -> Option<u32> {
+/// Acknowledge the highest-priority pending interrupt on this CPU:
+/// `(intid, token)`, where `token` is what [`eoi`] needs (the raw IAR value,
+/// which on GICv2 includes the SGI source CPU). `None` for a
+/// spurious/special INTID (nothing to EOI).
+pub fn ack() -> Option<(u32, u32)> {
     let g = gic();
-    let intid = if g.version == 3 {
+    let (intid, raw) = if g.version == 3 {
         let v = sysreg_r!("S3_0_C12_C12_0") as u32 & 0xff_ffff;
         // SAFETY: barrier only; orders the ack before the device accesses.
         unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
-        v
+        (v, v)
     } else {
-        rd32(g.cpu + GICC_IAR) & 0x3ff
+        let v = rd32(g.cpu + GICC_IAR);
+        (v & 0x3ff, v & 0x1fff)
     };
-    (intid < SPECIAL_INTID).then_some(intid)
+    (intid < SPECIAL_INTID).then_some((intid, raw))
 }
 
-/// End of interrupt for an INTID returned by [`ack`] (priority drop +
+/// End of interrupt for the token returned by [`ack`] (priority drop +
 /// deactivate).
-pub fn eoi(intid: u32) {
+pub fn eoi(token: u32) {
     let g = gic();
     if g.version == 3 {
-        sysreg_w!("S3_0_C12_C12_1", intid);
+        sysreg_w!("S3_0_C12_C12_1", token);
         // SAFETY: barrier only.
         unsafe { asm!("isb", options(nostack, preserves_flags)) };
     } else {
-        wr32(g.cpu + GICC_EOIR, intid);
+        wr32(g.cpu + GICC_EOIR, token);
     }
 }

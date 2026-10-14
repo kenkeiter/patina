@@ -6,6 +6,10 @@
 #   scripts/test-hello.sh --threads [arch...]    run testapps/threads instead
 #                                                (120 s timeout, output shown;
 #                                                not a pass/fail test yet)
+#   scripts/test-hello.sh --app <name> [arch...] run testapps/<name>: pass if it
+#                                                prints 'PASS <name>' and exits 0
+#                                                (PATINA_PARAMS: extra kernel
+#                                                params, e.g. patina.strace=1)
 #
 # hello is run twice per arch: without arguments (expect exit 0) and with
 # `3 a b` (expect exit 3). Honors the run-qemu.sh environment
@@ -15,9 +19,14 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 threads=0
+app=
 if [[ ${1:-} == --threads ]]; then
   threads=1
   shift
+elif [[ ${1:-} == --app ]]; then
+  [[ $# -ge 2 ]] || { echo "usage: $0 --app <name> [arch...]" >&2; exit 2; }
+  app=$2
+  shift 2
 fi
 arches=("$@")
 [[ ${#arches[@]} -gt 0 ]] || arches=(aarch64 x86_64)
@@ -66,6 +75,38 @@ if [[ $threads -eq 1 ]]; then
     tail -n 3 <<<"$clean"
   done
   exit 0
+fi
+
+if [[ -n $app ]]; then
+  export PATINA_TIMEOUT=${PATINA_TIMEOUT:-120}
+  failed=0
+  results=()
+  for arch in "${arches[@]}"; do
+    reason=
+    log=$out/$app-$arch.log
+    if ! "$root/scripts/build-kernel.sh" "$arch" >"$out/build-$arch.log" 2>&1; then
+      reason="kernel build failed"
+      tail -n 30 "$out/build-$arch.log" >&2
+    elif ! "$root/scripts/build-testapp.sh" "$app" "$arch" "$out/$app-$arch" >"$out/build-$app-$arch.log" 2>&1 \
+        || ! "$root/scripts/mkinitrd.sh" "$out/$app-$arch.cpio" "$out/$app-$arch" >>"$out/build-$app-$arch.log" 2>&1; then
+      reason="$app build/initrd failed"
+      tail -n 30 "$out/build-$app-$arch.log" >&2
+    else
+      # shellcheck disable=SC2086
+      run_case "$arch" "$out/$app-$arch.cpio" "$log" 0 "PASS $app" '[patina] exit code 0' \
+        ${PATINA_PARAMS:+-- $PATINA_PARAMS --}
+      echo "---- $app $arch (log $log) ----"
+      grep -vE '^\[(strace|run-qemu)\]' "$log" | sed -n '/^\[patina\] loader:/,$p' | tail -n 60
+    fi
+    if [[ -z $reason ]]; then
+      results+=("PASS $app $arch")
+    else
+      results+=("FAIL $app $arch: $reason")
+      failed=1
+    fi
+  done
+  printf '%s\n' "${results[@]}"
+  exit $failed
 fi
 
 export PATINA_TIMEOUT=${PATINA_TIMEOUT:-60}

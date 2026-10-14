@@ -257,6 +257,7 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
         exe_path: EXE_PATH,
         strace,
         epoch_ns,
+        files: SpinLock::new(crate::fs::FdTable::with_console()),
     });
     let t0 = task::create_thread0(frame);
     task::start_thread0(t0)

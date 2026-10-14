@@ -20,13 +20,21 @@
 //! ring-3 entry and exit), SYSCALL/SYSRET and exception/IRQ entry sharing one
 //! `ctx::TrapFrame` layout (`entry.rs`, `exceptions.rs`), the LAPIC timer
 //! with PIT calibration (`lapic.rs`, `timer.rs`), user PML4s (`uspace.rs`).
+//!
+//! SMP (Phase 2, `smp.rs`): CPUs enumerated from the ACPI MADT / MP table /
+//! fw_cfg (`acpi.rs`, `fwcfg.rs`), APs started by INIT-SIPI-SIPI through a
+//! real-mode trampoline at 0x8000, Reschedule/Stop IPIs on vectors
+//! 0xf0/0xf1, and a per-CPU one-shot LAPIC timer carrying both the tick
+//! grid and `timer::set_deadline`.
 
+mod acpi;
 pub mod boot;
 pub mod console;
 pub mod cpu;
 pub mod ctx;
 mod entry;
 mod exceptions;
+mod fwcfg;
 mod gdt;
 pub mod irq;
 mod lapic;
@@ -36,6 +44,7 @@ mod pic;
 pub mod port;
 pub mod power;
 pub mod sigframe;
+pub mod smp;
 mod start_info;
 pub mod timer;
 pub mod uspace;

@@ -2,13 +2,16 @@
 //!
 //! Gates (all 64-bit interrupt gates, selector 0x08, so IF is clear on
 //! entry): vectors 0-31 (#BP with DPL 3 so `int3` works from ring 3, #DF on
-//! IST1), the LAPIC timer ([`TIMER_VECTOR`]) and spurious
+//! IST1), the LAPIC timer ([`TIMER_VECTOR`]), the two IPI vectors and spurious
 //! ([`SPURIOUS_VECTOR`]) vectors. Every other vector stays not-present
 //! (a stray one raises #NP / #GP, which is dumped or reported).
 //!
 //! Entry asm and the frame layout are in `entry.rs`; [`handle_trap`] gets
 //! every exception and IRQ:
-//! * timer: EOI, then `trap::timer_tick`;
+//! * timer: EOI, re-arm the one-shot (`timer::on_interrupt`), then
+//!   `trap::timer_tick` when a tick or deadline was due;
+//! * IPIs ([`IPI_RESCHEDULE_VECTOR`], [`IPI_STOP_VECTOR`]): EOI, then
+//!   `trap::ipi`;
 //! * spurious: nothing (no EOI);
 //! * any exception from ring 0, and NMI / #DF / #MC from anywhere: fatal
 //!   register dump through `console::panic_write_fmt`, then `panic!`;
@@ -21,11 +24,14 @@ use core::cell::UnsafeCell;
 use core::mem::size_of;
 
 use super::ctx::TrapFrame;
-use super::entry::{__isr_spurious, __isr_table, __isr_timer, SPURIOUS_VECTOR, TIMER_VECTOR};
+use super::entry::{
+    __isr_ipi, __isr_spurious, __isr_table, __isr_timer, IPI_RESCHEDULE_VECTOR, IPI_STOP_VECTOR,
+    SPURIOUS_VECTOR, TIMER_VECTOR,
+};
 use super::gdt::{IST_DOUBLE_FAULT, KERNEL_CS};
-use super::{cpu, irq, lapic};
+use super::{cpu, irq, lapic, timer};
 use crate::console::panic_write_fmt;
-use crate::trap::{self, Access, Exception, FaultKind};
+use crate::trap::{self, Access, Exception, FaultKind, IpiKind};
 
 /// Vectors for which the CPU pushes an error code.
 const fn has_error_code(v: usize) -> bool {
@@ -84,7 +90,7 @@ struct DescriptorPtr {
     base: u64,
 }
 
-/// Fill and load the IDT on this CPU.
+/// Fill and load the IDT on the boot CPU (secondary CPUs only [`load`] it).
 pub(super) fn init() {
     // SAFETY: single-threaded boot; the stubs are valid handlers.
     unsafe {
@@ -97,6 +103,9 @@ pub(super) fn init() {
         }
         idt[TIMER_VECTOR as usize] = Gate::interrupt(__isr_timer, 0, 0);
         idt[SPURIOUS_VECTOR as usize] = Gate::interrupt(__isr_spurious, 0, 0);
+        let ipi = &*core::ptr::addr_of!(__isr_ipi);
+        idt[IPI_RESCHEDULE_VECTOR as usize] = Gate::interrupt(ipi[0], 0, 0);
+        idt[IPI_STOP_VECTOR as usize] = Gate::interrupt(ipi[1], 0, 0);
         load();
     }
 }
@@ -160,9 +169,26 @@ pub(super) extern "C" fn handle_trap(tf: &mut TrapFrame) {
         if from_user {
             tf.fs_base = cpu::read_fs_base();
         }
-        // EOI first: the hook may switch threads before this one returns.
+        // EOI and re-arm first: the hook may switch threads before this
+        // one returns.
         lapic::eoi();
-        trap::timer_tick(tf, from_user);
+        if timer::on_interrupt() {
+            trap::timer_tick(tf, from_user);
+        }
+        return;
+    }
+    if v == IPI_RESCHEDULE_VECTOR as u64 || v == IPI_STOP_VECTOR as u64 {
+        if tf.from_user() {
+            tf.fs_base = cpu::read_fs_base();
+        }
+        // EOI first: `Stop` never returns, `Reschedule` may switch.
+        lapic::eoi();
+        let kind = if v == IPI_STOP_VECTOR as u64 {
+            IpiKind::Stop
+        } else {
+            IpiKind::Reschedule
+        };
+        trap::ipi(tf, kind);
         return;
     }
     if v == SPURIOUS_VECTOR as u64 {

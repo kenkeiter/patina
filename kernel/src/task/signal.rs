@@ -164,6 +164,36 @@ impl PendingQueue {
     }
 }
 
+/// `Thread::saved_mask` value meaning "none" (a real mask never contains
+/// SIGKILL).
+pub const NO_SAVED_MASK: SigSet = u64::MAX;
+
+/// Install a temporary mask `m` for the current thread, remembering the
+/// current one as the saved mask (kept if one is already saved), as
+/// Linux's `set_user_sigmask`.
+pub fn set_temp_mask(m: SigSet) {
+    let t = current();
+    if t.saved_mask.load(Ordering::Relaxed) == NO_SAVED_MASK {
+        t.saved_mask.store(t.blocked(), Ordering::Relaxed);
+    }
+    t.blocked.store(m & !UNBLOCKABLE, Ordering::SeqCst);
+}
+
+/// Take the saved mask, if any.
+fn take_saved_mask(t: &Thread) -> Option<SigSet> {
+    let m = t.saved_mask.swap(NO_SAVED_MASK, Ordering::Relaxed);
+    (m != NO_SAVED_MASK).then_some(m)
+}
+
+/// Restore the saved mask now (the temporary mask's syscall completed
+/// without being interrupted; Linux `restore_saved_sigmask`).
+pub fn restore_saved_mask() {
+    let t = current();
+    if let Some(m) = take_saved_mask(t) {
+        t.blocked.store(m & !UNBLOCKABLE, Ordering::SeqCst);
+    }
+}
+
 /// Process-wide pending set.
 static SHARED: SpinLock<PendingQueue> = SpinLock::new(PendingQueue::new());
 /// Bits of [`SHARED`].
@@ -466,6 +496,7 @@ pub fn deliver(frame: &mut TrapFrame) {
     let restart = t.restart.load(Ordering::Relaxed);
     // Fast path: nothing pending that is not blocked, no restart.
     if restart == 0
+        && t.saved_mask.load(Ordering::Relaxed) == NO_SAVED_MASK
         && (t.sig_pending.load(Ordering::Relaxed) | SHARED_BITS.load(Ordering::Relaxed))
             & !t.blocked.load(Ordering::Relaxed)
             == 0
@@ -496,10 +527,8 @@ pub fn deliver(frame: &mut TrapFrame) {
             restart_for_handler(frame, restart, &act);
             restart = 0;
         }
-        let (saved, alt) = {
-            let mut st = t.sig.lock();
-            (st.saved_mask.take(), st.altstack)
-        };
+        let saved = take_saved_mask(t);
+        let alt = t.sig.lock().altstack;
         let old_mask = saved.unwrap_or(t.blocked());
         let d = SigDelivery {
             signo: sig,
@@ -535,8 +564,8 @@ pub fn deliver(frame: &mut TrapFrame) {
                         act.sa_handler
                     );
                 }
-                if saved.is_some() {
-                    t.sig.lock().saved_mask = saved;
+                if let Some(m) = saved {
+                    t.saved_mask.store(m, Ordering::Relaxed);
                 }
                 force_sigsegv(sig);
             }
@@ -548,7 +577,7 @@ pub fn deliver(frame: &mut TrapFrame) {
             (restart == ERESTART_RESTARTBLOCK).then_some(patina_abi::current::nr::RESTART_SYSCALL);
         sigframe::rewind_syscall(frame, nr);
     }
-    if let Some(m) = t.sig.lock().saved_mask.take() {
+    if let Some(m) = take_saved_mask(t) {
         t.blocked.store(m & !UNBLOCKABLE, Ordering::SeqCst);
     }
 }
@@ -576,14 +605,7 @@ pub fn sigreturn(frame: &mut TrapFrame) {
 /// the old mask comes back with `rt_sigreturn` (or right away if no
 /// handler runs and the call restarts).
 pub fn sigsuspend(mask: SigSet) -> Errno {
-    let t = current();
-    {
-        let mut st = t.sig.lock();
-        if st.saved_mask.is_none() {
-            st.saved_mask = Some(t.blocked());
-        }
-    }
-    t.blocked.store(mask & !UNBLOCKABLE, Ordering::SeqCst);
+    set_temp_mask(mask);
     while super::wait::sleep_until_interruptible(u64::MAX) != super::WakeReason::Interrupted {}
     Errno(ERESTARTNOHAND)
 }

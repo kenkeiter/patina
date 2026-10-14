@@ -41,6 +41,10 @@ name = "patina-ctlproto"
 version = "0.1.0"
 
 [[package]]
+name = "patina-fsutil"
+version = "0.1.0"
+
+[[package]]
 name = "patina-kernel"
 version = "0.1.0"
 dependencies = [
@@ -50,6 +54,7 @@ dependencies = [
  "patina-abi",
  "patina-cmdline",
  "patina-cpio",
+ "patina-fsutil",
  "patina-loader",
 ]
 
@@ -58,6 +63,14 @@ name = "patina-loader"
 version = "0.1.0"
 dependencies = [
  "patina-abi",
+]
+
+[[package]]
+name = "patina-vfs"
+version = "0.1.0"
+dependencies = [
+ "patina-abi",
+ "patina-cpio",
 ]
 
 [[package]]

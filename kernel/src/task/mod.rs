@@ -59,6 +59,8 @@ pub struct Process {
     pub strace: bool,
     /// `patina.epoch`: wall-clock time at boot (`CLOCK_REALTIME` offset).
     pub epoch_ns: u64,
+    /// File descriptors, shared by all threads (design §8).
+    pub files: SpinLock<crate::fs::FdTable>,
 }
 
 static PROCESS: OnceCell<Process> = OnceCell::new();
@@ -95,9 +97,6 @@ pub struct SigState {
     /// `sigaltstack` as Linux stores it: `ss_flags` is the raw value the
     /// program passed (`SS_DISABLE` with sp = size = 0 when disabled).
     pub altstack: StackT,
-    /// `rt_sigsuspend`: the mask to restore (and to save in the signal
-    /// frame) once the suspend ends (Linux `saved_sigmask`).
-    pub saved_mask: Option<SigSet>,
 }
 
 /// User state a thread starts from (before its first entry to user mode).
@@ -205,6 +204,11 @@ pub struct Thread {
     /// Bits of `sigq` (updated under its lock, read lock-free by the
     /// return-to-user fast path).
     pub sig_pending: AtomicU64,
+    /// Linux `saved_sigmask`: the mask to restore (and to save in the
+    /// signal frame) after `rt_sigsuspend` / `epoll_pwait` / `ppoll` with
+    /// a temporary mask; `signal::NO_SAVED_MASK` when none. Only the
+    /// thread itself touches it.
+    pub saved_mask: AtomicU64,
     /// Internal `ERESTART*` code of the syscall this thread is returning
     /// from (set by `syscall::dispatch`, consumed by signal delivery); 0
     /// when none.
@@ -253,6 +257,7 @@ impl Thread {
             blocked: AtomicU64::new(blocked),
             sigq: SpinLock::new(signal::PendingQueue::new()),
             sig_pending: AtomicU64::new(0),
+            saved_mask: AtomicU64::new(signal::NO_SAVED_MASK),
             restart: AtomicI32::new(0),
             restart_block: SpinLock::new(None),
             switch: UnsafeCell::new(SwitchState {
@@ -433,7 +438,6 @@ fn default_sig() -> SigState {
             ss_flags: SS_DISABLE,
             ..StackT::default()
         },
-        saved_mask: None,
     }
 }
 
