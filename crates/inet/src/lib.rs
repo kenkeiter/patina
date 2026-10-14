@@ -12,6 +12,9 @@
 //!
 //! * [`netlink`]: `NETLINK_ROUTE` request parsing and the link/address
 //!   dump replies (`net.Interfaces`).
+//! * [`vsock`]: AF_VSOCK stream sockets — the virtio-vsock header codec,
+//!   connection state machine, credit accounting and port table (D76;
+//!   `kernel/src/net/vsock.rs` wires it to the virtio-vsock driver).
 //!
 //! The kernel (`kernel/src/net/`) wires these to smoltcp.
 
@@ -21,12 +24,16 @@ extern crate alloc;
 
 pub mod netlink;
 pub mod unix;
+pub mod vsock;
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, Ipv6Addr};
 
-use patina_abi::net::{AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, AF_UNSPEC, SockaddrIn, SockaddrIn6};
+use patina_abi::net::{
+    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, AF_UNSPEC, AF_VSOCK, SockaddrIn, SockaddrIn6,
+    SockaddrVm,
+};
 use patina_abi::netlink::SockaddrNl;
 
 // ---------------------------------------------------------------------------
@@ -58,6 +65,12 @@ pub enum SockAddr {
     Netlink {
         pid: u32,
         groups: u32,
+    },
+    /// `AF_VSOCK` (`sockaddr_vm`): context id, port and `svm_flags`.
+    Vsock {
+        cid: u32,
+        port: u32,
+        flags: u8,
     },
 }
 
@@ -130,6 +143,19 @@ impl SockAddr {
                     groups: w(8),
                 })
             }
+            AF_VSOCK => {
+                // Linux `vsock_addr_cast`: the full 16 bytes, `svm_zero[0]`
+                // clear (callers turn every failure into EINVAL).
+                if bytes.len() < size_of::<SockaddrVm>() || bytes[13] != 0 {
+                    return Err(AddrError::Invalid);
+                }
+                let w = |i: usize| u32::from_ne_bytes(bytes[i..i + 4].try_into().unwrap());
+                Ok(SockAddr::Vsock {
+                    port: w(4),
+                    cid: w(8),
+                    flags: bytes[12],
+                })
+            }
             f => Err(AddrError::Family(f)),
         }
     }
@@ -183,6 +209,15 @@ impl SockAddr {
                 out[8..12].copy_from_slice(&groups.to_ne_bytes());
                 size_of::<SockaddrNl>()
             }
+            SockAddr::Vsock { cid, port, flags } => {
+                out[..2].copy_from_slice(&AF_VSOCK.to_ne_bytes());
+                out[2..4].fill(0);
+                out[4..8].copy_from_slice(&port.to_ne_bytes());
+                out[8..12].copy_from_slice(&cid.to_ne_bytes());
+                out[12] = *flags;
+                out[13..16].fill(0);
+                size_of::<SockaddrVm>()
+            }
         }
     }
 
@@ -193,6 +228,7 @@ impl SockAddr {
             SockAddr::Unix(_) => AF_UNIX,
             SockAddr::Unspec => AF_UNSPEC,
             SockAddr::Netlink { .. } => AF_NETLINK,
+            SockAddr::Vsock { .. } => AF_VSOCK,
         }
     }
 
@@ -545,6 +581,22 @@ mod tests {
             SockAddr::Unix(b"/sok".to_vec())
         );
         assert_eq!(SockAddr::Unix(b"/sok".to_vec()).encode(&mut buf), 7);
+
+        let vm = SockAddr::Vsock {
+            cid: 3,
+            port: 5000,
+            flags: 0,
+        };
+        let n = vm.encode(&mut buf);
+        assert_eq!(n, 16);
+        assert_eq!(&buf[..2], &AF_VSOCK.to_ne_bytes());
+        assert_eq!(&buf[4..12], &[0x88, 0x13, 0, 0, 3, 0, 0, 0]);
+        assert_eq!(SockAddr::parse(&buf[..n]).unwrap(), vm);
+        assert_eq!(vm.family(), AF_VSOCK);
+        // Short, or svm_zero[0] set: EINVAL (Linux `vsock_addr_cast`).
+        assert_eq!(SockAddr::parse(&buf[..15]), Err(AddrError::Invalid));
+        buf[13] = 1;
+        assert_eq!(SockAddr::parse(&buf[..16]), Err(AddrError::Invalid));
     }
 
     #[test]

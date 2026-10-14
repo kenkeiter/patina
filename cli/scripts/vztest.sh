@@ -10,6 +10,8 @@
 # (cli/vz_integration_test.go: hello exit codes, ctl stop/ping, --net user
 # + HTTP from the host at the guest's DHCP address). They build their own
 # signed CLI; the kernel must be built (scripts/build-kernel.sh aarch64).
+# Then it runs the in-process AF_VSOCK test (TestVZVsock, decision D76:
+# testapps/vsockapp, the host dialing the guest's listener on port 5000).
 #
 #   cli/scripts/vztest.sh --e2e [go test flags...]     (default: -v)
 #
@@ -21,7 +23,10 @@ if [[ ${1:-} == --e2e ]]; then
   shift
   cd "$cli"
   [[ $# -gt 0 ]] || set -- -v
-  PATINA_VZ_E2E=1 exec go test -count=1 -timeout 20m -run 'TestVZ(BootHello|E2E)' "$@" .
+  PATINA_VZ_E2E=1 go test -count=1 -timeout 20m -run 'TestVZ(BootHello|E2E)' "$@" .
+  # AF_VSOCK end to end (D76): in-process (the host side dials the guest's
+  # listener through the framework), so it runs from a signed vmm.test.
+  exec "$0" -test.run 'TestVZVsock$' -test.v -test.timeout 5m
 fi
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/patina-vztest.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT

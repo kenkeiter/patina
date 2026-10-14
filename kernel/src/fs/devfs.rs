@@ -116,6 +116,7 @@ const NODES: &[(&[u8], u64, u32)] = &[
     (b"urandom", URANDOM, 0o666),
     (b"tty", TTY, 0o666),
     (b"console", CONSOLE, 0o600),
+    (b"vsock", crate::net::vsock::DEV_VSOCK, 0o666),
 ];
 
 const LINKS: &[(&[u8], &[u8])] = &[
@@ -134,6 +135,10 @@ pub fn register() {
     vfs::register_chrdev(URANDOM, Arc::new(Mem::Random));
     vfs::register_chrdev(TTY, Arc::new(NoTty));
     vfs::register_chrdev(CONSOLE, Arc::new(ConsoleDev));
+    vfs::register_chrdev(
+        crate::net::vsock::DEV_VSOCK,
+        Arc::new(crate::net::vsock::VsockDev),
+    );
 }
 
 /// Create the `/dev` nodes the initrd did not supply (called with the

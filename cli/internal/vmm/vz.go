@@ -126,6 +126,20 @@ func (m *vzMachine) Control() ctl.Endpoint {
 	}}
 }
 
+// VsockDialer is implemented by machines whose host side can open a vsock
+// stream to any guest port (VZ: VZVirtioSocketDevice connectToPort:). The
+// guest's AF_VSOCK listeners (D76) are reached this way; port 4242 is the
+// kernel's control channel (use Control for it).
+type VsockDialer interface {
+	DialVsock(port uint32, timeout time.Duration) (net.Conn, error)
+}
+
+// DialVsock implements VsockDialer. The returned conn's CloseWrite (when
+// the framework's descriptor is a socket) half-closes the stream.
+func (m *vzMachine) DialVsock(port uint32, timeout time.Duration) (net.Conn, error) {
+	return m.dialFn(port, timeout)
+}
+
 func (m *vzMachine) PID() int             { return 0 }
 func (m *vzMachine) Wait() (*Exit, error) { return m.wait() }
 func (m *vzMachine) Kill() error          { return m.kill() }

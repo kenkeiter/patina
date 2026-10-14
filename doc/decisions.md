@@ -2347,6 +2347,103 @@ from a signal handler); the vvar refault after `madvise(DONTNEED)` and
 through vDSO frames under heavy profiling (the `pproftest` case of
 `test-runtime.sh` passes, but it does not target vDSO PCs).
 
+## D76: AF_VSOCK stream sockets for the program; the vsock driver multiplexes by port
+*2026-10-14 · Phase 5 (design §7 "Optional — AF_VSOCK")*
+
+The protocol is `patina_inet::vsock::Core` (`crates/inet/src/vsock/`,
+host-tested, 28 tests): Linux `af_vsock.c` + `virtio_transport_common.c`
+for streams — bound and connected tables, `REQUEST`/`RESPONSE`/`RST`/
+`SHUTDOWN`/`RW`/`CREDIT_*`, per-connection credit (256 KiB `buf_alloc`,
+`CREDIT_UPDATE` once less than 64 KiB of advertised space is left or the
+buffer runs dry, one `CREDIT_REQUEST` per stall), ephemeral ports (Linux:
+a random start above 1023, 24 tries), the 2 s connect timeout, 8 s
+orphaned-close timeout, `vsock_poll` readiness, `SO_VM_SOCKETS_*`, and the
+loopback transport (`VMADDR_CID_LOCAL` or the guest's own CID never reach
+the device). Deviations from Linux are listed in its module docs (a packet
+for a bound socket that is neither listening nor connecting gets `RST`; a
+stalled sender sends one `CREDIT_REQUEST`).
+
+Kernel side (`kernel/src/net/vsock.rs`): one `Core` behind one IRQ-safe
+lock, created at boot when the virtio-vsock device exists (guest CID from
+config space, device payload 4052 B = one 4 KiB tx slot minus the header,
+port 4242 reserved: `bind` gives `EADDRINUSE`, autobind skips it). Every
+socket call runs on the core and then pumps: loopback packets go straight
+back in, device packets go to the tx ring in order (a FIFO keeps the ones
+that found no free slot; tx completions now interrupt and wake the
+receiver), and the `PollList`s of every socket the core marks dirty are
+fired after the lock is dropped. A kernel thread, `vsockd`, woken by the
+device interrupt, takes received packets, feeds them in, runs the core's
+timers (sleeping until its next deadline, at most 1 s) and retries queued
+transmits. The core is seeded for ephemeral ports at the first `socket()`
+— at `net::init` the RNG is not seeded yet (the loader seeds it), and the
+first version picked the same port on every boot (the TCP port table in
+`net/stack.rs` has the same ordering; not changed here). `VsockSocket` is
+an `fs::File` + `SocketOps` (D68): `bind`/`listen`/`accept4`/`connect`
+(non-blocking `EINPROGRESS`, then `EPOLLOUT` and `SO_ERROR`)/`send*`/
+`recv*` (`MSG_PEEK`; `MSG_OOB` → `EOPNOTSUPP`)/`shutdown`/`getsockname`/
+`getpeername`, `FIONREAD`, `SO_ERROR`/`SO_TYPE`/`SO_DOMAIN`/
+`SO_PROTOCOL`/`SO_ACCEPTCONN`/timeouts, `AF_VSOCK`-level buffer sizes
+(u64) and connect timeout (timeval, `ERANGE` when out of range). A `RST`
+answering a `REQUEST` is `ECONNRESET` (Linux
+`virtio_transport_recv_connecting`), as is a transport reset; a `RST` on
+an established connection is EOF on read and `EPIPE` on write. `socket()`
+without the device is `EAFNOSUPPORT` (no vsock module); with it, a
+protocol other than 0/`PF_VSOCK` is `EPROTONOSUPPORT`, `SOCK_DGRAM`
+`ENODEV` (Linux: `vsock_create` → `vsock_assign_transport` finds no
+datagram transport — virtio has none), `SOCK_SEQPACKET` `ESOCKTNOSUPPORT`
+(`VIRTIO_VSOCK_F_SEQPACKET` is not negotiated; Linux creates the socket
+and fails at connect/listen), other types `ESOCKTNOSUPPORT`. `/dev/vsock`
+(10:121, always in devfs; `ENODEV` on open without the device) answers
+`IOCTL_VM_SOCKETS_GET_LOCAL_CID` (other ioctls `ENOTTY`), which is how
+`mdlayher/vsock` reads the local CID. `sockaddr_vm` decoding lives in
+`patina_inet::SockAddr::Vsock` (short or `svm_zero[0]` set → `EINVAL`).
+
+The driver (`drivers/virtio/vsock.rs`, amending D62) now multiplexes:
+packets whose destination port is the control channel's (4242) are handled
+by its existing one-connection logic, everything else goes to the socket
+layer, which answers packets nobody takes with `RST`. Receiving moved from
+the control thread to `vsockd` (`vsock::poll`); control bytes are
+buffered (64 KiB, its advertised credit) and the control thread drains them
+through the unchanged `vsock::service`/`EVENT` interface, so `ctl.rs` did
+not change. 32 rx buffers and 16 tx slots (from 16 / 8). The driver's
+private header codec was replaced by the core's. `vsockd` logs (once per
+change) packets whose header `len` exceeds the rx buffer and `RW` packets
+dropped because the peer exceeded our credit; neither was seen on VZ.
+
+Verified on Apple VZ (macOS 26): `TestVZVsock` (cli/internal/vmm, run by
+`cli/scripts/vztest.sh -test.run TestVZVsock`, by `vztest.sh --e2e` and as
+the `vsock` case of `scripts/test-vz.sh`) boots the real kernel with
+`testapps/vsockapp` at 1, 2 and 4 vCPUs: the local CID from the ioctl (3)
+equals the device's and the listener's `getsockname`; port 4242 still
+answers `ping` while the program's sockets run; a host
+`connectToPort:` to an unlistened guest port fails in < 20 ms; three
+concurrent host connections echo 1 MiB each way (uneven write sizes, a
+half-close at the end; ~10 ms per MiB unstalled), one with the host reader
+stalled 300 ms so the guest's echo runs out of credit and resumes; the
+guest's own checks pass (loopback echo through `VMADDR_CID_LOCAL` and its
+own CID, guest→host connect to an unlistened host port → `ECONNRESET`
+blocking and via non-blocking connect + `EPOLLOUT` + `SO_ERROR`,
+`socket()` errors, `bind 4242` → `EADDRINUSE`). The CLI side is
+`vmm.VsockDialer` (`DialVsock(port)`, the existing VZ dial path) plus
+`CloseWrite` on the VZ connection. Two VZ behaviours found while
+measuring: (1) VZ's device stops taking the guest's tx queue while one
+connection's host reader does not read (its advertised 256 KiB credit is
+more than it buffers), which stalls the other connections behind it (head-of-line blocking; the stalled-reader
+case shows the other two echoes finishing only when it resumes); nothing
+the guest can do short of not using the credit it is given, so it is
+documented, not worked around. (2) Bytes the guest has queued, or the VMM
+has not yet handed to the host, are lost if the program exits right after
+`close`: the kernel powers the VM off at once (~1 in 45 runs lost 1.5–186
+KiB before vsockapp waited for a final host connection, `-quit`); the
+`exit` flush covers only the control channel. Without a device (QEMU on
+macOS) `vsockapp -novsock` checks `EAFNOSUPPORT` and the failing
+`/dev/vsock`. Not done: `SOCK_SEQPACKET`, `SOCK_DGRAM`, `SO_LINGER`
+semantics (accepted, ignored), `SIOCOUTQ`, guest→host connections to a
+host *listener* (the CLI has no `VZVirtioSocketListener`; the guest side
+of the handshake is the same code the loopback and refused paths run),
+Firecracker/Cloud Hypervisor (vsock over their Unix socket: unverified,
+as in D62).
+
 ## D79: Benchmarks and the Go version matrix
 *2026-10-14 · Phase 5*
 
