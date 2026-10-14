@@ -110,7 +110,8 @@ bitflags! {
         const PEEK = 0x2;
         const DONTROUTE = 0x4;
         const CTRUNC = 0x8;
-        const PROXY = 0x10;
+        /// `MSG_PROBE` (formerly `MSG_PROXY`).
+        const PROBE = 0x10;
         const TRUNC = 0x20;
         const DONTWAIT = 0x40;
         const EOR = 0x80;
@@ -138,8 +139,9 @@ pub const SCM_CREDENTIALS: i32 = 2;
 /// Max `listen` backlog the kernel clamps to (`/proc/sys/net/core/somaxconn`).
 pub const SOMAXCONN: i32 = 4096;
 
-/// `struct sockaddr_in` (16 bytes).
-#[repr(C)]
+/// `struct sockaddr_in` (16 bytes, 4-byte aligned: `sin_addr` is a `__be32`
+/// in C).
+#[repr(C, align(4))]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
 )]
@@ -304,8 +306,8 @@ pub struct Ucred {
     pub gid: u32,
 }
 
-/// `struct ip_mreq`.
-#[repr(C)]
+/// `struct ip_mreq` (two `struct in_addr`, i.e. `__be32`: 4-byte aligned).
+#[repr(C, align(4))]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
 )]

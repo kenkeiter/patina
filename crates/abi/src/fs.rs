@@ -221,6 +221,10 @@ pub const STATX_BASIC_STATS: u32 = 0x07ff;
 pub const STATX_BTIME: u32 = 0x0800;
 pub const STATX_MNT_ID: u32 = 0x1000;
 pub const STATX_DIOALIGN: u32 = 0x2000;
+pub const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+pub const STATX_SUBVOL: u32 = 0x8000;
+pub const STATX_WRITE_ATOMIC: u32 = 0x1_0000;
+pub const STATX_DIO_READ_ALIGN: u32 = 0x2_0000;
 
 /// `struct statx_timestamp`.
 #[repr(C)]
@@ -260,8 +264,14 @@ pub struct Statx {
     pub stx_mnt_id: u64,
     pub stx_dio_mem_align: u32,
     pub stx_dio_offset_align: u32,
-    /// Newer fields (subvol, atomic write limits, ...) and spare space.
-    pub _spare: [u64; 12],
+    pub stx_subvol: u64,
+    pub stx_atomic_write_unit_min: u32,
+    pub stx_atomic_write_unit_max: u32,
+    pub stx_atomic_write_segments_max: u32,
+    pub stx_dio_read_offset_align: u32,
+    pub stx_atomic_write_unit_max_opt: u32,
+    pub _spare2: u32,
+    pub _spare3: [u64; 8],
 }
 
 impl Default for Statx {

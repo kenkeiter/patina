@@ -23,9 +23,11 @@
 //! Both targets are little-endian; helpers that pack sub-fields into byte
 //! arrays assume that.
 //!
-//! Layout values in the tests come from the Linux UAPI headers, cross-checked
-//! against `golang.org/x/sys/unix` `ztypes_linux_{amd64,arm64}.go` (generated
-//! from those headers by `cgo -godefs`) and Go's `runtime/defs_linux_*.go`.
+//! `layout_check` (tests) compares every struct layout and constant here,
+//! for both arches, against values compiled from the Linux UAPI headers
+//! (plus transcribed kernel-internal definitions); see
+//! `gen/linux-headers/README.md`. Syscall tables and errno are generated
+//! from `golang.org/x/sys/unix` by `gen/gen.go` and checked the same way.
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -74,3 +76,6 @@ pub fn syscall_name(table: &'static [(usize, &'static str)], nr: usize) -> Optio
 
 #[cfg(test)]
 mod layout_check;
+#[cfg(test)]
+#[rustfmt::skip]
+mod linux_expected;
