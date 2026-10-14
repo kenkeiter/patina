@@ -19,6 +19,7 @@ patina-cmdline = { path = "../crates/cmdline" }
 patina-cpio = { path = "../crates/cpio" }
 patina-fsutil = { path = "../crates/fsutil" }
 patina-loader = { path = "../crates/loader" }
+patina-vfs = { path = "../crates/vfs" }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 fdt = "0.1.5"

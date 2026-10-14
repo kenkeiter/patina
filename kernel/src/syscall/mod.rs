@@ -6,13 +6,15 @@
 //! `-errno`. Unknown numbers return `ENOSYS` and are logged once per number.
 //! `patina.strace` prints every call with its six raw arguments.
 //!
-//! Handlers are grouped by area: [`fs`] (fds, paths), [`poll`] (epoll,
-//! ppoll), [`mm`] (memory),
-//! [`signal`], [`proc`] (ids, limits, exit_group, randomness), [`thread`]
-//! (clone, exit, futex, sched_yield), [`time`] (clocks, sleeps).
+//! Handlers are grouped by area: [`fs`] (fds), [`path`] (paths, cwd,
+//! metadata), [`poll`] (epoll, ppoll), [`mm`] (memory),
+//! [`signal`], [`proc`] (ids, limits, exit_group, randomness, Tier-3
+//! stubs), [`thread`] (clone, exit, futex, sched_yield), [`time`] (clocks,
+//! sleeps).
 
 mod fs;
 mod mm;
+mod path;
 mod poll;
 mod proc;
 mod signal;
@@ -22,7 +24,9 @@ mod time;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use patina_abi::current::{self, nr};
-use patina_abi::errno::{ENOSYS, Errno};
+use patina_abi::errno::{ECHILD, ENOSYS, EOPNOTSUPP, EPERM, Errno};
+#[cfg(target_arch = "x86_64")]
+use patina_abi::fs::AT_FDCWD;
 
 use crate::arch::ctx::TrapFrame;
 use crate::mm::vm::AddressSpace;
@@ -124,6 +128,38 @@ fn trace(n: usize, a: &[u64; 6], ret: Option<isize>) {
     }
 }
 
+/// Index of the path argument of a path syscall (for strace).
+fn path_arg(n: usize) -> Option<usize> {
+    match n {
+        nr::OPENAT | nr::MKDIRAT | nr::MKNODAT | nr::UNLINKAT | nr::READLINKAT
+        | nr::NEWFSTATAT | nr::STATX | nr::FACCESSAT | nr::FACCESSAT2 | nr::FCHMODAT
+        | nr::FCHOWNAT | nr::UTIMENSAT | nr::RENAMEAT | nr::RENAMEAT2 | nr::LINKAT => Some(1),
+        nr::SYMLINKAT => Some(2),
+        nr::CHDIR | nr::TRUNCATE | nr::STATFS => Some(0),
+        #[cfg(target_arch = "x86_64")]
+        nr::OPEN | nr::STAT | nr::LSTAT | nr::ACCESS | nr::READLINK | nr::MKDIR | nr::RMDIR
+        | nr::UNLINK | nr::RENAME | nr::CREAT | nr::CHMOD | nr::UTIMES => Some(0),
+        _ => None,
+    }
+}
+
+/// strace: show the path argument of a path syscall before the call.
+fn trace_path(n: usize, a: &[u64; 6]) {
+    if let Some(i) = path_arg(n) {
+        if a[i] == 0 {
+            return;
+        }
+        if let Ok(p) = with_space(|s| s.read_cstr(a[i] as usize, 4095)) {
+            crate::kprintln!(
+                "[strace] {} {} path {:?}",
+                TraceTid(task::current().tid),
+                current::syscall_name(n).unwrap_or("?"),
+                core::str::from_utf8(&p).unwrap_or("<non-utf8>")
+            );
+        }
+    }
+}
+
 /// Handle the syscall in `frame` (called from `trap::syscall`).
 pub fn dispatch(frame: &mut TrapFrame) {
     let n = frame.syscall_nr();
@@ -149,6 +185,9 @@ pub fn dispatch(frame: &mut TrapFrame) {
         return;
     }
 
+    if strace {
+        trace_path(n, &a);
+    }
     let r = call(n, &a, frame);
     let ret = match r {
         Ok(v) => v,
@@ -174,7 +213,6 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         // fs.rs
         nr::READ => fs::read(i(0), u(1), u(2)),
         nr::WRITE => fs::write(i(0), u(1), u(2)),
-        nr::OPENAT => fs::openat(i(0), u(1), a[2] as u32),
         nr::CLOSE => fs::close(i(0)),
         nr::FCNTL => fs::fcntl(i(0), i(1), a[2]),
         nr::IOCTL => fs::ioctl(i(0), a[1] as u32, a[2]),
@@ -187,20 +225,104 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::DUP3 => fs::dup3(i(0), i(1), a[2] as u32),
         nr::PIPE2 => fs::pipe2(u(0), a[1] as u32),
         nr::EVENTFD2 => fs::eventfd2(a[0] as u32, a[1] as u32),
+        nr::FSTAT => fs::fstat(i(0), u(1)),
+        nr::GETDENTS64 => fs::getdents64(i(0), u(1), u(2)),
+        nr::FTRUNCATE => fs::ftruncate(i(0), a[1] as i64),
+        nr::FALLOCATE => fs::fallocate(i(0), i(1), a[2] as i64, a[3] as i64),
+        nr::FLOCK => fs::flock(i(0), i(1)),
+        nr::FADVISE64 => fs::fadvise64(i(0), i(3)),
+        nr::CLOSE_RANGE => fs::close_range(a[0] as u32, a[1] as u32, a[2] as u32),
+        nr::FSYNC | nr::FDATASYNC | nr::SYNCFS => path::fd_noop(i(0)),
+        nr::SYNC_FILE_RANGE => path::fd_noop(i(0)),
+        nr::SYNC => Ok(0),
+        nr::READAHEAD => fs::fadvise64(i(0), 0),
+        // Go falls back to read/write on ENOSYS; not worth a log line.
+        nr::COPY_FILE_RANGE | nr::SENDFILE | nr::SPLICE | nr::TEE | nr::OPENAT2 => {
+            Err(Errno(ENOSYS))
+        }
         #[cfg(target_arch = "x86_64")]
         nr::DUP2 => fs::dup2(i(0), i(1)),
         #[cfg(target_arch = "x86_64")]
         nr::PIPE => fs::pipe2(u(0), 0),
         #[cfg(target_arch = "x86_64")]
         nr::EVENTFD => fs::eventfd2(a[0] as u32, 0),
-        nr::READLINKAT => fs::path_enoent(u(1)),
-        nr::FACCESSAT | nr::FACCESSAT2 => fs::path_enoent(u(1)),
-        nr::NEWFSTATAT => fs::newfstatat(i(0), u(1), u(2), a[3] as u32),
-        nr::FSTAT => fs::fstat(i(0), u(1)),
+
+        // path.rs
+        nr::OPENAT => path::openat(i(0), u(1), a[2] as u32, a[3] as u32),
+        nr::MKDIRAT => path::mkdirat(i(0), u(1), a[2] as u32),
+        nr::MKNODAT => path::mknodat(i(0), u(1), a[2] as u32, a[3]),
+        nr::UNLINKAT => path::unlinkat(i(0), u(1), a[2] as u32),
+        nr::RENAMEAT => path::renameat2(i(0), u(1), i(2), u(3), 0),
+        nr::RENAMEAT2 => path::renameat2(i(0), u(1), i(2), u(3), a[4] as u32),
+        nr::SYMLINKAT => path::symlinkat(u(0), i(1), u(2)),
+        nr::LINKAT => path::linkat(i(0), u(1), i(2), u(3), a[4] as u32),
+        nr::READLINKAT => path::readlinkat(i(0), u(1), u(2), u(3)),
+        nr::NEWFSTATAT => path::newfstatat(i(0), u(1), u(2), a[3] as u32),
+        nr::STATX => path::statx(i(0), u(1), a[2] as u32, a[3] as u32, u(4)),
+        nr::FACCESSAT => path::faccessat2(i(0), u(1), a[2] as u32, 0),
+        nr::FACCESSAT2 => path::faccessat2(i(0), u(1), a[2] as u32, a[3] as u32),
+        nr::FCHMODAT => path::fchmodat2(i(0), u(1), a[2] as u32, 0),
+        nr::FCHMODAT2 => path::fchmodat2(i(0), u(1), a[2] as u32, a[3] as u32),
+        nr::FCHOWNAT => path::fchownat(i(0), u(1), a[2] as u32, a[3] as u32, a[4] as u32),
+        nr::UTIMENSAT => path::utimensat(i(0), u(1), u(2), a[3] as u32),
+        nr::FCHMOD => path::fchmod(i(0), a[1] as u32),
+        nr::FCHOWN => path::fchown(i(0), a[1] as u32, a[2] as u32),
+        nr::TRUNCATE => path::truncate(u(0), a[1] as i64),
+        nr::GETCWD => path::getcwd(u(0), u(1)),
+        nr::CHDIR => path::chdir(u(0)),
+        nr::FCHDIR => path::fchdir(i(0)),
+        nr::UMASK => path::umask_call(a[0] as u32),
+        nr::STATFS => path::statfs(u(0), u(1)),
+        nr::FSTATFS => path::fstatfs(i(0), u(1)),
+        nr::CHROOT => Err(Errno(EPERM)),
+        nr::SETXATTR | nr::LSETXATTR | nr::FSETXATTR | nr::GETXATTR | nr::LGETXATTR
+        | nr::FGETXATTR | nr::LISTXATTR | nr::LLISTXATTR | nr::FLISTXATTR | nr::REMOVEXATTR
+        | nr::LREMOVEXATTR | nr::FREMOVEXATTR => Err(Errno(EOPNOTSUPP)),
         #[cfg(target_arch = "x86_64")]
-        nr::OPEN => fs::openat(patina_abi::fs::AT_FDCWD, u(0), a[1] as u32),
+        nr::OPEN => path::openat(AT_FDCWD, u(0), a[1] as u32, a[2] as u32),
         #[cfg(target_arch = "x86_64")]
-        nr::ACCESS | nr::READLINK | nr::STAT | nr::LSTAT => fs::path_enoent(u(0)),
+        nr::CREAT => path::openat(
+            AT_FDCWD,
+            u(0),
+            patina_abi::fs::O_CREAT | patina_abi::fs::O_WRONLY | patina_abi::fs::O_TRUNC,
+            a[1] as u32,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        nr::STAT => path::stat(u(0), u(1), true),
+        #[cfg(target_arch = "x86_64")]
+        nr::LSTAT => path::stat(u(0), u(1), false),
+        #[cfg(target_arch = "x86_64")]
+        nr::ACCESS => path::faccessat2(AT_FDCWD, u(0), a[1] as u32, 0),
+        #[cfg(target_arch = "x86_64")]
+        nr::READLINK => path::readlinkat(AT_FDCWD, u(0), u(1), u(2)),
+        #[cfg(target_arch = "x86_64")]
+        nr::MKDIR => path::mkdirat(AT_FDCWD, u(0), a[1] as u32),
+        #[cfg(target_arch = "x86_64")]
+        nr::MKNOD => path::mknodat(AT_FDCWD, u(0), a[1] as u32, a[2]),
+        #[cfg(target_arch = "x86_64")]
+        nr::RMDIR => path::unlinkat(AT_FDCWD, u(0), patina_abi::fs::AT_REMOVEDIR),
+        #[cfg(target_arch = "x86_64")]
+        nr::UNLINK => path::unlinkat(AT_FDCWD, u(0), 0),
+        #[cfg(target_arch = "x86_64")]
+        nr::RENAME => path::renameat2(AT_FDCWD, u(0), AT_FDCWD, u(1), 0),
+        #[cfg(target_arch = "x86_64")]
+        nr::SYMLINK => path::symlinkat(u(0), AT_FDCWD, u(1)),
+        #[cfg(target_arch = "x86_64")]
+        nr::LINK => path::linkat(AT_FDCWD, u(0), AT_FDCWD, u(1), 0),
+        #[cfg(target_arch = "x86_64")]
+        nr::CHMOD => path::fchmodat2(AT_FDCWD, u(0), a[1] as u32, 0),
+        #[cfg(target_arch = "x86_64")]
+        nr::CHOWN => path::fchownat(AT_FDCWD, u(0), a[1] as u32, a[2] as u32, 0),
+        #[cfg(target_arch = "x86_64")]
+        nr::LCHOWN => path::lchown(u(0), a[1] as u32, a[2] as u32),
+        #[cfg(target_arch = "x86_64")]
+        nr::UTIMES => path::futimesat(AT_FDCWD, u(0), u(1)),
+        #[cfg(target_arch = "x86_64")]
+        nr::FUTIMESAT => path::futimesat(i(0), u(1), u(2)),
+        // The old getdents record format is not implemented; Go uses
+        // getdents64.
+        #[cfg(target_arch = "x86_64")]
+        nr::GETDENTS => Err(Errno(ENOSYS)),
 
         // poll.rs
         nr::EPOLL_CREATE1 => poll::epoll_create1(a[0] as u32),
@@ -247,6 +369,7 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::SET_TID_ADDRESS => proc::set_tid_address(a[0]),
         nr::UNAME => proc::uname(u(0)),
         nr::SCHED_GETAFFINITY => proc::sched_getaffinity(i(0), u(1), u(2)),
+        nr::SCHED_SETAFFINITY => proc::sched_setaffinity(i(0), u(1), u(2)),
         nr::SCHED_YIELD => thread::sched_yield(),
         nr::PRLIMIT64 => proc::prlimit64(i(0), a[1] as u32, u(2), u(3)),
         nr::GETRLIMIT => proc::prlimit64(0, a[0] as u32, 0, u(1)),
@@ -254,6 +377,37 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::GETRANDOM => proc::getrandom(u(0), u(1), a[2] as u32),
         #[cfg(target_arch = "x86_64")]
         nr::ARCH_PRCTL => proc::arch_prctl(frame, i(0), a[1]),
+        // Tier-3 stubs (D57).
+        nr::PRCTL => proc::prctl(i(0), a[1]),
+        nr::GETPGID | nr::GETSID => proc::own_id(i(0)),
+        #[cfg(target_arch = "x86_64")]
+        nr::GETPGRP => Ok(1),
+        nr::SETPGID => Ok(0),
+        nr::SETSID => Err(Errno(EPERM)),
+        nr::GETGROUPS => Ok(0),
+        nr::SETGROUPS | nr::SETUID | nr::SETGID | nr::SETREUID | nr::SETREGID
+        | nr::SETRESUID | nr::SETRESGID | nr::SETFSUID | nr::SETFSGID => Ok(0),
+        nr::GETRESUID | nr::GETRESGID => proc::getres(u(0), u(1), u(2)),
+        nr::CAPGET => proc::capget(u(0), u(1)),
+        nr::CAPSET => Err(Errno(EPERM)),
+        nr::SCHED_GETSCHEDULER => proc::own_id(i(0)).map(|_| 0),
+        nr::SCHED_SETSCHEDULER | nr::SCHED_SETPARAM => Err(Errno(EPERM)),
+        nr::SCHED_GETPARAM => proc::sched_getparam(i(0), u(1)),
+        nr::SCHED_GET_PRIORITY_MAX | nr::SCHED_GET_PRIORITY_MIN => Ok(0),
+        // The raw syscall returns 20 - nice.
+        nr::GETPRIORITY => Ok(20),
+        nr::SETPRIORITY => Ok(0),
+        nr::PERSONALITY => Ok(0),
+        nr::SYSINFO => proc::sysinfo(u(0)),
+        nr::GETCPU => proc::getcpu(u(0), u(1)),
+        nr::MLOCK | nr::MUNLOCK | nr::MLOCKALL | nr::MUNLOCKALL | nr::MSYNC | nr::MLOCK2 => {
+            Ok(0)
+        }
+        nr::WAIT4 | nr::WAITID => Err(Errno(ECHILD)),
+        // Logged once (enosys): a program that needs these cannot work.
+        nr::EXECVE | nr::EXECVEAT => enosys(n),
+        #[cfg(target_arch = "x86_64")]
+        nr::FORK | nr::VFORK => enosys(n),
 
         // time.rs
         nr::CLOCK_GETTIME => time::clock_gettime(i(0), u(1)),

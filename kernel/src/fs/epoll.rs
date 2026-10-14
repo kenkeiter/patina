@@ -344,6 +344,10 @@ impl File for Epoll {
         "epoll"
     }
 
+    fn proc_name(&self) -> alloc::vec::Vec<u8> {
+        b"anon_inode:[eventpoll]".to_vec()
+    }
+
     fn poll(&self, hook: Option<&Arc<dyn PollHook>>) -> EpollFlags {
         let mut g = self.inner.lock();
         if let Some(h) = hook {

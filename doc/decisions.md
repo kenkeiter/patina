@@ -1089,3 +1089,167 @@ mprotect/munmap/mremap return before remote CPUs flush, so for a few
 microseconds a remote thread can still write through the old entry into a
 frame that is still held (lost write, no corruption), which Go does not
 rely on. Verified only under QEMU TCG (x86_64) and HVF (aarch64).
+
+## D53: VFS integration and locking
+*2026-10-14 · Phase 3*
+
+The root filesystem is the one `patina_vfs::Fs` behind a global IRQ-safe
+`SpinLock` (`kernel/src/fs/vfs.rs`). `fs::rootfs::init` creates it and
+unpacks the initrd with `populate_from_cpio_static`, so file pages stay
+borrowed from the initrd until written. The loader then looks `/app` up
+in the tree and takes its contents as one `&'static [u8]`
+(`Fs::static_contents`, no copy). A malformed archive is still exit 127
+"initrd is not a valid newc cpio archive". A missing `/app` is still 127,
+and a non-regular `/app` 126. The file data limit is half of RAM (the
+tmpfs default). It is enforced as `ENOSPC` and reported by `statfs`
+(`TMPFS_MAGIC`, bsize 4096). Each syscall step does its whole
+resolve-and-modify sequence in one critical section. That is what makes
+`O_CREAT|O_EXCL`, `rename` and `O_APPEND` atomic. User memory is never
+touched under the lock: paths are copied in first and results copied out
+after. Outside a critical section an inode reference is a `VHandle`
+(`Handle<KFs>`, where `KFs` is a ZST `FsRef` over the global). Code that
+gets a reference under the lock (`Fs::open`, `get_ref`) returns the raw
+inode number and wraps it with `Handle::adopt` after unlocking. No
+`VHandle`, `Arc<OpenFile>` or `Arc<dyn File>` is dropped inside
+`vfs::with`. Dirfds (`namei::Base`) and `/proc/self/fd` targets are held
+as `Arc<OpenFile>` locals that outlive the closure.
+
+The process cwd is a raw counted reference in `Process::cwd`, changed only
+under the FS lock (`namei::set_cwd`), and `Process::umask` starts at 022.
+The lock order is: fd table → (released); a file's own lock (a regular
+file's offset) → FS → `Process::cwd` / heap. `File` grew additive default
+methods: `getdents64`, `truncate`, `vnode` (the backing inode, for
+`fchmod`/`fchdir`/dirfds), `is_opath` and `proc_name` (the
+`/proc/self/fd` link text). Regular files (`vfile::RegFile`) are not
+pollable (`EPERM` from `epoll_ctl`, always ready for `ppoll`) and give
+`ENOTTY` for ioctls. `SEEK_DATA`/`SEEK_HOLE` treat the file as one data
+extent, as tmpfs does. Deviation: `pwrite` on an `O_APPEND` description
+writes at the offset given (Linux appends).
+
+## D54: devfs, procfs-lite and generated files
+*2026-10-14 · Phase 3*
+
+Special nodes carry a `vfs::KSpecial(Arc<dyn DevNode>)`, which the kernel
+gets back by downcasting through `Special::as_any`. `DevNode::open(ino,
+flags)` builds a free-standing `File`. `namei` wraps it in a `NodeFile`,
+so `fstat` reports the inode and `/proc/self/fd` the path. Character
+devices without a handle (for example `mknod` entries in the initrd) are
+bound by `rdev` at open time from a registry (`vfs::register_chrdev`).
+`/dev` has `null` 1:3, `zero` 1:5, `full` 1:7, `random` 1:8 and `urandom`
+1:9 (both read `random::fill`), `tty` 5:0 (`ENXIO`: there is no
+controlling terminal) and `console` 5:1 (`fs::console::Console`). There
+are also symlinks: `fd` → `/proc/self/fd`, and `stdin`/`stdout`/`stderr`
+→ `/proc/self/fd/0..2`.
+
+Generated files are `S_IFREG` 0444 special nodes whose content a closure
+produces at open time into a read-only `MemFile` (size 0 in `stat`, like
+procfs). This covers `/proc/1/{maps,status,stat,comm,cmdline,environ,
+mounts}`, `/proc/{cpuinfo,meminfo,uptime,version,mounts,loadavg}`,
+`/proc/sys/kernel/{hostname,osrelease,ostype,version,pid_max,threads-max,
+random/boot_id,random/uuid}`, `/proc/sys/net/core/somaxconn` (4096, read
+by `net.Listen`), `/sys/kernel/mm/transparent_hugepage/{hpage_pmd_size,
+enabled}` and `/sys/devices/system/cpu/{online,possible}`.
+
+The real nodes are symlinks and directories: `/proc/self` → `1`,
+`/proc/1/exe` → `/app` and `/proc/1/root` → `/`. `/proc/1/cwd` is a
+placeholder symlink that `chdir` retargets. Two places are "magic": the
+path layer (`fs/namei.rs`) checks for them before normal resolution. It
+repeats the walk with the new `Fs::lookup_parent` and follows final
+symlinks itself, so `/dev/stdin`, `/dev/fd/N` and dirfd-relative names
+all reach them. A name `N` in `/proc/1/fd` follows to the open file
+itself (as Linux `proc_fd_link` does). For a VFS file it reopens the
+inode with the new flags; anything else (pipe, eventfd) shares the open
+file description, as `dup` does. Its `lstat` is a symlink and its
+`readlink` is the open path, `pipe:[ino]`, `anon_inode:[eventfd]` and so
+on. Opening the `/proc/1/fd` directory gives a generated listing
+(`procfs::FdDirFile`). `/proc/1/cwd` as the final component gives the
+live cwd. Deviations: deeper paths through an fd link
+(`/proc/self/fd/3/x`) are `ENOENT`, `/proc/self/maps` shows ELF VMAs with
+offset 0 and no `[heap]` (the break never moves), `VmRSS` is frames in
+use system-wide, and `/proc/self/cgroup` and `mountinfo` are absent
+(Go's cgroup-aware GOMAXPROCS then assumes no limit).
+
+`/etc/{resolv.conf,hosts,hostname,nsswitch.conf,passwd,group}` are
+created only if the initrd lacks them. `resolv.conf` uses the `ip=` DNS
+fields, else `nameserver 10.0.2.3`. `hosts` has the localhost lines plus
+`<ip> <hostname>` when `ip=` gives a client address. The base directories
+`/tmp` (1777), `/root`, `/etc`, `/dev`, `/proc` and `/sys` always exist.
+
+## D55: FIFOs
+*2026-10-14 · Phase 3*
+
+A FIFO inode (from `mknodat(S_IFIFO)` or the initrd) gets a `pipe::Fifo`
+handle the first time it is opened. The FIFO keeps the
+`Pipe` its ends share, plus Linux's `r_counter`/`w_counter`. Open follows
+`fifo_open`. `O_RDONLY` waits until a writer has opened (not with
+`O_NONBLOCK`). `O_WRONLY` waits for a reader, and with `O_NONBLOCK` it is
+`ENXIO`. `O_RDWR` is one description that is both ends and never waits.
+The wait is interruptible (`ERESTARTSYS`), and an interrupted open drops
+the count it took. When every end has been closed, the next open starts
+a fresh, empty pipe. The ends are the ordinary `PipeReader`/`PipeWriter`,
+so `pipe2` semantics (atomic `PIPE_BUF` writes, `SIGPIPE`, readiness)
+carry over unchanged.
+
+## D56: path syscall conventions
+*2026-10-14 · Phase 3*
+
+Every path syscall decodes `(dirfd, path)` through `namei`. `AT_FDCWD`
+and absolute paths use the cwd. Any other dirfd must be an open file with
+a directory inode (`EBADF` / `ENOTDIR`); `O_PATH` fds qualify.
+`AT_EMPTY_PATH` is honoured by `newfstatat`, `statx`, `linkat`,
+`faccessat2`, `fchmodat2`, `fchownat` and `utimensat` (also implied by
+`utimensat` with a NULL path). An empty path on a non-`AT_FDCWD` dirfd
+reads the dirfd's own symlink for `readlinkat`. `O_PATH` descriptors only
+support `fstat`, `fchdir`, `close`, `dup`, `fcntl` and use as a dirfd.
+Everything else on them is `EBADF`. `O_TMPFILE` is `EOPNOTSUPP` and
+`O_DIRECT` is `EINVAL` (tmpfs). `O_NOATIME`/`O_LARGEFILE`/`O_DSYNC`/
+`O_SYNC` are accepted and ignored. The creation mode is masked with the
+umask (`mkdir` keeps 01777 bits, files 07777).
+
+There is a single user. Permission bits are stored but not enforced (as
+for root), except `X_OK`. `chown` changes ids freely. `mknodat` creates
+regular files and FIFOs; devices and sockets give `EPERM`. `statfs` and
+`fstatfs` report tmpfs for every path. `fsync`, `fdatasync`, `syncfs`,
+`sync`, `sync_file_range`, `flock` (validated, always granted) and
+`fadvise64`/`readahead` are no-ops. `fallocate` mode 0 extends the file;
+other modes are `EOPNOTSUPP`. `close_range` supports `CLOSE_RANGE_CLOEXEC`
+(`UNSHARE` is a no-op). `copy_file_range`, `sendfile`, `splice`, `tee`
+and `openat2` are `ENOSYS` without a log line. Go falls back to
+read/write, and `os.Root` falls back to `openat` with `O_NOFOLLOW`.
+`chroot` is `EPERM`. The x86_64 legacy calls (`open creat stat lstat
+access readlink mkdir mknod rmdir unlink rename symlink link chmod chown
+lchown utimes futimesat`) map onto the `*at` handlers. The old `getdents`
+is `ENOSYS`. With `patina.strace` each path syscall also logs its path
+argument. Deviations: an open file's `/proc/self/fd` name is the lexically
+normalised path it was opened by, which `rename` does not update (except
+for directories, whose name is computed live). Linux `xattr`s are not
+supported (`EOPNOTSUPP`).
+
+## D57: Tier-3 syscall stubs
+*2026-10-14 · Phase 3*
+
+Design §7's Tier-3 list is answered so that the `os` package tests and
+typical programs see a plausible single-process root system instead of
+`ENOSYS`. `wait4`/`waitid` return `ECHILD`. `execve`, `execveat`, `fork`
+and `vfork` return `ENOSYS`, logged once per number like any unknown
+call, because a program that needs them cannot work. `prctl` handles
+`PR_SET_NAME`/`PR_GET_NAME` (the per-thread 16-byte `Thread::name`),
+`PR_SET_DUMPABLE` (0/1) / `PR_GET_DUMPABLE` (1), `PR_SET_NO_NEW_PRIVS`,
+`PR_GET_NO_NEW_PRIVS` (0) and `PR_SET_VMA` (accepted). Every other option
+is `EINVAL`. The process is pid 1, its own group and session leader:
+`getpgrp`/`getpgid`/`getsid` give 1, `setpgid` gives 0 and `setsid`
+gives `EPERM`. Identity calls report uid/gid 0 everywhere: `getgroups` →
+0 groups, `getresuid`/`getresgid` → 0,0,0, and every `set*id` and
+`setgroups` call → 0 without changing anything. `capget` negotiates the
+version and reports empty sets, and `capset` gives `EPERM`.
+`sched_setaffinity` succeeds if the mask names an online CPU (no
+migration; `EINVAL` otherwise). `sched_getscheduler` → `SCHED_OTHER`,
+`sched_setscheduler`/`sched_setparam` → `EPERM`, `sched_getparam` →
+priority 0, and `sched_get_priority_max`/`min` → 0. `getpriority` gives
+20 (nice 0, raw syscall encoding) and `setpriority` gives 0.
+`personality` gives 0. `sysinfo` fills in uptime, `totalram`/`freeram`
+from the frame allocator, `procs` = live threads and `mem_unit` 1.
+`getcpu` gives the current CPU, node 0. `mlock*`/`munlock*`/`msync` give
+0. The `xattr` family gives `EOPNOTSUPP`. `inotify_*`, `memfd_create`,
+`pidfd_open`, `kcmp`, `seccomp`, `*_mempolicy` and `ioprio_*` remain
+`ENOSYS` (logged once). Go handles all of these.

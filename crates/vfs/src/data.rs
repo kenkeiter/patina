@@ -44,6 +44,12 @@ impl FileData {
         self.size
     }
 
+    /// The whole contents as one borrowed slice, if they are still exactly
+    /// the `'static` backing (nothing written since population).
+    pub fn as_static(&self) -> Option<&'static [u8]> {
+        (self.pages.is_empty() && self.backing.len() as u64 == self.size).then_some(self.backing)
+    }
+
     /// Number of materialised (heap-owned) pages.
     pub fn owned_pages(&self) -> u64 {
         self.pages.len() as u64

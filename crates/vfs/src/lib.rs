@@ -71,6 +71,7 @@ pub use data::PAGE_SIZE;
 pub use fs::{Clock, FileType, Fs, Special};
 pub use handle::{FsRef, Handle};
 pub use ops::{OpenOptions, Opened, SetTime};
+pub use path::LastComponent;
 pub use patina_abi::errno::Errno;
 pub use patina_abi::time::Timespec;
 pub use populate::{

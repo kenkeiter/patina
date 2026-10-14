@@ -95,7 +95,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use patina_abi::current::Stat;
 use patina_abi::epoll::EpollFlags;
-use patina_abi::errno::{EINVAL, ENOTTY, ESPIPE, Errno};
+use patina_abi::errno::{EINVAL, ENOTDIR, ENOTTY, ESPIPE, Errno};
 use patina_abi::fs::{O_ACCMODE, O_APPEND, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY};
 
 use crate::sync::SpinLock;
@@ -300,6 +300,39 @@ pub trait File: Send + Sync {
     /// `lseek(off, whence)` → new offset.
     fn lseek(&self, _off: i64, _whence: i32) -> Result<u64, Errno> {
         Err(Errno(ESPIPE))
+    }
+
+    /// `getdents64` into `buf` (directories): bytes written, 0 at the end.
+    fn getdents64(&self, _buf: &mut [u8]) -> Result<usize, Errno> {
+        Err(Errno(ENOTDIR))
+    }
+
+    /// `ftruncate`: `EINVAL` unless the file is a regular file.
+    fn truncate(&self, _len: u64) -> Result<(), Errno> {
+        Err(Errno(EINVAL))
+    }
+
+    /// The VFS inode behind this description, if it was opened by path
+    /// (regular files, directories, `O_PATH` fds, device nodes and FIFOs):
+    /// `fchmod`, `fchdir`, dirfd-relative lookups and `/proc/self/fd/N`
+    /// act on it.
+    fn vnode(&self) -> Option<patina_vfs::Ino> {
+        None
+    }
+
+    /// An `O_PATH` description: only `fstat`, `fchdir`, `close`, `dup`,
+    /// `fcntl` and use as a dirfd work; the rest give `EBADF`.
+    fn is_opath(&self) -> bool {
+        false
+    }
+
+    /// What `readlink("/proc/self/fd/N")` shows: the path it was opened
+    /// by, or `pipe:[ino]`, `anon_inode:[eventfd]`, ...
+    fn proc_name(&self) -> Vec<u8> {
+        let mut v = Vec::from(&b"anon_inode:["[..]);
+        v.extend_from_slice(self.kind().as_bytes());
+        v.push(b']');
+        v
     }
 
     /// The last reference to the open file description went away (every
