@@ -38,6 +38,18 @@ impl Parent {
     }
 }
 
+/// Result of [`Fs::lookup_parent`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastComponent {
+    /// Directory holding the last component (or the directory the path
+    /// names, when it ends in `.`, `..` or is only slashes).
+    pub dir: Ino,
+    /// The last component, if it is a normal name (not `.`, `..`, `/`).
+    pub name: Option<Vec<u8>>,
+    /// The path ended in `/` after the last component.
+    pub trailing: bool,
+}
+
 /// Validate a user-supplied path.
 pub(crate) fn check_path(path: &[u8]) -> Result<()> {
     if path.is_empty() {
@@ -207,6 +219,21 @@ impl Fs {
         let mut links = 0;
         let p = self.walk_parent(start, path, &mut links)?;
         Ok(self.finish_lookup(p, follow, &mut links)?.0)
+    }
+
+    /// Resolve every component of `path` but the last (following
+    /// intermediate symlinks), for callers that intercept particular names
+    /// in particular directories before normal resolution (the kernel's
+    /// procfs "magic" links such as `/proc/self/fd/N`). See [`LastComponent`].
+    pub fn lookup_parent(&self, start: Ino, path: &[u8]) -> Result<LastComponent> {
+        check_path(path)?;
+        let mut links = 0;
+        let p = self.walk_parent(start, path, &mut links)?;
+        Ok(LastComponent {
+            dir: p.dir,
+            name: p.normal().map(|n| n.to_vec()),
+            trailing: p.trailing,
+        })
     }
 
     /// Path of directory `ino` from the root (`getcwd`). `ENOENT` if it has

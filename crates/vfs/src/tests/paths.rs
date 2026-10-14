@@ -280,3 +280,28 @@ fn removed_cwd() {
     fs.put_ref(c);
     assert_eq!(fs.inode_count(), before - 1);
 }
+
+#[test]
+fn lookup_parent_follows_intermediate_links() {
+    let mut fs = setup();
+    fs.symlink(b"/a/b", R, b"/lb").unwrap();
+    fs.symlink(b"lb", R, b"/lb2").unwrap();
+    let b = fs.resolve(R, b"/a/b", true).unwrap();
+    let p = fs.lookup_parent(R, b"/lb2/f").unwrap();
+    assert_eq!(p.dir, b);
+    assert_eq!(p.name.as_deref(), Some(&b"f"[..]));
+    assert!(!p.trailing);
+    // The final component is not followed.
+    let p = fs.lookup_parent(R, b"/lb2").unwrap();
+    assert_eq!((p.dir, p.name.as_deref()), (R, Some(&b"lb2"[..])));
+    let p = fs.lookup_parent(R, b"/a/b/c/").unwrap();
+    assert_eq!((p.dir, p.name.as_deref(), p.trailing), (b, Some(&b"c"[..]), true));
+    let p = fs.lookup_parent(R, b"/a/b/..").unwrap();
+    assert_eq!((p.dir, p.name), (b, None));
+    assert_eq!(fs.lookup_parent(R, b""), Err(err(ENOENT)));
+    assert_eq!(fs.lookup_parent(R, b"/nope/x"), Err(err(ENOENT)));
+    assert_eq!(fs.lookup_parent(R, b"/top/x"), Err(err(ENOTDIR)));
+    // Nothing is created.
+    assert!(fs.resolve(R, b"/a/b/x", false).is_err());
+    let _ = vec![0u8; 0];
+}

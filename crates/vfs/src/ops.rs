@@ -684,6 +684,16 @@ impl Fs {
         Ok(self.stat(ino)?.size)
     }
 
+    /// Contents of regular file `ino` as a `'static` slice without copying,
+    /// if it was populated by [`populate_from_cpio_static`](crate::populate_from_cpio_static)
+    /// and not modified since (`None` otherwise: read it with [`Fs::read_at`]).
+    pub fn static_contents(&self, ino: Ino) -> Option<&'static [u8]> {
+        match &self.inodes.get(&ino)?.kind {
+            Kind::File(d) => d.as_static(),
+            _ => None,
+        }
+    }
+
     /// The kernel handle of a special node, if any.
     pub fn special(&self, ino: Ino) -> Option<Arc<dyn Special>> {
         match &self.inodes.get(&ino)?.kind {

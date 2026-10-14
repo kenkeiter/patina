@@ -100,7 +100,10 @@ fn bsdcpio_fixture_static_zero_copy() {
     // Copy-on-write: writing materialises a page; the archive is untouched.
     let ino = fs.resolve(R, b"/etc/hosts", true).unwrap();
     assert_eq!(fs.stat(ino).unwrap().blocks, 8);
+    assert_eq!(fs.static_contents(ino), Some(&b"127.0.0.1 localhost\n"[..]));
+    assert_eq!(fs.static_contents(R), None);
     fs.write_at(ino, 0, b"10").unwrap();
+    assert_eq!(fs.static_contents(ino), None, "written: no longer the backing");
     assert_eq!(fs.pages_used(), 1);
     assert_eq!(
         get(&mut fs, "/etc/hosts").unwrap(),
@@ -108,8 +111,11 @@ fn bsdcpio_fixture_static_zero_copy() {
     );
     // Shrink then grow: the old backing bytes must not reappear.
     let five = fs.resolve(R, b"/dir/five", true).unwrap();
+    assert!(fs.static_contents(five).is_some());
     fs.truncate(five, 2).unwrap();
+    assert_eq!(fs.static_contents(five), Some(&b"ab"[..]), "shrunk backing");
     fs.truncate(five, 5).unwrap();
+    assert_eq!(fs.static_contents(five), None, "grown past the backing");
     assert_eq!(get(&mut fs, "/dir/five").unwrap(), b"ab\0\0\0");
     fs.write_at(five, 4, b"Z").unwrap();
     assert_eq!(get(&mut fs, "/dir/five").unwrap(), b"ab\0\0Z");

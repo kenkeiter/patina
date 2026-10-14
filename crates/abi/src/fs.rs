@@ -280,6 +280,48 @@ impl Default for Statx {
     }
 }
 
+/// `struct statfs` (`statfs`/`fstatfs`; 120 bytes, identical on x86_64
+/// and the 64-bit asm-generic layout aarch64 uses).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct Statfs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+    pub f_spare: [i64; 4],
+}
+
+/// `f_type` of tmpfs (`TMPFS_MAGIC`).
+pub const TMPFS_MAGIC: i64 = 0x0102_1994;
+/// `f_flags` bits (`ST_*`).
+pub const ST_NOSUID: i64 = 0x0002;
+pub const ST_NODEV: i64 = 0x0004;
+pub const ST_RELATIME: i64 = 0x1000;
+
+/// `close_range` flags.
+pub const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+pub const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+
+/// `fallocate` mode bits.
+pub const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+pub const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
+
+/// `flock` operations.
+pub const LOCK_SH: i32 = 1;
+pub const LOCK_EX: i32 = 2;
+pub const LOCK_NB: i32 = 4;
+pub const LOCK_UN: i32 = 8;
+
 /// `struct iovec`.
 #[repr(C)]
 #[derive(
@@ -374,6 +416,15 @@ mod tests {
         assert!(buf[25..32].iter().all(|&b| b == 0));
         assert_eq!(buf[32], 0xff);
         assert_eq!(write_dirent64(&mut buf[..31], 7, 1, DT_REG, b"hello"), None);
+    }
+
+    #[test]
+    fn statfs_layout() {
+        assert_eq!(core::mem::size_of::<Statfs>(), 120);
+        assert_eq!(core::mem::offset_of!(Statfs, f_fsid), 56);
+        assert_eq!(core::mem::offset_of!(Statfs, f_namelen), 64);
+        assert_eq!(core::mem::offset_of!(Statfs, f_flags), 80);
+        assert_eq!(core::mem::offset_of!(Statfs, f_spare), 88);
     }
 
     #[test]

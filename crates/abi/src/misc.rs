@@ -169,6 +169,54 @@ pub const PR_SET_VMA_ANON_NAME: u64 = 0;
 /// Length of a task comm name including NUL (`PR_SET_NAME`).
 pub const TASK_COMM_LEN: usize = 16;
 
+/// `struct sysinfo` (64-bit: 112 bytes; `_f` is empty).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct Sysinfo {
+    pub uptime: i64,
+    pub loads: [u64; 3],
+    pub totalram: u64,
+    pub freeram: u64,
+    pub sharedram: u64,
+    pub bufferram: u64,
+    pub totalswap: u64,
+    pub freeswap: u64,
+    pub procs: u16,
+    pub pad: u16,
+    pub _pad1: u32,
+    pub totalhigh: u64,
+    pub freehigh: u64,
+    pub mem_unit: u32,
+    pub _pad2: u32,
+}
+
+/// `capget`/`capset` header (`struct __user_cap_header_struct`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct CapUserHeader {
+    pub version: u32,
+    pub pid: i32,
+}
+
+/// One `struct __user_cap_data_struct` (v2/v3 pass two of them).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct CapUserData {
+    pub effective: u32,
+    pub permitted: u32,
+    pub inheritable: u32,
+}
+
+pub const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+pub const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
 /// `membarrier` commands (patina may return `ENOSYS` for all of them).
 pub const MEMBARRIER_CMD_QUERY: i32 = 0;
 pub const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
@@ -187,5 +235,15 @@ mod tests {
         let u = Utsname::new(long, "", "", "", "", "");
         assert_eq!(u.sysname[63], b'x');
         assert_eq!(u.sysname[64], 0);
+    }
+
+    #[test]
+    fn sysinfo_caps_layout() {
+        assert_eq!(core::mem::size_of::<Sysinfo>(), 112);
+        assert_eq!(core::mem::offset_of!(Sysinfo, procs), 80);
+        assert_eq!(core::mem::offset_of!(Sysinfo, totalhigh), 88);
+        assert_eq!(core::mem::offset_of!(Sysinfo, mem_unit), 104);
+        assert_eq!(core::mem::size_of::<CapUserHeader>(), 8);
+        assert_eq!(core::mem::size_of::<CapUserData>(), 12);
     }
 }
