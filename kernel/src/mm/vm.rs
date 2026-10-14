@@ -167,6 +167,12 @@ fn page_len(start: usize, len: usize) -> Option<usize> {
     (end <= USER_VA_END).then_some(l)
 }
 
+/// Linux `access_ok`: `[addr, addr + len)` lies in the user half without
+/// overflowing. A range check only: the pages may still be unmapped.
+pub fn access_ok(addr: usize, len: usize) -> bool {
+    addr.checked_add(len).is_some_and(|end| end <= USER_VA_END)
+}
+
 /// The user address space: page tables + VMAs + resident-page set.
 pub struct AddressSpace {
     pub tables: UserTables,
@@ -805,19 +811,22 @@ impl AddressSpace {
         self.brk
     }
 
-    /// `mincore`: 1 per resident page, 0 otherwise. `ENOMEM` if the range
-    /// is not fully mapped.
-    pub fn mincore(&mut self, addr: usize, len: usize) -> Result<Vec<u8>> {
-        if !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(Errno(EINVAL));
+    /// One step of `mincore` (Linux `mm/mincore.c do_mincore`): the
+    /// residency (1/0 per page) of the pages from `addr` (page aligned) to
+    /// the end of the VMA containing it, at most `pages` and `out.len()`
+    /// of them, written to `out`. Returns the number of pages done;
+    /// `ENOMEM` if no VMA contains `addr`. Costs O(resident pages in the
+    /// chunk), never allocates: the caller walks a huge range in bounded
+    /// chunks, dropping the address-space lock between them.
+    pub fn mincore_chunk(&self, addr: usize, pages: usize, out: &mut [u8]) -> Result<usize> {
+        let v = self.find(addr).ok_or(Errno(ENOMEM))?;
+        let n = pages.min(out.len()).min((v.end - addr) / PAGE_SIZE);
+        let out = &mut out[..n];
+        out.fill(0);
+        for &va in self.resident.range(addr..addr + n * PAGE_SIZE) {
+            out[(va - addr) / PAGE_SIZE] = 1;
         }
-        let len = page_len(addr, len).ok_or(Errno(ENOMEM))?;
-        if !self.is_covered(addr, addr + len) {
-            return Err(Errno(ENOMEM));
-        }
-        Ok((0..len / PAGE_SIZE)
-            .map(|i| self.resident.contains(&(addr + i * PAGE_SIZE)) as u8)
-            .collect())
+        Ok(n)
     }
 
     // ---------------------------------------------------------------
