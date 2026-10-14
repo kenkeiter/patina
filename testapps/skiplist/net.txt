@@ -1,0 +1,43 @@
+# Go net package tests skipped under patina (scripts/test-gonet.sh, D73).
+# One top-level test per line: TestName  # reason
+#
+# AF_UNIX sockets are being added by another change (socket(AF_UNIX) is
+# EAFNOSUPPORT in this tree). Most of these also have tcp/udp subtests,
+# which pass. Re-enable once AF_UNIX is merged.
+TestConnAndListener  # AF_UNIX: pending
+TestDialerControl  # AF_UNIX: pending
+TestDialerControlContext  # AF_UNIX: pending
+TestDialContext  # AF_UNIX: pending
+TestFileConn  # AF_UNIX: pending
+TestFileListener  # AF_UNIX: pending
+TestFilePacketConn  # AF_UNIX: pending
+TestFileFdBlocks  # AF_UNIX: pending
+TestListenConfigControl  # AF_UNIX: pending
+TestPacketConn  # AF_UNIX: pending
+TestConnAndPacketConn  # AF_UNIX: pending
+TestUnixListenerSpecificMethods  # AF_UNIX: pending
+TestUnixConnSpecificMethods  # AF_UNIX: pending
+TestUnixAndUnixpacketServer  # AF_UNIX: pending
+TestUnixgramServer  # AF_UNIX: pending
+TestUnixgramAutobind  # AF_UNIX: pending
+TestUnixAutobindClose  # AF_UNIX: pending
+TestUnixAbstractLongNameNulStart  # AF_UNIX: pending
+TestUnixgramLinuxAbstractLongName  # AF_UNIX: pending
+TestUnixConnReadMsgUnixSCMRightsCloseOnExec  # AF_UNIX: pending
+TestReadUnixgramWithUnnamedSocket  # AF_UNIX: pending
+TestUnixgramZeroBytePayload  # AF_UNIX: pending
+TestUnixgramZeroByteBuffer  # AF_UNIX: pending
+TestUnixgramWrite  # AF_UNIX: pending
+TestUnixConnLocalAndRemoteNames  # AF_UNIX: pending
+TestUnixgramConnLocalAndRemoteNames  # AF_UNIX: pending
+TestUnixUnlink  # AF_UNIX: pending
+TestUnixConnReadEOF  # AF_UNIX: pending
+TestZeroByteRead  # AF_UNIX: pending
+TestPacketConnClose  # AF_UNIX: pending
+TestListenerClose  # AF_UNIX: pending
+TestConnClose  # AF_UNIX: pending
+TestCloseWrite  # AF_UNIX: pending
+TestCloseRead  # AF_UNIX: pending
+#
+# Child processes: the peer runs as a re-exec of the test binary.
+TestSplice  # needs os/exec (no execve, D57): startTestSocketPeer

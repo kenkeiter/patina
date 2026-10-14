@@ -250,8 +250,9 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::SYNC_FILE_RANGE => path::fd_noop(i(0)),
         nr::SYNC => Ok(0),
         nr::READAHEAD => fs::fadvise64(i(0), 0),
+        nr::SENDFILE => fs::sendfile(i(0), i(1), u(2), u(3)),
         // Go falls back to read/write on ENOSYS; not worth a log line.
-        nr::COPY_FILE_RANGE | nr::SENDFILE | nr::OPENAT2 => Err(Errno(ENOSYS)),
+        nr::COPY_FILE_RANGE | nr::OPENAT2 => Err(Errno(ENOSYS)),
         // Go's splice path (io.Copy between TCP conns, poll.Splice) falls
         // back only on EINVAL ("splice unsupported for this fd type");
         // ENOSYS would fail the copy.

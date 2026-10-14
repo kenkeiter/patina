@@ -22,7 +22,8 @@ the manifest pins the major version.
 ## zerocopy (+ zerocopy-derive)
 
 - **Version:** 0.8.x (`zerocopy = { version = "0.8", default-features = false, features = ["derive"] }`)
-- **Used by:** `patina-abi`
+- **Used by:** `patina-abi`; `patina-inet` (only `IntoBytes::as_bytes`, for
+  the netlink reply encoder, D73; no extra features)
 - **Why:** byte-safe conversion of `#[repr(C)]` ABI structs to and from user
   memory (`IntoBytes::as_bytes`, `FromBytes::read_from_bytes`) without
   hand-written `unsafe` transmutes. The `IntoBytes` derive also refuses
@@ -220,5 +221,7 @@ All resolved by `Cargo.lock`; none has default features that pull `std`.
 `crates/inet`: socket-address codec (`SockAddr` ↔ `sockaddr_in`/`_in6`/`_un`
 bytes, IPv4-mapped IPv6 handling) and the inet bind table (`PortTable`:
 EADDRINUSE with `SO_REUSEADDR`/`SO_REUSEPORT` and dual-stack overlap,
-ephemeral ports 32768–60999). Depends only on `patina-abi`; no `unsafe`;
-host tests in the crate (`cargo test -p patina-inet`).
+ephemeral ports 32768–60999), plus the `NETLINK_ROUTE` request parser and
+link/address dump encoder (`netlink`, D73). Depends on `patina-abi` and
+`zerocopy` (already audited above); no `unsafe`; host tests in the crate
+(`cargo test -p patina-inet`).

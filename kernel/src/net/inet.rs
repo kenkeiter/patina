@@ -566,7 +566,11 @@ pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Er
         SOCK_STREAM if protocol == 0 || protocol == IPPROTO_TCP => IPPROTO_TCP,
         SOCK_DGRAM if protocol == 0 || protocol == IPPROTO_UDP => IPPROTO_UDP,
         SOCK_STREAM | SOCK_DGRAM => return Err(Errno(EPROTONOSUPPORT)),
-        SOCK_RAW | SOCK_SEQPACKET | SOCK_RDM => return Err(Errno(ESOCKTNOSUPPORT)),
+        // Raw IP needs CAP_NET_RAW, which no process has: Linux answers an
+        // unprivileged (or containerised) caller with EPERM, and Go's
+        // tests treat that as "not supported here".
+        SOCK_RAW => return Err(Errno(EPERM)),
+        SOCK_SEQPACKET | SOCK_RDM => return Err(Errno(ESOCKTNOSUPPORT)),
         _ => return Err(Errno(EINVAL)),
     };
     let id = stack::with(false, |s| {

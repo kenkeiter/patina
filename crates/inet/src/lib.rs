@@ -8,17 +8,23 @@
 //!   `SO_REUSEPORT` and dual-stack overlap, and ephemeral port allocation
 //!   (32768–60999, Linux's `ip_local_port_range`).
 //!
+//! * [`netlink`]: `NETLINK_ROUTE` request parsing and the link/address
+//!   dump replies (`net.Interfaces`).
+//!
 //! The kernel (`kernel/src/net/`) wires these to smoltcp.
 
 #![no_std]
 
 extern crate alloc;
 
+pub mod netlink;
+
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, Ipv6Addr};
 
-use patina_abi::net::{AF_INET, AF_INET6, AF_UNIX, AF_UNSPEC, SockaddrIn, SockaddrIn6};
+use patina_abi::net::{AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, AF_UNSPEC, SockaddrIn, SockaddrIn6};
+use patina_abi::netlink::SockaddrNl;
 
 // ---------------------------------------------------------------------------
 // Socket addresses.
@@ -45,6 +51,8 @@ pub enum SockAddr {
     Unix(Vec<u8>),
     /// `AF_UNSPEC` (`connect` to dissolve a UDP association).
     Unspec,
+    /// `AF_NETLINK`: port id and multicast group mask (`sockaddr_nl`).
+    Netlink { pid: u32, groups: u32 },
 }
 
 /// Why a user `sockaddr` could not be decoded.
@@ -106,6 +114,16 @@ impl SockAddr {
                 Ok(SockAddr::Unix(path.to_vec()))
             }
             AF_UNSPEC => Ok(SockAddr::Unspec),
+            AF_NETLINK => {
+                if bytes.len() < size_of::<SockaddrNl>() {
+                    return Err(AddrError::Invalid);
+                }
+                let w = |i: usize| u32::from_ne_bytes(bytes[i..i + 4].try_into().unwrap());
+                Ok(SockAddr::Netlink {
+                    pid: w(4),
+                    groups: w(8),
+                })
+            }
             f => Err(AddrError::Family(f)),
         }
     }
@@ -152,6 +170,13 @@ impl SockAddr {
                 out[..2].copy_from_slice(&AF_UNSPEC.to_ne_bytes());
                 2
             }
+            SockAddr::Netlink { pid, groups } => {
+                out[..2].copy_from_slice(&AF_NETLINK.to_ne_bytes());
+                out[2..4].fill(0);
+                out[4..8].copy_from_slice(&pid.to_ne_bytes());
+                out[8..12].copy_from_slice(&groups.to_ne_bytes());
+                size_of::<SockaddrNl>()
+            }
         }
     }
 
@@ -161,6 +186,7 @@ impl SockAddr {
             SockAddr::V6 { .. } => AF_INET6,
             SockAddr::Unix(_) => AF_UNIX,
             SockAddr::Unspec => AF_UNSPEC,
+            SockAddr::Netlink { .. } => AF_NETLINK,
         }
     }
 
@@ -488,6 +514,13 @@ mod tests {
             b.ip_port(),
             Some((IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443))
         );
+
+        let nl = SockAddr::Netlink { pid: 1, groups: 0x10 };
+        let n = nl.encode(&mut buf);
+        assert_eq!(n, 12);
+        assert_eq!(&buf[..2], &AF_NETLINK.to_ne_bytes());
+        assert_eq!(SockAddr::parse(&buf[..n]).unwrap(), nl);
+        assert_eq!(SockAddr::parse(&buf[..8]), Err(AddrError::Invalid));
 
         buf[0..2].copy_from_slice(&99u16.to_ne_bytes());
         assert_eq!(SockAddr::parse(&buf[..16]), Err(AddrError::Family(99)));

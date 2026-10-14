@@ -177,7 +177,8 @@ pub fn socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
         Ok(AF_INET | AF_INET6) => crate::net::inet::create(domain as u16, ty, protocol)?,
         // AF_UNIX: a second SocketOps implementation slots in here.
         Ok(AF_UNIX) => return Err(Errno(EAFNOSUPPORT)),
-        // AF_NETLINK, AF_PACKET, AF_VSOCK, ...: not supported.
+        Ok(AF_NETLINK) => crate::net::netlink::create(ty, protocol)?,
+        // AF_PACKET, AF_VSOCK, ...: not supported.
         _ => return Err(Errno(EAFNOSUPPORT)),
     };
     install(
@@ -556,5 +557,6 @@ pub fn trace_addr(n: usize, a: &[u64; 6]) -> Option<alloc::string::String> {
         SockAddr::V6 { addr, port, .. } => alloc::format!("[{}]:{}", addr, port),
         SockAddr::Unix(p) => alloc::format!("{:?}", alloc::string::String::from_utf8_lossy(&p)),
         SockAddr::Unspec => alloc::string::String::from("AF_UNSPEC"),
+        SockAddr::Netlink { pid, groups } => alloc::format!("nl:{}/{:#x}", pid, groups),
     })
 }
