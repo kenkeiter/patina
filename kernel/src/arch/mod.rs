@@ -253,11 +253,18 @@
 //!     /// for it with IRQs masked (then EOI). Works before the scheduler
 //!     /// starts (aarch64 initializes the GIC on demand; x86 the I/O APIC).
 //!     pub fn register(irq: u32, handler: fn(u32));
+//!     /// Phase 4 (D70): reserve an MSI for PCI device id `requester` and
+//!     /// name it with an IRQ number `configure`/`register` accept (x86:
+//!     /// 0x100 + vector, LAPIC message; aarch64: ITS LPI or GICv2m SPI).
+//!     pub fn alloc_msi(requester: u32) -> Option<drivers::pci::MsiMsg>;
 //! }
 //! pub mod devices {
 //!     /// virtio-mmio regions the platform describes (aarch64: DTB nodes;
 //!     /// x86_64: `virtio_mmio.device=` params, DSDT `LNRO0005`, probe).
 //!     pub fn virtio_mmio(cmdline: &patina_cmdline::Cmdline) -> Vec<drivers::MmioDesc>;
+//!     /// Phase 4 (D70): PCI host bridges (aarch64: DTB ECAM node; x86_64:
+//!     /// MCFG entries, else port 0xCF8 on PC platforms).
+//!     pub fn pci_hosts() -> Vec<drivers::pci::PciHostDesc>;
 //! }
 //! pub mod cpu {
 //!     /// Barrier before a device doorbell (aarch64 `dsb sy`, x86 `mfence`).

@@ -186,22 +186,32 @@ impl Its {
                 BASER_TYPE_COLLECTION => 256 * esz,
                 _ => continue,
             };
-            // Flat table, 4 KiB pages, at most 64 pages (device ids up to
-            // 32768 with 8-byte entries; PCI requester ids are far below).
-            let pages = want.div_ceil(PAGE_SIZE).clamp(1, 64);
-            let t = alloc_zeroed(pages * PAGE_SIZE).ok_or("no memory")?;
+            // Table page size: ask for 4 KiB and take what the ITS keeps
+            // (KVM's ITS only implements 64 KiB pages; QEMU's takes 4 KiB).
+            w64(reg, b & (0x7 << 56 | 0x1f << 48));
+            let psz = match (r64(reg) >> 8) & 3 {
+                0 => 0x1000,
+                1 => 0x4000,
+                _ => 0x1_0000,
+            };
+            // Flat table of at most 256 KiB (device ids up to 32768 with
+            // 8-byte entries; PCI requester ids are far below).
+            let bytes = want.clamp(1, 256 * 1024).next_multiple_of(psz);
+            let pages = bytes / psz;
+            let t = alloc_zeroed(bytes).ok_or("no memory")?; // naturally aligned
             let v = BASER_VALID
                 | (CACHE_RAWAWB << 59)
                 | (b & (0x7 << 56 | 0x1f << 48))
                 | t as u64
                 | SH_INNER
+                | (r64(reg) & (3 << 8))
                 | (pages as u64 - 1);
             w64(reg, v);
-            if (r64(reg) >> 8) & 3 != 0 {
-                return Err("ITS does not take 4 KiB table pages");
+            if r64(reg) & BASER_VALID == 0 {
+                return Err("ITS rejected a table");
             }
             if ty == BASER_TYPE_DEVICE {
-                max_devid = ((pages * PAGE_SIZE) / esz).min(u32::MAX as usize) as u32;
+                max_devid = (bytes / esz).min(u32::MAX as usize) as u32;
             }
         }
         if max_devid == 0 {

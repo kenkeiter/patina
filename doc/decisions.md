@@ -1553,3 +1553,131 @@ in a row): hello args/exit 3, ctl stop handler/nohandler/forced, ping, dump,
 signal SIGUSR1, `--timeout`, SIGINT → 143, double SIGINT → 137. A `patina
 run` killed with SIGKILL still leaves QEMU running (own process group, no
 parent-death signal on macOS).
+
+## D70: virtio-pci transport, PCI discovery, MSI-X (LAPIC, GICv3 ITS, GICv2m) and INTx
+*2026-10-14 · Phase 4*
+
+Cloud Hypervisor has no virtio-mmio, so virtio-pci moved up from Phase 5.
+**Discovery** (`drivers/pci.rs`): `arch::devices::pci_hosts()` returns
+fixed-size `PciHostDesc`s. On x86_64 there is one per ACPI MCFG entry
+(`acpi::mcfg`, read with the other tables in `platform.rs`, logged as
+`[patina] acpi: mcfg @ <table>: ecam <base> segment S bus A-B`). QEMU q35 has
+ECAM 0xb0000000 for buses 0-255; Cloud Hypervisor (from its source) has
+0xe8000000 for bus 0 per segment. Without an MCFG but with a full,
+non-hardware-reduced FADT and a working 0xCF8 probe (QEMU `pc`), the host uses
+the legacy port mechanism. On aarch64 it is the DTB's
+`pci-host-ecam-generic` node, parsed before the heap: `reg`, `bus-range`,
+`linux,pci-domain`, `ranges` (first 32-bit and 64-bit memory windows),
+`interrupt-map` with `interrupt-map-mask` (up to 64 entries; the parent
+phandle's `#address-cells`/`#interrupt-cells` are honoured), and the first
+`msi-map` entry's device-id offset. The ECAM window is mapped once (2 MiB
+blocks). Enumeration starts at the first bus and follows bridges whose
+secondary bus is already programmed; nothing is renumbered. Memory BARs are
+sized with decoding off; I/O BARs are ignored. A BAR that reads 0 is
+unassigned: QEMU `virt` with `-kernel` has no firmware, so the BAR gets an
+address from the 32-bit window (the 64-bit window as a fallback for 64-bit
+BARs). The address is bump-allocated past every BAR that is already assigned,
+aligned to the BAR's size, written, and verified by read-back. SeaBIOS (q35
+and pc) and Cloud Hypervisor assign BARs themselves. On x86 no window is known
+(no `_CRS`), so a device whose needed BAR is unassigned is skipped with a log
+line. COMMAND gets memory space and bus master set, plus INTx disable when
+MSI-X is used.
+
+**Transport** (`drivers/virtio/pci.rs`, `PciTransport: Transport`). It
+handles vendor 0x1af4, devices 0x1000-0x107f: device type = id − 0x1040 for
+modern ids, else the subsystem id for transitional devices. It uses only the
+modern vendor capabilities (common, notify with `notify_off_multiplier`, ISR,
+device cfg; the first of each type), so legacy I/O BAR0 is never touched, and
+a device without them is skipped. Behaviour:
+- 64-bit common-cfg fields are written as two 32-bit halves.
+- `queue_notify_off` is read per queue at `queue_setup`. The doorbell is
+  notify base + off × multiplier, written as a 16-bit queue index.
+- Writing status 0 waits up to 100 ms for the reset to read back 0.
+- Reading the ISR acks it, and deasserts INTx.
+
+**Interrupt seam: no change for drivers.** `Device { transport, irq:
+Option<IrqLine> }`, `IrqLine { irq, edge, active_low }` and `attach_irq(line,
+cb)` are unchanged. The only addition is a defaulted
+`Transport::irq_kind() -> Option<&str>` ("msi-x"/"intx"), used only by the
+discovery line. MSI-X is set up at discovery, before any driver runs:
+- `arch::irq::alloc_msi(device_id) -> Option<MsiMsg { irq, addr, data }>`
+  reserves a vector or LPI and names it with an arch IRQ number that
+  `configure`/`register` accept. The transport writes the message to MSI-X
+  table entry 0 and unmasks it. MSI-X is enabled with the function mask
+  held while the entry is written. The `IrqLine` handed to the driver is
+  `{ irq: msg.irq, edge: true }`.
+- The device is told to use vector 0 for every queue (`queue_msix_vector`,
+  written in `queue_setup`) and for config changes (`msix_config`, written
+  with `DRIVER_OK`, because a reset clears both). Each write is read back
+  and a refusal (0xffff) is logged.
+- `ack_interrupt` reports `INT_VRING` when the ISR reads 0 under MSI-X:
+  Cloud Hypervisor never sets the queue bit with MSI-X.
+
+Per platform:
+- **x86_64**: `alloc_msi` takes a free vector from 0x30-0x7f with a no-op
+  handler until `register`. The IRQ number is `MSI_IRQ_BASE` (0x100) +
+  vector (q35 shows `irq 304` = vector 0x30). The message is address
+  0xFEE00000 | (boot CPU APIC id << 12), data = vector (fixed, edge).
+  `register` for such a number only installs the handler; the I/O APIC is
+  not touched. INTx on x86 would need the DSDT `_PRT` (AML), so it is not
+  done: a function without MSI-X is registered without an IRQ.
+- **aarch64**: Cloud Hypervisor's virtio-pci has no INTx at all. The
+  interrupt pin is 0, `interrupt-map` is empty, and only `VirtioInterruptMsix`
+  exists (`virtio-devices/src/transport/pci_device.rs`). Under KVM that MSI-X
+  is delivered through the GICv3 ITS (`msi-parent`/`msi-map` to an
+  `arm,gic-v3-its` node). On MSHV it uses a GICv2m frame instead. Both are
+  implemented:
+  - `arch/aarch64/its.rs`, a minimal ITS driver. It sets up LPIs on the boot
+    CPU's redistributor: `GICR_PROPBASER` with IDbits 14, a configuration
+    byte of priority 0x80 | group 1 | enable, and a zeroed 64 KiB
+    `GICR_PENDBASER`, then `EnableLPIs`. On the ITS it sets up a one-page
+    command queue and flat device and collection tables. For the
+    `GITS_BASER` page size it takes what the ITS keeps after asking for
+    4 KiB: KVM's ITS only implements 64 KiB pages, QEMU's takes 4 KiB. Then
+    MAPC collection 0 → the boot CPU (redistributor PA or processor number,
+    per `GITS_TYPER.PTA`) and SYNC. Each MSI gets MAPD (ITT of 2 events),
+    MAPTI event 0 → the next LPI (8192+), INV and SYNC, polled to
+    completion. The message is address `GITS_TRANSLATER`, data 0.
+  - `v2m.rs`: `MSI_TYPER` or the DTB `arm,msi-base-spi`/`arm,msi-num-spis`
+    give the SPI range. The message is address `MSI_SETSPI_NS`, data = SPI
+    INTID, edge.
+  - `gic::ack` now passes LPI INTIDs through instead of treating them as
+    special, and `irq::register` keeps LPI handlers in a separate 64-entry
+    table.
+  - INTx is the fallback when neither exists, or when forced with
+    `patina.pci.irq=intx`. The pin is looked up in the `interrupt-map`,
+    which already encodes the slot swizzle for root-bus devices, giving a
+    level SPI. Shared lines work through `attach_irq`, which calls every
+    callback on the line.
+
+QEMU `virt` has an ITS under TCG and a v2m frame (SPIs 80-143) under hvf,
+so both MSI paths are exercised on this host.
+
+**Scripts**: `PATINA_VIRTIO=pci` makes `run-qemu.sh` add
+`virtio-serial-pci` / `virtio-rng-pci` (same ports) instead of the `-device`
+variants, using a `$vsuf` suffix. This is now the default for x86
+`pc`/`q35`, and microvm refuses it. `PATINA_VIRTIO_PCI_OPTS` appends device
+properties, for example `,disable-legacy=on` for modern-only ids 0x1040+.
+The default devices are transitional and work as is.
+
+**Verified on QEMU 11.1.2**:
+- aarch64 `virt`:
+  - hvf v2m MSI-X: test-ctl 8/8 (also with `PATINA_CPUS=4` and
+    `disable-legacy=on`), test-hello, and fileio over `hvc0`.
+  - TCG ITS LPIs: test-ctl 8/8, test-hello, fileio over `hvc0`.
+  - INTx with `patina.pci.irq=intx`: fileio over `hvc0` on SPIs 36/37, and a
+    shared SPI 36 with console at slot 1 and rng at slot 5.
+- x86_64 q35 (MCFG ECAM, MSI-X): test-ctl 8/8 (also 4 CPUs), test-hello,
+  and fileio over `hvc0`.
+- x86_64 `pc` (port 0xCF8, MSI-X): test-ctl 8/8.
+
+Interrupt delivery was confirmed with a temporary first-interrupt log in
+`virtio::dispatch`: the ctl tests otherwise also pass on the control
+thread's 250 ms poll.
+
+**Untested**: Cloud Hypervisor on both arches. That covers MCFG bus 0 at
+0xe8000000, 64-bit BARs above RAM, the 512 KiB BAR0 that holds the
+capabilities and the MSI-X table, the KVM ITS with 64 KiB table pages, the
+MSHV v2m DTB override, and `msi-map` offsets for segment > 0. Not done:
+x86 INTx (`_PRT`), bridge renumbering, the swizzle for INTx behind bridges,
+per-queue MSI-X vectors, and LPIs targeted at CPUs other than the boot CPU.
