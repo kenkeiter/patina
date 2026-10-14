@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -60,6 +62,9 @@ func cmdBuild(args []string, stdout, stderr io.Writer) (int, error) {
 }
 
 func cmdImage(args []string, stdout, stderr io.Writer) (int, error) {
+	if len(args) > 0 && args[0] == "pack" {
+		return cmdImagePack(args[1:], stdout, stderr)
+	}
 	if len(args) == 0 || args[0] != "inspect" {
 		return 0, usagef("usage: patina image inspect <image.patina> [--json]")
 	}
@@ -126,6 +131,42 @@ func cmdImage(args []string, stdout, stderr io.Writer) (int, error) {
 				time.Unix(h.MTime, 0).UTC().Format("2006-01-02 15:04"), h.Name, extra)
 		}
 	})
+}
+
+// cmdImagePack bundles an already-built kernel and initrd (no Go build) into
+// a .patina image. Hidden (not in the usage text): scripts/run-qemu.sh uses it
+// to run its raw kernel + initrd under `patina run --vmm vz`.
+func cmdImagePack(args []string, stdout, stderr io.Writer) (int, error) {
+	fs := newFlagSet("image pack", stderr, "patina image pack --kernel <path> --initrd <cpio> --target <vmm>-<arch> -o <out.patina> [--name n]")
+	kernel := fs.String("kernel", "", "kernel artifact `path` (required)")
+	initrd := fs.String("initrd", "", "newc initrd `cpio` (required)")
+	tgt := fs.String("target", "", "target `vmm-arch` (required)")
+	out := fs.String("o", "", "output `file` (required)")
+	name := fs.String("name", "", "image name (default: the output file name without .patina)")
+	pos, pass, err := parseArgs(fs, args)
+	if err != nil {
+		return 0, err
+	}
+	if len(pos) != 0 || pass != nil {
+		return 0, usagef("unexpected arguments")
+	}
+	if *kernel == "" || *initrd == "" || *tgt == "" || *out == "" {
+		return 0, usagef("--kernel, --initrd, --target and -o are required")
+	}
+	t, err := target.Parse(*tgt)
+	if err != nil {
+		return 0, usagef("%v", err)
+	}
+	n := *name
+	if n == "" {
+		n = strings.TrimSuffix(filepath.Base(*out), ".patina")
+	}
+	m := &image.Manifest{Name: n, Arch: t.Arch, VMM: t.VMM, Target: t.String(), Created: time.Now().UTC(), CLI: version}
+	if err := image.Write(*out, m, *kernel, *initrd); err != nil {
+		return 0, err
+	}
+	fmt.Fprintf(stdout, "packed %s: %s for %s\n", *out, m.Name, m.Target)
+	return 0, nil
 }
 
 func cmdRun(args []string, stdout, stderr io.Writer) (int, error) {
