@@ -19,7 +19,10 @@
 use core::arch::global_asm;
 
 use super::start_info::{self, MEMMAP_ACPI, MEMMAP_NVS, MEMMAP_RAM};
-use super::{KERNEL_VA_BASE, console, exceptions, gdt, kernel_load_phys, kernel_size, paging};
+use super::{
+    KERNEL_VA_BASE, console, cpu, entry, exceptions, gdt, kernel_load_phys, kernel_size, paging,
+    percpu, pic, timer,
+};
 use crate::bootinfo::{BootInfo, MemKind, MemoryMap, PhysRange, PlatformInfo};
 use crate::mm::{PhysAddr, frame, heap, page_align_down, page_align_up};
 use crate::sync::OnceCell;
@@ -247,9 +250,14 @@ fn console_port(cmdline: &str) -> (u16, &'static str) {
 /// boot stack. Never returns.
 #[unsafe(no_mangle)]
 pub extern "C" fn early_main(start_info_pa: usize) -> ! {
+    timer::record_boot_tsc();
     paging::adopt_boot_tables();
     gdt::init();
+    percpu::init_boot_cpu();
     exceptions::init();
+    pic::disable();
+    cpu::init_features();
+    entry::init_syscall();
 
     // SAFETY: on the boot tables, called once.
     let parsed = unsafe { start_info::parse(start_info_pa) };
@@ -297,6 +305,14 @@ pub extern "C" fn early_main(start_info_pa: usize) -> ! {
     if let Some((s, e)) = si.initrd {
         crate::kprintln!("[patina] early:   module 0 (initrd) {:#x}-{:#x}", s, e);
     }
+    let (fsgs, smap, fp, xsize) = cpu::features_summary();
+    crate::kprintln!(
+        "[patina] early: cpu: {}, {}, fp state {} ({} bytes), syscall/sysret on, per-cpu GS",
+        fsgs,
+        smap,
+        fp,
+        if xsize != 0 { xsize } else { 512 }
+    );
     if si.memmap_len == 0 {
         panic!(
             "PVH start_info has no memmap (start_info version {}): cannot discover RAM",

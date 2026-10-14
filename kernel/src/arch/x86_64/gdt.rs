@@ -98,6 +98,12 @@ fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
     (low, high)
 }
 
+/// The boot CPU's TSS (its `rsp[0]` is updated by `cpu::set_kernel_stack`).
+/// Phase 2: one GDT/TSS per CPU.
+pub(super) fn boot_tss() -> *mut Tss {
+    CPU0.tss.get()
+}
+
 #[repr(C, packed)]
 struct DescriptorPtr {
     limit: u16,

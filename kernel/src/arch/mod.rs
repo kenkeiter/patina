@@ -137,6 +137,7 @@
 //! * other user sync exceptions → `trap::user_exception(..)`;
 //! * timer IRQ (from user or kernel mode) → `trap::timer_tick(..)`;
 //! * every return to user mode → `trap::before_return_to_user(..)`.
+//!
 //! Kernel-mode faults remain fatal (register dump + panic), on a stack that
 //! survives a kernel stack overflow (per-CPU overflow stack on aarch64,
 //! IST1 on x86_64).
