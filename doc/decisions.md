@@ -198,3 +198,87 @@ A kernel panic prints `[patina] panic: <message> at <file>:<line>`, then
 `[patina] exit code 255`, and powers off (`panic::PANIC_EXIT_CODE`).
 Design §10.2 reserves 255 for kernel panics; the `{"ev":"panic"}`
 control-channel event is added in Phase 3 when the channel exists.
+
+## D19: x86_64 kernel window maps physical 0, image linked at +2 MiB
+*2026-10-14 · Phase 0*
+
+On x86_64 the top-2 GiB window is Linux-style: `KERNEL_VA_BASE + pa → pa`
+for the first GiB, the image is linked at `KERNEL_VA_BASE + 0x20_0000` and
+loaded at physical 0x20_0000 (the ELF `p_paddr` is physical, `p_vaddr` the
+high VA, so PVH loaders in QEMU/Firecracker/Cloud Hypervisor place it
+correctly). `arch::kernel_load_phys()` therefore returns the fixed
+`KERNEL_LOAD_PHYS = 0x20_0000`, whereas on aarch64 `KERNEL_VA_BASE` maps the
+(variable) load address itself; `mm::kernel_virt_to_phys` has a per-arch
+`cfg` for this. The ELF `e_entry` is unused; the `.note.Xen`
+`XEN_ELFNOTE_PHYS32_ENTRY` note carries the physical 32-bit entry
+(`_start32`), stored as an 8-byte desc like Linux (QEMU reads a u64,
+linux-loader a u32).
+
+## D20: x86_64 QEMU machine is `microvm`; `pc`/`q35` via `PATINA_MACHINE`
+*2026-10-14 · Phase 0*
+
+PVH boot works on `-M microvm` with QEMU 11.1.2, so the design's choice
+stands and no fallback to `pc` was needed. `scripts/run-qemu.sh` takes
+`PATINA_MACHINE=pc|q35` as an override (both boot and exit cleanly); `-cpu
+host` is used only when `PATINA_ACCEL` is `kvm`/`hvf`, otherwise `-cpu max`.
+`microvm` has no ACPI PM port and no i8042, so without `isa-debug-exit` a
+guest cannot power itself off; the script always adds the device.
+
+## D21: x86_64 mapping granularity and direct-map coverage
+*2026-10-14 · Phase 0*
+
+The kernel image is mapped with 4 KiB pages (`.text` R-X, `.rodata` and the
+note R+NX, data/bss/stack RW+NX, boot-stack guard page unmapped). The direct
+map uses 2 MiB pages where aligned and 4 KiB at the edges, RW+NX+global; 1 GiB
+pages are not used because not every VMM CPU model advertises them. It covers
+memmap RAM, ACPI and NVS entries, the whole low 1 MiB (RSDP scan, future AP
+trampoline) and the initrd range — the latter explicitly because QEMU/qboot
+places the initrd's last page inside an e820 "reserved" entry. After
+`frame::init` all 256 kernel-half PML4 slots are pre-populated so Phase 1 user
+address spaces can copy the upper half. The boot-time identity map of the low
+4 GiB lives only in the asm boot tables and is dropped at the CR3 switch in
+`early_main`, before `frame::init`; no Rust code relies on it. `map_device`
+calls made before the final tables exist only record ranges below 4 GiB
+(already reachable through the boot direct map) and are replayed uncached
+(PCD|PWT) into the final tables; LAPIC/IOAPIC (0xfee00000/0xfec00000) are not
+in the direct map and must be mapped with `map_device`.
+
+## D22: `hvm_start_info` handling
+*2026-10-14 · Phase 0*
+
+The cmdline (NUL-terminated, copied into a static 4 KiB buffer because the
+heap does not exist yet), module 0 (the initrd), `rsdp_paddr` and the memmap
+(start_info v1+) are read through the boot direct map; structures above 4 GiB
+are rejected. A v0 start_info or one with no memmap entries panics with
+"PVH start_info has no memmap ...: cannot discover RAM" instead of guessing
+RAM (untested; some Firecracker versions may need an e820/CMOS fallback
+later). On this QEMU `rsdp_paddr` is 0 on `microvm`, `pc` and `q35`, so a
+later phase must scan 0xE0000–0xFFFFF for the RSDP; `microvm`'s memmap has no
+ACPI-type entries.
+
+## D23: x86_64 poweroff order
+*2026-10-14 · Phase 0*
+
+`arch::power::poweroff` tries, in order: (1) `isa-debug-exit` — probe
+`inb(0xf4) != 0xff` (QEMU's device reads as 0, an absent port as 0xff), then
+`outb(0xf4, code)`; QEMU exits with status `(code << 1) | 1`, which the
+scripts ignore in favour of the serial sentinel; (2) ACPI PM1a S5 for
+`pc`-class machines, `outw(0x604, 0x2000)`, with no table parsing; (3) i8042
+reset `outb(0x64, 0xfe)`, which is how Firecracker terminates a guest; (4)
+`cli; hlt` loop. Cloud Hypervisor's ACPI shutdown (needs FADT/DSDT) and
+`microvm`'s GED sleep register are out of scope. The port-I/O `asm!` blocks
+are deliberately not `nomem` so they act as compiler barriers.
+
+## D24: x86_64 GDT/TSS/IDT layout fixed for Phase 1
+*2026-10-14 · Phase 0*
+
+Selectors: 0x08 kernel code64, 0x10 kernel data, 0x18 user code32 (DPL3, the
+`SYSRET` base), 0x20 user data (DPL3), 0x28 user code64 (DPL3), 0x30 TSS
+(16-byte descriptor); `STAR` should be `[47:32] = 0x08`, `[63:48] = 0x18|3`.
+The TSS is static with `iomap_base = 104`, `rsp0 = 0` (set per thread in
+Phase 1) and IST1 = a 16 KiB static double-fault stack; only `#DF` uses an
+IST. The IDT has 256 gates, 0–31 present (DPL0, selector 0x08), 32–255 not
+present; `TrapFrame` is 176 bytes and an `iretq` return path exists. CR4 =
+PAE|PGE|OSFXSR|OSXMMEXCPT, EFER = LME|NXE, CR0 = PE|MP|NE|WP|PG;
+`flush_tlb_all` toggles CR4.PGE on the local CPU only. `cpu::id()` returns 0
+until per-CPU GS lands.

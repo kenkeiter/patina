@@ -97,3 +97,8 @@ be revisited in later phases.
 - **`uart_16550` / `arm_pl011`:** the PL011 and 16550-MMIO (with `reg-shift`
   / `reg-io-width`) transmit paths are small in-tree drivers in
   `kernel/src/arch/aarch64/console.rs` (transmit only, polled).
+- **`x86_64` / `raw-cpuid` / `x2apic` / `uart_16550` (x86 port):** Phase 0
+  needs only port I/O, a GDT/TSS/IDT, CR/MSR writes and a 4-level page-table
+  walker, all in-tree under `kernel/src/arch/x86_64/` (no crates added by the
+  x86_64 port). `raw-cpuid`/`x2apic` become relevant with SMP and the APIC
+  timer in Phase 2.

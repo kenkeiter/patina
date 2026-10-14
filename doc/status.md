@@ -48,7 +48,7 @@ Test names used below (all aarch64, release profile unless noted):
 
 - [x] Cargo workspace (`members = ["kernel", "crates/*"]`, `default-members = ["crates/*"]`), toolchain pinned to 1.99.0 with both bare-metal targets — **build-a64**
 - [x] `patina-kernel` builds for `aarch64-unknown-none` (release and dev) — **build-a64**, **dev-profile**, **clippy-a64**
-- [~] `patina-kernel` builds for `x86_64-unknown-none` — see x86_64 below
+- [x] `patina-kernel` builds for `x86_64-unknown-none` — **build-x86** (see x86_64 below)
 - [x] Per-arch linker script selected by `kernel/build.rs` (`src/arch/<arch>/linker.ld`); aarch64 script verified — **build-a64**
 - [x] `panic = "abort"` in both profiles; release keeps debug info (`debug = true`), `out/kernel-aarch64.elf` carries symbols — **build-a64**
 - [x] Host-testable crates under `crates/` (`patina-abi`, `patina-ctlproto`, `patina-cmdline`, `patina-cpio`); they are not yet used by the kernel
@@ -81,18 +81,37 @@ Test names used below (all aarch64, release profile unless noted):
 
 ### x86_64
 
-TODO(supervisor): replace this block with x86_64 results once the parallel bring-up is verified.
+Test names (all QEMU 11.1.2 `-M microvm -accel tcg -cpu max`, release profile unless noted):
 
-All items below are in progress and unverified; no results are claimed.
+| Name | Command | Observed |
+|---|---|---|
+| **build-x86** | `scripts/build-kernel.sh x86_64`; `llvm-readelf -l -n out/kernel-x86_64-pvh.elf` | three `PT_LOAD` segments at physical 0x200000/0x20c000/0x20f000 (vaddr 0xffffffff802xxxxx, R E / R / RW), one `PT_NOTE` with owner `Xen` type 0x12 desc = 0x200000 (`_start32`) |
+| **boot-x86** | `scripts/run-qemu.sh x86_64` | `[patina] early: console 16550 @ port 0x3f8 ... start_info @ 0x1580 v1 ... memmap 6 entries`, the raw PVH memmap, `final page tables live (7 pool pages, ...), identity map dropped, NX on`, banner `[patina] patina-kernel 0.1.0 (x86_64)`, memory map (8 KiB firmware = start_info/cmdline/memmap, 628 KiB reserved low memory, kernel 448 KiB at 0x200000, 510 MiB usable), `platform: pvh start_info @ 0x1580`, `frames: 128369 free / 130671 total`, `[patina] exit code 0`; QEMU terminated by isa-debug-exit, script exit 0 in under a second |
+| **initrd-args-x86** | `scripts/run-qemu.sh x86_64 t.cpio -- foo=bar -- a b%20c` | `initrd: 0x1ffff000-0x1ffff200 (512 bytes)`, `params: [..., "foo=bar"]`, `argv: ["/app","a","b c"]`; a 3 MB initrd also reported correctly |
+| **selftest-panic-x86** | `... -- patina.selftest=panic` | exit 255 |
+| **selftest-fault-x86** | `... -- patina.selftest=fault` | `unhandled exception: #PF page fault (vector 14)`, `error code 0x0 (not present, read, kernel mode)`, `CR2 0xffffdeadbeef0000`, RIP/CS/RFLAGS/RSP/SS/CR3 + GPR dump, panic, exit 255 |
+| **selftest-alloc-x86** | `... -- patina.selftest=alloc` | `selftest alloc: ok`, exit 0 |
+| **mem-sizes-x86** | `PATINA_MEM=128` / `PATINA_MEM=4096` | 32391 frames / memmap `0x100000000-0x140000000 ram` shown as `1 GiB usable`, 1047887 frames; a temporary test wrote and read back PA 0x13ffff000 through the direct map |
+| **cpus-x86** | `PATINA_CPUS=2 scripts/run-qemu.sh x86_64` | boots and exits 0 (APs never started) |
+| **double-fault-x86** | temporary (uncommitted) stack-recursion test | `#DF double fault` dump on IST1, exit 255 (no triple fault) |
+| **machines-x86** | `PATINA_MACHINE=pc` / `q35` | both boot and exit 0 with initrd; on `pc` without `isa-debug-exit` the probe read 0xff and QEMU still exited through the ACPI 0x604 / i8042 fallback (which of the two is unknown); `microvm` without `isa-debug-exit` hangs until the timeout (no PM port, no i8042) |
+| **smoke-both** | `scripts/smoke.sh` | `PASS aarch64`, `PASS x86_64`, exit 0 |
+| **dev-profile-x86** | `scripts/build-kernel.sh x86_64 --debug`, then boot + selftests | boots; `alloc` ok, `fault` shows the CR2 dump |
+| **clippy-x86** | `cargo clippy -p patina-kernel --target x86_64-unknown-none` | 0 warnings (aarch64 re-run: still 0) |
 
-- [~] `patina-kernel` builds for `x86_64-unknown-none`; `out/kernel-x86_64-pvh.elf`
-- [~] PVH `ELFNOTE` (`XEN_ELFNOTE_PHYS32_ENTRY`), 32-bit protected-mode entry → long mode
-- [~] Higher-half kernel at `KERNEL_VA_BASE` + direct map at `PHYS_OFFSET`, 4-level paging, NX
-- [~] `hvm_start_info`: memory map, cmdline, module list (initrd)
-- [~] 16550 console at port 0x3f8
-- [~] IDT with register dump on fatal exceptions
-- [~] Poweroff via `isa-debug-exit` with ACPI / i8042 fallback
-- [~] `scripts/run-qemu.sh x86_64` (`-M microvm -accel tcg -cpu max`) and `scripts/smoke.sh x86_64`
+- [x] `patina-kernel` builds for `x86_64-unknown-none` (release and dev); `out/kernel-x86_64-pvh.elf` — **build-x86**, **dev-profile-x86**, **clippy-x86**
+- [x] PVH `ELFNOTE` (`XEN_ELFNOTE_PHYS32_ENTRY`) in a `PT_NOTE` segment; `p_paddr` = physical load address — **build-x86**, loaded by QEMU in **boot-x86**
+- [x] 32-bit protected-mode entry → long mode (`arch/x86_64/boot.rs`: boot GDT, 4-level boot tables, PAE/LME/NXE/PG) — **boot-x86**
+- [x] Higher-half kernel window at `KERNEL_VA_BASE` (image linked at `KERNEL_VA_BASE + 0x200000`), direct map of all RAM at `PHYS_OFFSET` (2 MiB pages, RW+NX, > 4 GiB covered), identity map dropped at the CR3 switch — **boot-x86**, **mem-sizes-x86**
+- [x] Final kernel tables with per-section permissions (`.text` R-X, `.rodata` R+NX, data/bss RW+NX) and an unmapped boot-stack guard page — **boot-x86** (log line); permissions not separately probed
+- [x] `hvm_start_info` (v1): memmap — **boot-x86**, **mem-sizes-x86**; cmdline — **initrd-args-x86**; modlist (initrd = module 0) — **initrd-args-x86**; `rsdp_paddr` recorded (0 on this QEMU)
+- [~] `hvm_start_info` v0 / no memmap: deliberately panics with a clear message; untested (no such VMM here)
+- [x] GDT (kernel/user selectors), TSS with IST1 for `#DF`, IDT with 32 exception gates and full register dump — **selftest-fault-x86**, **double-fault-x86**
+- [x] 16550 console at port 0x3f8 (`console=ttyS0`) — **boot-x86**
+- [x] Poweroff via `isa-debug-exit` (probe `inb(0xf4) != 0xff`) — **boot-x86**; ACPI PM1a 0x604 S5 / i8042 reset fallback — **machines-x86** on `pc` (one of the two worked; untested individually)
+- [ ] Cloud Hypervisor ACPI shutdown (FADT/DSDT) and microvm GED sleep register: not implemented
+- [x] `scripts/run-qemu.sh x86_64` (`-M microvm -accel tcg -cpu max`, `PATINA_MACHINE` override) and `scripts/smoke.sh x86_64` — **boot-x86**, **smoke-both**
+- [ ] SMP: APs are never started (Phase 2)
 
 ### Scripts and docs
 
@@ -104,13 +123,14 @@ All items below are in progress and unverified; no results are claimed.
 ## Per-target matrix
 
 `V` verified (named test) · `U` untested (code written to the spec, never
-booted) · `—` not applicable · `?` x86_64, in progress.
+booted) · `—` not applicable.
 
 | Target | boot | console | poweroff | initrd |
 |---|---|---|---|---|
 | QEMU `virt` aarch64, HVF | V **boot-hvf** | V PL011 | V PSCI HVC | V **initrd-args** |
 | QEMU `virt` aarch64, TCG | V **boot-tcg**, **el2-drop** | V PL011 | V PSCI HVC / SMC | V (same DTB path; **initrd-args** run on HVF) |
-| QEMU `microvm` x86_64, TCG | ? | ? | ? | ? |
+| QEMU `microvm` x86_64, TCG | V **boot-x86** | V 16550 port 0x3f8 | V isa-debug-exit | V **initrd-args-x86** |
+| QEMU `pc` / `q35` x86_64, TCG | V **machines-x86** | V 16550 | V isa-debug-exit; ACPI/i8042 fallback (one of them) | V **machines-x86** |
 | Firecracker aarch64 | U (no KVM on this host) | U 16550 MMIO | U PSCI | U |
 | Firecracker x86_64 | U | U | U | U |
 | Cloud Hypervisor aarch64 | U | U 16550 MMIO | U PSCI | U |
