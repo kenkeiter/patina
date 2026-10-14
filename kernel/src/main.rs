@@ -36,6 +36,18 @@ pub fn exit(code: i32) -> ! {
     arch::power::poweroff(code)
 }
 
+/// The process was terminated by signal `sig` (`SIG_DFL` terminate/core):
+/// print `[patina] exit signal <NAME>` (the future control-channel `exit`
+/// event's `signal` field, design §10) and exit with `128 + sig` through
+/// the normal exit path.
+pub fn exit_signal(sig: i32) -> ! {
+    match patina_abi::signal::name(sig) {
+        Some(n) => kprint!("\n[patina] exit signal {}\n", n),
+        None => kprint!("\n[patina] exit signal {}\n", sig),
+    }
+    exit(128 + sig)
+}
+
 fn human(bytes: usize) -> alloc::string::String {
     const KIB: usize = 1024;
     const MIB: usize = 1024 * KIB;

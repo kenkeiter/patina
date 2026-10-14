@@ -322,8 +322,42 @@ pub fn ipi_reschedule() {
     }
 }
 
+/// A signal became pending for `t` (and `t` does not block it): make sure
+/// `t` notices it promptly (called by `task::signal` after the pending bit
+/// is published, any context, any lock but the runqueue's).
+/// * blocked interruptibly → woken with `WakeReason::Interrupted`;
+/// * current on this CPU → nothing: delivery runs on its way back to user
+///   mode (`trap::before_return_to_user`);
+/// * runnable → nothing: it passes through the same path when it runs;
+/// * running on another CPU → [`kick_remote`] (Phase 2 SMP: IPI).
+pub fn kick(t: &Arc<Thread>) {
+    if let Some(seq) = t.interruptible_seq() {
+        wake(t, seq, super::WakeReason::Interrupted);
+        return;
+    }
+    if t.state() == ThreadState::Running {
+        let flags = irq::save_disable();
+        // SAFETY: IRQs masked, this CPU's data.
+        let here =
+            unsafe { (*this_cpu().current.get()).as_ref() }.is_some_and(|c| Arc::ptr_eq(c, t));
+        irq::restore(flags);
+        if !here {
+            kick_remote(t);
+        }
+    }
+}
+
+/// `t` is running on another CPU and has a new deliverable signal.
+/// Phase 2 SMP: `arch::smp::send_ipi(cpu_of(t), IpiKind::Reschedule)` so
+/// the target CPU passes through `before_return_to_user` (signal delivery)
+/// promptly; on the uniprocessor scheduler this cannot happen.
+pub fn kick_remote(_t: &Arc<Thread>) {
+    // Phase 2 SMP: send_ipi(cpu, Reschedule)
+}
+
 /// Hook for `trap::before_return_to_user` (IRQs masked): run a pending
-/// reschedule. Phase 2: signal delivery follows here.
+/// reschedule. Signal delivery (`task::signal::deliver`) follows it in
+/// `trap::before_return_to_user`.
 pub fn before_return_to_user() {
     if is_running() && this_cpu().need_resched.load(Ordering::Relaxed) {
         schedule();

@@ -229,6 +229,20 @@ impl Default for FpState {
     }
 }
 
+impl FpState {
+    /// The raw XSAVE (standard format) / FXSAVE image (signal frames).
+    pub fn bytes(&self) -> &[u8; FP_STATE_SIZE] {
+        &self.0
+    }
+
+    /// Mutable raw image; must stay a valid XSAVE/FXSAVE image before it
+    /// is passed to [`fp_restore`] (reserved header bytes zero, XSTATE_BV
+    /// within XCR0, MXCSR reserved bits clear).
+    pub fn bytes_mut(&mut self) -> &mut [u8; FP_STATE_SIZE] {
+        &mut self.0
+    }
+}
+
 impl fmt::Debug for FpState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("FpState { .. }")

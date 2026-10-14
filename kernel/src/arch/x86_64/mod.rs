@@ -35,6 +35,7 @@ mod percpu;
 mod pic;
 pub mod port;
 pub mod power;
+pub mod sigframe;
 mod start_info;
 pub mod timer;
 pub mod uspace;

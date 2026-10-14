@@ -125,11 +125,26 @@ pub fn dispatch(frame: &mut TrapFrame) {
         }
         proc::exit_group(a[0]);
     }
+    // rt_sigreturn rebuilds the whole frame (return register included).
+    if n == nr::RT_SIGRETURN {
+        if strace {
+            trace(n, &a, None);
+        }
+        signal::rt_sigreturn(frame);
+        return;
+    }
 
     let r = call(n, &a, frame);
     let ret = match r {
         Ok(v) => v,
-        Err(e) => e.to_ret(),
+        Err(e) => {
+            // Internal restart codes are resolved by signal delivery on
+            // the way out (`task::signal::deliver`).
+            if task::signal::is_restart(e.0) {
+                task::current().restart.store(e.0, Ordering::Relaxed);
+            }
+            e.to_ret()
+        }
     };
     if strace {
         trace(n, &a, Some(ret));
@@ -169,11 +184,17 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         // signal.rs
         nr::RT_SIGACTION => signal::rt_sigaction(i(0), u(1), u(2), u(3)),
         nr::RT_SIGPROCMASK => signal::rt_sigprocmask(i(0), u(1), u(2), u(3)),
-        nr::SIGALTSTACK => signal::sigaltstack(u(0), u(1)),
-        nr::RT_SIGRETURN => signal::rt_sigreturn(frame),
+        nr::SIGALTSTACK => signal::sigaltstack(u(0), u(1), frame.sp()),
         nr::KILL => signal::kill(i(0), i(1)),
         nr::TGKILL => signal::tgkill(i(0), i(1), i(2)),
-        nr::TKILL => signal::tgkill(1, i(0), i(1)),
+        nr::TKILL => signal::tkill(i(0), i(1)),
+        nr::RT_SIGPENDING => signal::rt_sigpending(u(0), u(1)),
+        nr::RT_SIGSUSPEND => signal::rt_sigsuspend(u(0), u(1)),
+        nr::RESTART_SYSCALL => signal::restart_syscall(),
+        #[cfg(target_arch = "x86_64")]
+        nr::PAUSE => signal::pause(),
+        // Go does not use these; queued-info signals are not supported.
+        nr::RT_SIGTIMEDWAIT | nr::RT_SIGQUEUEINFO | nr::RT_TGSIGQUEUEINFO => enosys(n),
 
         // proc.rs
         nr::GETPID => Ok(task::process().pid as isize),
