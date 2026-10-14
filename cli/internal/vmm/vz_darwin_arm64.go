@@ -291,6 +291,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -343,6 +344,7 @@ type vzDarwin struct {
 	events *os.File // read end of the event pipe
 	serial *os.File // read end of the console pipe
 	copied chan struct{}
+	lastRx atomic.Int64 // UnixNano of the last console read
 
 	vmMu    sync.RWMutex // held shared while calling into the VM, exclusively by free
 	mu      sync.Mutex
@@ -412,10 +414,7 @@ func vzStart(ctx context.Context, cfg *Config, spec *VZSpec) (Machine, error) {
 		conns: map[*vzConn]struct{}{}, waited: make(chan struct{})}
 	// ew stays open (the shim writes to its descriptor) until waitLoop has
 	// freed the VM; holding the *os.File keeps its finalizer away.
-	go func() {
-		io.Copy(cfg.Serial, sr)
-		close(m.copied)
-	}()
+	go m.copyConsole()
 	if C.vz_start(h, &cerr) != 0 {
 		err := fmt.Errorf("vz: %w", cstrErr(cerr))
 		m.free()
@@ -463,18 +462,66 @@ func (m *vzDarwin) waitLoop(ew *os.File) {
 		break
 	}
 	m.waitRes = ex
+	stopped := time.Now()
 	m.free()
-	// Drain the console. The framework does not reliably close its end of
-	// the pipe when the VM is released (EOF came in ~1 of 10 runs), so give
-	// in-flight output a short grace and stop reading.
-	select {
-	case <-m.copied:
-	case <-time.After(250 * time.Millisecond):
-		m.serial.SetReadDeadline(time.Now())
-		<-m.copied
-	}
+	m.drainConsole(stopped)
 	m.serial.Close()
 	m.events.Close()
+}
+
+// Console drain bounds: the framework does not reliably close its end of
+// the console pipe when the VM is released (EOF came in ~1 of 10 runs), so
+// after the stop event the console is read until it has been quiet for
+// consoleQuiet (the guest's last lines are normally in the pipe already:
+// its console driver waits for the device to consume them before
+// poweroff), and never longer than consoleDrainMax.
+const (
+	consoleQuiet    = 20 * time.Millisecond
+	consoleDrainMax = 250 * time.Millisecond
+)
+
+func (m *vzDarwin) drainConsole(stopped time.Time) {
+	deadline := stopped.Add(consoleDrainMax)
+	for {
+		last := time.Unix(0, m.lastRx.Load())
+		if last.Before(stopped) {
+			last = stopped
+		}
+		quietAt := last.Add(consoleQuiet)
+		if quietAt.After(deadline) {
+			quietAt = deadline
+		}
+		d := time.Until(quietAt)
+		if d <= 0 {
+			break
+		}
+		select {
+		case <-m.copied:
+			return
+		case <-time.After(d):
+		}
+	}
+	m.serial.SetReadDeadline(time.Now())
+	<-m.copied
+}
+
+// copyConsole copies guest console output to cfg.Serial, noting when data
+// last arrived (drainConsole).
+func (m *vzDarwin) copyConsole() {
+	defer close(m.copied)
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := m.serial.Read(buf)
+		if n > 0 {
+			m.lastRx.Store(time.Now().UnixNano())
+			if _, werr := m.cfg.Serial.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func (m *vzDarwin) wait() (*Exit, error) {

@@ -160,6 +160,27 @@ impl Mux {
 }
 
 impl MuxTx {
+    /// Send an ARP request for `tpa` from `spa`. Used once a DHCP lease is
+    /// applied, for the gateway: the target of a request creates an entry
+    /// for the sender (RFC 826; BSD `in_arpinput`), so a host's first packet
+    /// to us is not lost to its own ARP resolution. Apple VZ NAT (macOS)
+    /// drops that packet, which cost every first connection a 1 s SYN
+    /// retransmit.
+    pub fn arp_request(&mut self, spa: Ipv4Addr, tpa: Ipv4Addr) {
+        let mac = self.mac;
+        let f = &mut self.buf[..ETH_HDR + 28];
+        f[..6].fill(0xff);
+        f[6..12].copy_from_slice(&mac);
+        f[12..14].copy_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+        // htype 1, ptype IPv4, hlen 6, plen 4, op 1 (request).
+        f[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+        f[22..28].copy_from_slice(&mac);
+        f[28..32].copy_from_slice(&spa.octets());
+        f[32..38].fill(0);
+        f[38..42].copy_from_slice(&tpa.octets());
+        self.route(ETH_HDR + 28);
+    }
+
     /// Route the frame in `self.buf[..len]`.
     fn route(&mut self, len: usize) {
         let MuxTx {
@@ -285,6 +306,17 @@ impl Device for Mux {
     fn transmit(&mut self, _now: Instant) -> Option<TxToken<'_>> {
         if self.tx.lo.is_full() {
             return None;
+        }
+        // Likewise while the NIC's transmit ring is full: a token would
+        // make `route` drop the frame, which costs TCP a retransmission
+        // timeout (smoltcp's minimum RTO is 1 s; a 4 MiB send over VZ NAT
+        // stalled for 1 s in about half the runs). Without a token smoltcp
+        // keeps the data; the driver's transmit-completion interrupt wakes
+        // the net task to poll again.
+        if let Some(n) = self.tx.nic.as_mut() {
+            if !n.can_send() {
+                return None;
+            }
         }
         Some(TxToken(&mut self.tx))
     }

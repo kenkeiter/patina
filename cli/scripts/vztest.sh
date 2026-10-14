@@ -6,10 +6,23 @@
 #   cli/scripts/vztest.sh [-test.run regexp] [-test.v] ...
 #   PATINA_VZ_PROBE=1 cli/scripts/vztest.sh -test.run TestVZProbeDTB -test.v
 #
+# With --e2e it instead runs the CLI end-to-end tests against the real kernel
+# (cli/vz_integration_test.go: hello exit codes, ctl stop/ping, --net user
+# + HTTP from the host at the guest's DHCP address). They build their own
+# signed CLI; the kernel must be built (scripts/build-kernel.sh aarch64).
+#
+#   cli/scripts/vztest.sh --e2e [go test flags...]     (default: -v)
+#
 # macOS on Apple Silicon only.
 set -euo pipefail
 
 cli=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ ${1:-} == --e2e ]]; then
+  shift
+  cd "$cli"
+  [[ $# -gt 0 ]] || set -- -v
+  PATINA_VZ_E2E=1 exec go test -count=1 -timeout 20m -run 'TestVZ(BootHello|E2E)' "$@" .
+fi
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/patina-vztest.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 

@@ -4,6 +4,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -69,5 +70,101 @@ func TestDialVZWithoutDialer(t *testing.T) {
 	}
 	if s := (Endpoint{Kind: KindVZ, Port: Port}).String(); s != "vz vsock port 4242" {
 		t.Fatalf("String() = %q", s)
+	}
+}
+
+// Before the first connection the hub retries fast: a guest that exits
+// within milliseconds of listening must still be reached.
+func TestHubFirstDialRetryIsFast(t *testing.T) {
+	var mu sync.Mutex
+	fails := 20
+	ep := Endpoint{Kind: KindVZ, Port: Port, Dialer: func(time.Duration) (net.Conn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fails > 0 {
+			fails--
+			return nil, net.ErrClosed
+		}
+		a, _ := net.Pipe()
+		return a, nil
+	}}
+	t0 := time.Now()
+	h, err := NewHub(filepath.Join(shortDir(t), "hub.sock"), ep, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	select {
+	case <-h.Connected():
+	case <-time.After(5 * time.Second):
+		t.Fatal("never connected")
+	}
+	// 20 failures at 100 ms would take 2 s; at 5 ms, ~100 ms.
+	if d := time.Since(t0); d > time.Second {
+		t.Fatalf("connected after %v", d)
+	}
+}
+
+// Quiesce returns at once when the upstream never attached.
+func TestHubQuiesceNeverConnected(t *testing.T) {
+	ep := Endpoint{Kind: KindVZ, Port: Port, Dialer: func(time.Duration) (net.Conn, error) {
+		return nil, net.ErrClosed
+	}}
+	h, err := NewHub(filepath.Join(shortDir(t), "hub.sock"), ep, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	time.Sleep(20 * time.Millisecond)
+	t0 := time.Now()
+	if !h.Quiesce(time.Second) {
+		t.Fatal("Quiesce timed out")
+	}
+	if d := time.Since(t0); d > 100*time.Millisecond {
+		t.Fatalf("Quiesce took %v", d)
+	}
+}
+
+// Quiesce waits until events already sent on the connection (the exit
+// event before poweroff) have reached OnEvent.
+func TestHubQuiesceDeliversBufferedEvents(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	used := false
+	guest := make(chan net.Conn, 1)
+	ep := Endpoint{Kind: KindVZ, Port: Port, Dialer: func(time.Duration) (net.Conn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if used {
+			return nil, net.ErrClosed // the VM is gone
+		}
+		used = true
+		a, b := net.Pipe()
+		guest <- b
+		return a, nil
+	}}
+	h, err := NewHub(filepath.Join(shortDir(t), "hub.sock"), ep, func(e *Event) {
+		time.Sleep(20 * time.Millisecond) // a slow consumer
+		mu.Lock()
+		seen = append(seen, e.Ev)
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	g := <-guest
+	go func() {
+		g.Write([]byte(`{"ev":"ready","go":"go1.27","cpus":1}` + "\n" + `{"ev":"exit","code":3}` + "\n"))
+		g.Close()
+	}()
+	<-h.Connected()
+	if !h.Quiesce(2 * time.Second) {
+		t.Fatal("Quiesce timed out")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(seen, ",") != "ready,exit" {
+		t.Fatalf("seen %v", seen)
 	}
 }

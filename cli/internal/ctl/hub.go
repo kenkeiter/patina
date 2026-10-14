@@ -27,7 +27,19 @@ type Hub struct {
 	done      chan struct{}
 	connected chan struct{} // closed on first successful upstream connection
 	connOnce  sync.Once
+	quiesce   chan struct{} // closed by Quiesce: no new upstream dials
+	quiOnce   sync.Once
+	loopDone  chan struct{} // closed when upstreamLoop returns
 }
+
+// Upstream dial retry intervals: fast until the first connection (a guest
+// that exits within milliseconds of listening must still be reached before
+// it powers off; a refused connect costs ~1 ms on Apple VZ, less on a Unix
+// socket), then slower for reconnects.
+const (
+	firstDialRetry = 5 * time.Millisecond
+	redialRetry    = 100 * time.Millisecond
+)
 
 // NewHub listens on listenPath and starts connecting to upstream (retrying
 // until Close). onEvent is called for every guest event, from one goroutine.
@@ -44,6 +56,8 @@ func NewHub(listenPath string, upstream Endpoint, onEvent func(*Event)) (*Hub, e
 		clients:   map[net.Conn]struct{}{},
 		done:      make(chan struct{}),
 		connected: make(chan struct{}),
+		quiesce:   make(chan struct{}),
+		loopDone:  make(chan struct{}),
 	}
 	go h.acceptLoop()
 	go h.upstreamLoop()
@@ -69,22 +83,51 @@ func (h *Hub) forward(line []byte) error {
 	return up.WriteLine(line)
 }
 
+// Quiesce stops dialing the upstream and waits (at most timeout) until the
+// connection that is up, if any, has ended and every event it carried has
+// been delivered to OnEvent. `patina run` calls it once the VM is gone, so
+// it waits exactly as long as buffered events (the exit event) need, and
+// not at all when the channel never attached.
+func (h *Hub) Quiesce(timeout time.Duration) bool {
+	h.quiOnce.Do(func() { close(h.quiesce) })
+	select {
+	case <-h.loopDone:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func (h *Hub) quiescing() bool {
+	select {
+	case <-h.done:
+		return true
+	case <-h.quiesce:
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *Hub) upstreamLoop() {
+	defer close(h.loopDone)
+	retry := firstDialRetry
 	for {
-		select {
-		case <-h.done:
+		if h.quiescing() {
 			return
-		default:
 		}
 		c, err := Dial(h.upstream, 2*time.Second)
 		if err != nil {
 			select {
 			case <-h.done:
 				return
-			case <-time.After(100 * time.Millisecond):
+			case <-h.quiesce:
+				return
+			case <-time.After(retry):
 			}
 			continue
 		}
+		retry = redialRetry
 		h.mu.Lock()
 		if h.closed {
 			h.mu.Unlock()

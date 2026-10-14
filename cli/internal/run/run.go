@@ -4,6 +4,7 @@
 package run
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -68,6 +69,10 @@ func Run(o Options) (int, error) {
 	// between console lines (noteWriter), never inside one.
 	sentinel := &sentinelWriter{w: o.Stdout}
 	o.Stderr = &noteWriter{s: sentinel, w: o.Stderr}
+	// The guest's DHCP address, from the kernel's lease log event or (as a
+	// fallback) its console line; printed once and kept in state.json.
+	leases := &leaseTracker{stderr: o.Stderr}
+	sentinel.onLease = leases.set
 	logw := io.Discard
 	if o.Verbose {
 		logw = o.Stderr
@@ -173,6 +178,10 @@ func Run(o Options) (int, error) {
 				close(gotExit)
 			}
 			evMu.Unlock()
+		case "log":
+			if n := parseLease(e.Msg); n != nil {
+				leases.set(n)
+			}
 		case "panic":
 			evMu.Lock()
 			panicked = true
@@ -201,9 +210,7 @@ func Run(o Options) (int, error) {
 		Upstream: mach.Control(),
 		Started:  time.Now().UTC(),
 	}
-	if err := runstate.Save(dir, st); err != nil {
-		fmt.Fprintf(o.Stderr, "patina: warning: cannot write run state: %v\n", err)
-	}
+	leases.attach(dir, st)
 	fmt.Fprintf(logw, "patina: vm %q (patina ctl %s ...)\n", name, name)
 
 	type waitRes struct {
@@ -267,10 +274,13 @@ loop:
 	if res.err != nil {
 		return 0, res.err
 	}
-	// The exit event precedes poweroff, but is read asynchronously.
+	// The exit event precedes poweroff, but is read asynchronously: wait
+	// until the control connection has delivered everything it carried
+	// (immediately when it never attached), at most 300 ms.
 	select {
 	case <-gotExit:
-	case <-time.After(300 * time.Millisecond):
+	default:
+		hub.Quiesce(300 * time.Millisecond)
 	}
 
 	evMu.Lock()
@@ -304,7 +314,11 @@ var sentinelRE = regexp.MustCompile(`^\[patina\] exit code (-?[0-9]+)\s*$`)
 // sentinelWriter passes console output through and remembers the last
 // "[patina] exit code N" line.
 type sentinelWriter struct {
-	w    io.Writer
+	w io.Writer
+	// onLease, if set, is called (outside the lock) with each
+	// "[patina] net: dhcp lease ..." console line's address.
+	onLease func(*runstate.Net)
+
 	mu   sync.Mutex
 	line []byte
 	over bool
@@ -315,6 +329,12 @@ type sentinelWriter struct {
 const maxSentinelLine = 256
 
 func (s *sentinelWriter) Write(p []byte) (int, error) {
+	var leases []*runstate.Net
+	defer func() {
+		for _, l := range leases {
+			s.onLease(l)
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n, err := s.w.Write(p)
@@ -324,9 +344,14 @@ func (s *sentinelWriter) Write(p []byte) (int, error) {
 	for _, c := range p {
 		if c == '\n' {
 			if !s.over {
-				if m := sentinelRE.FindSubmatch(trimCR(s.line)); m != nil {
+				line := trimCR(s.line)
+				if m := sentinelRE.FindSubmatch(line); m != nil {
 					if v, err := strconv.Atoi(string(m[1])); err == nil {
 						s.code = &v
+					}
+				} else if s.onLease != nil && bytes.HasPrefix(line, []byte(consoleLeasePrefix)) {
+					if l := parseLease(string(line[len(consoleLeasePrefix):])); l != nil {
+						leases = append(leases, l)
 					}
 				}
 			}
@@ -376,3 +401,49 @@ func (s *sentinelWriter) Code() *int {
 
 // ErrNoImage is returned when no image path is given.
 var ErrNoImage = errors.New("usage: patina run <image.patina> [flags] [-- args...]")
+
+// leaseTracker records the guest's DHCP lease: it prints
+// "patina: guest address A (gateway G)" when the address is first seen or
+// changes, and keeps state.json's "net" current once the run state exists.
+type leaseTracker struct {
+	stderr io.Writer
+
+	mu  sync.Mutex
+	cur *runstate.Net
+	dir string
+	st  *runstate.State
+}
+
+func (t *leaseTracker) set(n *runstate.Net) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.cur != nil && t.cur.Addr == n.Addr && t.cur.Prefix == n.Prefix && t.cur.Gateway == n.Gateway {
+		return // the event and the console line report the same lease
+	}
+	t.cur = n
+	gw := n.Gateway
+	if gw == "" {
+		gw = "none"
+	}
+	fmt.Fprintf(t.stderr, "patina: guest address %s (gateway %s)\n", n.Addr, gw)
+	t.saveLocked()
+}
+
+// attach writes the run state (with the lease, if already known) and keeps
+// it updated from now on.
+func (t *leaseTracker) attach(dir string, st *runstate.State) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.dir, t.st = dir, st
+	t.saveLocked()
+}
+
+func (t *leaseTracker) saveLocked() {
+	if t.st == nil {
+		return
+	}
+	t.st.Net = t.cur
+	if err := runstate.Save(t.dir, t.st); err != nil {
+		fmt.Fprintf(t.stderr, "patina: warning: cannot write run state: %v\n", err)
+	}
+}

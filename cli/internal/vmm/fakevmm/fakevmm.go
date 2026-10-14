@@ -24,6 +24,7 @@
 //	PATINA_FAKEVMM_SCENARIO  exit (default): ready event, console output, exit event, sentinel, power off
 //	                         serial: the guest never accepts vsock; sentinel only
 //	                         stop:   serve ping, wait for {"op":"stop"}, exit 143 (SIGTERM)
+//	                         lease:  stop, after a DHCP lease console line + log event
 //	                         mute:   print one line and spin; never accepts vsock
 //	                         silent: power off without reporting any exit code
 //	                         panic:  ready, then a panic event and power off without a sentinel
@@ -478,7 +479,7 @@ func runGuest(vmm, cmdline string, vsock net.Listener) {
 		g.scenario = "exit"
 	}
 	fmt.Printf("fake %s: booting with cmdline: %s\n", vmm, cmdline)
-	listens := g.scenario == "exit" || g.scenario == "stop" || g.scenario == "panic"
+	listens := g.scenario == "exit" || g.scenario == "stop" || g.scenario == "panic" || g.scenario == "lease"
 	if vsock != nil {
 		g.ln = vsock
 		go g.accept(vsock, listens)
@@ -516,11 +517,18 @@ func runGuest(vmm, cmdline string, vsock net.Listener) {
 		fmt.Println("fake guest: spinning")
 		<-deadline
 		os.Exit(3)
-	case "stop":
+	case "stop", "lease":
 		select {
 		case <-g.conn1:
 		case <-deadline:
 			os.Exit(3)
+		}
+		if g.scenario == "lease" {
+			// The kernel's DHCP lease, as a console line and a log event
+			// (D72; the CLI must report it once).
+			msg := "net: dhcp lease 192.168.64.3/24 via 192.168.64.1, dns 192.168.64.1, domain example.test (212 ms)"
+			fmt.Println("[patina] " + msg)
+			g.send(`{"ev":"log","level":"info","msg":"` + msg + `"}`)
 		}
 		g.send(`{"ev":"ready","go":"go-fake","cpus":1,"mem_mb":128}`)
 		fmt.Println("fake guest: waiting for stop")

@@ -192,12 +192,21 @@ fn format_into<'a>(buf: &'a mut [u8], args: fmt::Arguments<'_>) -> &'a str {
 
 /// `{"ev":"log","level":"warn","msg":...}` (e.g. the ENOSYS-once log).
 pub fn log_warn(args: fmt::Arguments<'_>) {
+    log("warn", args);
+}
+
+/// `{"ev":"log","level":"info","msg":...}` (e.g. the DHCP lease).
+pub fn log_info(args: fmt::Arguments<'_>) {
+    log("info", args);
+}
+
+fn log(level: &str, args: fmt::Arguments<'_>) {
     if TRANSPORT.load(Ordering::Relaxed) == T_NONE {
         return;
     }
     let mut b = [0u8; 256];
     let msg = format_into(&mut b, args);
-    emit_with(&Event::Log { level: "warn", msg }, 10_000_000);
+    emit_with(&Event::Log { level, msg }, 10_000_000);
 }
 
 /// `{"ev":"panic","msg":...}` from the panic handler (other CPUs stopped).
