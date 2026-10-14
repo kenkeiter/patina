@@ -36,6 +36,9 @@ use crate::task;
 /// A handler's result: the non-negative return value, or an errno.
 pub type SysResult = Result<isize, Errno>;
 
+/// fd-table access for kernel code outside `syscall` (AF_UNIX SCM_RIGHTS).
+pub use fs::{get as fd_get, install as fd_install};
+
 /// Run `f` on the current process's address space (locked).
 pub fn with_space<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
     f(&mut task::process().space.lock())

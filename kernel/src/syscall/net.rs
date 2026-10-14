@@ -6,8 +6,11 @@
 //! `msghdr`), blocking (`fs::file::wait_ready` honouring `O_NONBLOCK`,
 //! `MSG_DONTWAIT`, `SO_RCVTIMEO`/`SO_SNDTIMEO`), `MSG_WAITALL` loops,
 //! `SIGPIPE`. The socket itself is reached through `File::as_socket`
-//! (`net::socket::SocketOps`), so AF_UNIX adds a constructor in
-//! [`socket`]/[`socketpair`] and nothing else here.
+//! (`net::socket::SocketOps`); families differ only in their constructors
+//! ([`socket`]/[`socketpair`]). AF_UNIX (D71) also uses the generic hooks
+//! `SocketOps::recv_msg` (control data sized to `msg_controllen`),
+//! `max_dgram`, and `EAGAIN` from a blocking `connect` (full backlog: wait
+//! for `OUT` and retry).
 //!
 //! Interrupted waits: accept/send/recv without a timeout return
 //! `ERESTARTSYS` (restarted under `SA_RESTART`, D45), with a timeout
@@ -34,8 +37,6 @@ use crate::task::{self, WakeReason};
 
 /// Bounce-buffer size per send/recv step on streams.
 const CHUNK: usize = 64 * 1024;
-/// Largest datagram (IPv4 UDP payload limit).
-const MAX_DGRAM: usize = 65507;
 /// Largest option value / `msg_control` copied in.
 const MAX_OPT: usize = 4096;
 
@@ -175,8 +176,7 @@ pub fn socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
     let (ty, flags) = split_type(ty)?;
     let file: Arc<dyn crate::fs::file::File> = match u16::try_from(domain) {
         Ok(AF_INET | AF_INET6) => crate::net::inet::create(domain as u16, ty, protocol)?,
-        // AF_UNIX: a second SocketOps implementation slots in here.
-        Ok(AF_UNIX) => return Err(Errno(EAFNOSUPPORT)),
+        Ok(AF_UNIX) => crate::net::unix::create(ty, protocol)?,
         Ok(AF_NETLINK) => crate::net::netlink::create(ty, protocol)?,
         // AF_PACKET, AF_VSOCK, ...: not supported.
         _ => return Err(Errno(EAFNOSUPPORT)),
@@ -187,14 +187,34 @@ pub fn socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
     )
 }
 
-pub fn socketpair(domain: i32, ty: i32, _protocol: i32, _sv: usize) -> SysResult {
-    split_type(ty)?;
-    match u16::try_from(domain) {
-        Ok(AF_INET | AF_INET6) => Err(Errno(EOPNOTSUPP)),
-        // AF_UNIX socketpair arrives with the AF_UNIX implementation.
-        Ok(AF_UNIX) => Err(Errno(EAFNOSUPPORT)),
-        _ => Err(Errno(EAFNOSUPPORT)),
+pub fn socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> SysResult {
+    let (ty, flags) = split_type(ty)?;
+    let (a, b) = match u16::try_from(domain) {
+        Ok(AF_INET | AF_INET6) => return Err(Errno(EOPNOTSUPP)),
+        Ok(AF_UNIX) => crate::net::unix::pair(ty, protocol)?,
+        _ => return Err(Errno(EAFNOSUPPORT)),
+    };
+    let open = |f: Arc<dyn crate::fs::file::File>| {
+        install(
+            OpenFile::new(f, O_RDWR | (flags & O_NONBLOCK)),
+            flags & SOCK_CLOEXEC != 0,
+        )
+    };
+    let close = |fd: isize| drop(task::process().files.lock().close(fd as i32));
+    let fa = open(a)?;
+    let fb = match open(b) {
+        Ok(fd) => fd,
+        Err(e) => {
+            close(fa);
+            return Err(e);
+        }
+    };
+    if let Err(e) = with_space(|s| s.write_val(sv, &[fa as i32, fb as i32])) {
+        close(fa);
+        close(fb);
+        return Err(e);
     }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -244,12 +264,18 @@ pub fn connect(fd: i32, addr: usize, len: usize) -> SysResult {
     let of = sock(fd)?;
     let a = read_addr(addr, len)?;
     let o = ops(&of);
-    match o.connect(&a) {
-        Ok(()) => return Ok(0),
-        Err(Errno(EINPROGRESS)) if !of.flags().nonblocking() => {}
-        Err(e) => return Err(e),
-    }
     let until = deadline(o.timeouts().1);
+    loop {
+        match o.connect(&a) {
+            Ok(()) => return Ok(0),
+            Err(Errno(EINPROGRESS)) if !of.flags().nonblocking() => break,
+            // AF_UNIX with a full backlog: wait for room, then retry.
+            Err(Errno(EAGAIN)) if !of.flags().nonblocking() => {
+                wait(&of, EpollFlags::OUT | EpollFlags::WRNORM, until)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
     loop {
         match wait_ready(&*of.file, EpollFlags::OUT | EpollFlags::WRNORM, until) {
             WakeReason::Woken => {}
@@ -343,7 +369,7 @@ fn send_common(
     };
     let total = iov.total();
     if !o.is_stream() {
-        if total > MAX_DGRAM {
+        if total > o.max_dgram() {
             return Err(Errno(EMSGSIZE));
         }
         let mut k = vec![0u8; total];
@@ -359,13 +385,20 @@ fn send_common(
     }
     let mut k = vec![0u8; total.clamp(1, CHUNK)];
     let mut done = 0;
+    // Ancillary data goes with the first bytes sent only.
+    let mut control = control;
     loop {
         let n = iov.gather(&mut k)?;
         let mut off = 0;
         while off < n || (total == 0 && off == 0) {
             match o.send(&k[off..n], to.as_ref(), flags, control) {
                 Ok(0) if n == 0 => return Ok(0),
-                Ok(w) => off += w,
+                Ok(w) => {
+                    off += w;
+                    if w > 0 {
+                        control = &[];
+                    }
+                }
                 Err(Errno(EAGAIN)) if !nonblock => {
                     if let Err(e) = wait(of, EpollFlags::OUT | EpollFlags::WRNORM, until) {
                         return partial(done + off, e);
@@ -389,23 +422,27 @@ struct Received {
     control: Vec<u8>,
 }
 
-fn recv_common(of: &OpenFile, mut iov: Iov, flags: MsgFlags) -> Result<Received, Errno> {
+/// `room`: bytes of `msg_control` the caller offers (0: none).
+fn recv_common(of: &OpenFile, mut iov: Iov, flags: MsgFlags, room: usize) -> Result<Received, Errno> {
     let o = ops(of);
     let nonblock = of.flags().nonblocking() || flags.contains(MsgFlags::DONTWAIT);
     let until = deadline(o.timeouts().0);
     let want = EpollFlags::IN | EpollFlags::RDNORM;
     let total = iov.total();
     if !o.is_stream() {
-        let mut k = vec![0u8; total.min(MAX_DGRAM + 1)];
+        let mut k = vec![0u8; total.min(o.max_dgram() + 1)];
         loop {
-            match o.recv(&mut k, flags) {
+            match o.recv_msg(&mut k, flags, room) {
                 Err(Errno(EAGAIN)) if !nonblock => wait(of, want, until)?,
                 Err(e) => return Err(e),
-                Ok(r) => {
+                Ok((r, ctrunc)) => {
                     iov.scatter(&k[..r.len])?;
                     let mut out = MsgFlags::empty();
                     if r.full > r.len {
                         out |= MsgFlags::TRUNC;
+                    }
+                    if ctrunc {
+                        out |= MsgFlags::CTRUNC;
                     }
                     return Ok(Received {
                         ret: if flags.contains(MsgFlags::TRUNC) { r.full } else { r.len },
@@ -421,14 +458,21 @@ fn recv_common(of: &OpenFile, mut iov: Iov, flags: MsgFlags) -> Result<Received,
     let mut k = vec![0u8; total.clamp(1, CHUNK)];
     let mut got = 0;
     let mut control = Vec::new();
+    let mut out = MsgFlags::empty();
     loop {
         let n = (total - got).min(k.len());
-        match o.recv(&mut k[..n], flags) {
-            Ok(r) => {
+        match o.recv_msg(&mut k[..n], flags, room) {
+            Ok((r, ctrunc)) => {
                 iov.scatter(&k[..r.len])?;
                 got += r.len;
-                if control.is_empty() {
+                if ctrunc {
+                    out |= MsgFlags::CTRUNC;
+                }
+                // Ancillary data ends a receive (Linux stops after the
+                // data that carried it, even under MSG_WAITALL).
+                if !r.control.is_empty() || ctrunc {
                     control = r.control;
+                    break;
                 }
                 if r.len == 0 || !waitall || got >= total {
                     break;
@@ -456,7 +500,7 @@ fn recv_common(of: &OpenFile, mut iov: Iov, flags: MsgFlags) -> Result<Received,
     Ok(Received {
         ret: got,
         from: None,
-        flags: MsgFlags::empty(),
+        flags: out,
         control,
     })
 }
@@ -479,6 +523,7 @@ pub fn recvfrom(fd: i32, buf: usize, len: usize, flags: u32, addr: usize, alenp:
         &of,
         Iov::new(vec![(buf, len.min(isize::MAX as usize))]),
         MsgFlags::from_bits_retain(flags),
+        0,
     )?;
     if addr != 0 && alenp != 0 {
         match &r.from {
@@ -513,7 +558,8 @@ pub fn recvmsg(fd: i32, msg: usize, flags: u32) -> SysResult {
         return Err(Errno(EINVAL));
     }
     let iov = Iov::new(read_iov(m.msg_iov as usize, m.msg_iovlen as usize)?);
-    let r = recv_common(&of, iov, MsgFlags::from_bits_retain(flags))?;
+    let room = if m.msg_control != 0 { m.msg_controllen as usize } else { 0 };
+    let r = recv_common(&of, iov, MsgFlags::from_bits_retain(flags), room)?;
     let mut out = r.flags;
     if m.msg_name != 0 {
         match &r.from {

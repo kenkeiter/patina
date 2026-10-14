@@ -10,12 +10,11 @@
 //! `MSG_WAITALL` looping and `SIGPIPE`. An implementation only provides
 //! non-blocking primitives that return `EAGAIN` when they would block.
 //!
-//! Today the only implementation is `net::inet::InetSocket` (AF_INET /
-//! AF_INET6, TCP and UDP over smoltcp). AF_UNIX plugs in as a second
-//! implementor: decode its address from [`SockAddr::Unix`], implement these
-//! methods, and add it to `syscall::net::socket`/`socketpair`. Ancillary
+//! Implementations: `net::inet::InetSocket` (AF_INET / AF_INET6, TCP and
+//! UDP over smoltcp) and `net::unix::UnixSocket` (AF_UNIX, D71). Ancillary
 //! data (SCM_RIGHTS) reaches [`SocketOps::send`] as the raw `msg_control`
-//! bytes and leaves [`SocketOps::recv`] through [`RecvInfo::control`].
+//! bytes (passed with the first chunk of a stream send only) and leaves
+//! [`SocketOps::recv_msg`] through [`RecvInfo::control`].
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -78,6 +77,23 @@ pub trait SocketOps: Send + Sync {
     ) -> Result<usize, Errno>;
     /// Receive into `buf` (`MSG_PEEK`, `MSG_TRUNC` honoured here).
     fn recv(&self, buf: &mut [u8], flags: MsgFlags) -> Result<RecvInfo, Errno>;
+    /// `recvmsg`: [`SocketOps::recv`] with `room` bytes of `msg_control`
+    /// available (0 for `recvfrom`/`read`). The implementation fits its
+    /// control data to `room` itself (SCM_RIGHTS installs only the fds that
+    /// fit) and returns whether anything was cut (`MSG_CTRUNC`).
+    fn recv_msg(
+        &self,
+        buf: &mut [u8],
+        flags: MsgFlags,
+        _room: usize,
+    ) -> Result<(RecvInfo, bool), Errno> {
+        self.recv(buf, flags).map(|r| (r, false))
+    }
+    /// Largest datagram `send` accepts (`EMSGSIZE` above it; also sizes
+    /// the receive bounce buffer). Default: the IPv4 UDP payload limit.
+    fn max_dgram(&self) -> usize {
+        65507
+    }
     fn shutdown(&self, how: i32) -> Result<(), Errno>;
     fn local_addr(&self) -> Result<SockAddr, Errno>;
     fn peer_addr(&self) -> Result<SockAddr, Errno>;
