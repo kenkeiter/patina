@@ -271,5 +271,6 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
         umask: core::sync::atomic::AtomicU32::new(0o022),
     });
     let t0 = task::create_thread0(frame);
+    crate::ctl::ready(patina_loader::buildinfo::go_version(file).unwrap_or(""));
     task::start_thread0(t0)
 }

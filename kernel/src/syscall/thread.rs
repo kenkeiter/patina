@@ -123,7 +123,7 @@ pub fn futex(uaddr: usize, op: i32, val: u32, timeout: usize, val3: u32) -> SysR
                     // Relative, CLOCK_MONOTONIC.
                     timer::now_ns().saturating_add(ns)
                 } else if realtime {
-                    ns.saturating_sub(task::process().epoch_ns)
+                    ns.saturating_sub(crate::wallclock::epoch_ns())
                 } else {
                     ns
                 })

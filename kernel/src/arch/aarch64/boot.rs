@@ -415,10 +415,11 @@ pub extern "C" fn early_main(dtb_phys: usize, load_phys: usize) -> ! {
         gic::set_desc(g);
     }
     timer::early_init(plat.timer_virt_intid);
+    super::devices::record(&plat);
 
     // ---- Console: `console=` on the cmdline picks the UART type when it
     // names one we drive (ttyAMA0 = PL011, ttyS0 = 16550); otherwise (absent,
-    // hvc0 = virtio-console which is not driven yet) the DTB decides:
+    // or hvc0 = virtio-console, which `drivers` switches to later) the DTB decides:
     // stdout-path, else the first UART node.
     let want = crate::cmdline::param(plat.bootargs, "console");
     let want_kind = match want {
@@ -468,6 +469,11 @@ pub extern "C" fn early_main(dtb_phys: usize, load_phys: usize) -> ! {
             plat.dtb_size,
             load_phys
         );
+    }
+
+    if want.is_some_and(|c| c.starts_with("hvc")) {
+        // virtio-console comes up later; keep the boot log for it.
+        crate::console::start_early_ring();
     }
 
     // ---- Memory map.

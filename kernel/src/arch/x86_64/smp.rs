@@ -126,6 +126,29 @@ struct FwBuf(core::cell::UnsafeCell<[u8; FWCFG_BUF]>);
 unsafe impl Sync for FwBuf {}
 static FW_TABLES: FwBuf = FwBuf(core::cell::UnsafeCell::new([0; FWCFG_BUF]));
 
+/// fw_cfg's ACPI tables as a blob (`etc/acpi/tables` followed by
+/// `etc/acpi/rsdp`) and the RSDP's offset in it. Boot CPU only, during
+/// early boot (shares the static buffer with [`enumerate`]).
+pub(super) fn fwcfg_acpi() -> Option<(acpi::Blob<'static>, u64)> {
+    if !fwcfg::present() {
+        return None;
+    }
+    let (rsel, rsize) = fwcfg::find_file("etc/acpi/rsdp")?;
+    let (tsel, tsize) = fwcfg::find_file("etc/acpi/tables")?;
+    // SAFETY: single-threaded boot; `enumerate` is done with the buffer.
+    let buf = unsafe { &mut *FW_TABLES.0.get() };
+    let n = fwcfg::read_item(tsel, tsize, 0, &mut buf[..FWCFG_BUF - 64]);
+    let rn = fwcfg::read_item(rsel, rsize, 0, &mut buf[n..n + 36]);
+    // SAFETY: as above; the blob is only read from now on.
+    let blob: &'static [u8] = unsafe { &(&*FW_TABLES.0.get())[..n + rn] };
+    Some((acpi::Blob(blob), n as u64))
+}
+
+/// The RSDP that `enumerate` used (0 if none / fw_cfg).
+pub(super) fn rsdp_addr() -> u64 {
+    RSDP_ADDR.load(Ordering::Relaxed)
+}
+
 fn try_fwcfg_madt(out: &mut CpuList) -> Option<u64> {
     if !fwcfg::present() {
         return None;

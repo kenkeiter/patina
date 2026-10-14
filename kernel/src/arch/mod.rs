@@ -241,6 +241,34 @@
 //! }
 //! ```
 //!
+//! Phase 3 additions (device interrupts and discovery for `drivers/`,
+//! decisions D58/D59/D64):
+//!
+//! ```text
+//! pub mod irq {
+//!     /// Trigger mode / polarity of device interrupt `irq` (GIC INTID on
+//!     /// aarch64, GSI on x86_64), before `register`.
+//!     pub fn configure(irq: u32, edge: bool, active_low: bool);
+//!     /// Route `irq` to the boot CPU, unmask it and call `handler(irq)`
+//!     /// for it with IRQs masked (then EOI). Works before the scheduler
+//!     /// starts (aarch64 initializes the GIC on demand; x86 the I/O APIC).
+//!     pub fn register(irq: u32, handler: fn(u32));
+//! }
+//! pub mod devices {
+//!     /// virtio-mmio regions the platform describes (aarch64: DTB nodes;
+//!     /// x86_64: `virtio_mmio.device=` params, DSDT `LNRO0005`, probe).
+//!     pub fn virtio_mmio(cmdline: &patina_cmdline::Cmdline) -> Vec<drivers::MmioDesc>;
+//! }
+//! pub mod cpu {
+//!     /// Barrier before a device doorbell (aarch64 `dsb sy`, x86 `mfence`).
+//!     pub fn io_barrier();
+//! }
+//! pub mod power {
+//!     /// x86_64: isa-debug-exit, ACPI S5 from the FADT, i8042 reset (D64).
+//!     pub fn poweroff(code: i32) -> !;
+//! }
+//! ```
+//!
 //! Entry paths the arch must provide (all end by restoring `frame`):
 //! * syscall (`SVC #0` / `SYSCALL`+`SYSRET` with `swapgs` and the per-CPU
 //!   kernel stack) → `trap::syscall(&mut frame)`;

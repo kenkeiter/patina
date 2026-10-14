@@ -700,6 +700,13 @@ pub fn ipi_stop() -> ! {
     halt_this_cpu()
 }
 
+/// Whether some CPU has started the VM exit ([`stop_other_cpus`] ran):
+/// device code on the exit/panic path may then break locks a stopped CPU
+/// still holds.
+pub fn exiting() -> bool {
+    EXIT_OWNER.load(Ordering::SeqCst) != 0
+}
+
 /// Stop every other CPU before the VM exits (exit_group, `crate::exit`,
 /// panic): the first caller sends `Stop` and waits up to 10 ms for the
 /// others to halt, then returns; a later caller on another CPU halts

@@ -17,8 +17,10 @@ buddy_system_allocator = { version = "0.13", default-features = false }
 patina-abi = { path = "../crates/abi" }
 patina-cmdline = { path = "../crates/cmdline" }
 patina-cpio = { path = "../crates/cpio" }
+patina-ctlproto = { path = "../crates/ctlproto" }
 patina-fsutil = { path = "../crates/fsutil" }
 patina-loader = { path = "../crates/loader" }
+patina-rand = { path = "../crates/rand" }
 patina-vfs = { path = "../crates/vfs" }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]

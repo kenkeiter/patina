@@ -1253,3 +1253,213 @@ from the frame allocator, `procs` = live threads and `mem_unit` 1.
 0. The `xattr` family gives `EOPNOTSUPP`. `inotify_*`, `memfd_create`,
 `pidfd_open`, `kcmp`, `seccomp`, `*_mempolicy` and `ioprio_*` remain
 `ENOSYS` (logged once). Go handles all of these.
+## D58: virtio is in-tree behind a `Transport` trait; no `virtio-drivers`
+*2026-10-14 · Phase 3*
+
+`kernel/src/drivers/virtio/` (audit in doc/crates.md). Design §11 names
+`virtio-drivers`; version 0.13.0 was read and not adopted: it brings
+`safe-mmio`, `zerocopy`/`thiserror`/`enumn` with three proc-macro chains, its
+console is single-port (the `patina.ctl` port needs the multiport control
+queue), and our transmit paths must run with IRQs masked and from the
+panic/exit path with bounded polling, which is easier to guarantee in about
+600 lines we own. Its structure was kept: `virtio::Transport` is a trait
+(device type, status, 64-bit features, queue setup with
+desc/avail/used addresses, notify, read+ack interrupt status, config space
+with generation retry) implemented by `mmio::MmioTransport` for legacy
+(version 1: GuestPageSize, QueueAlign/QueuePFN) and modern (version 2:
+QueueDesc/Driver/Device, QueueReady, FEATURES_OK checked,
+`VIRTIO_F_VERSION_1` required) registers. QEMU 11 `virt` and `microvm` default
+to legacy (`virtio-mmio.force-legacy=true`); modern was run with `-global
+virtio-mmio.force-legacy=false` (aarch64: ready/ping/stop OK). `queue::VirtQueue`
+is a split ring always laid out the legacy way (descriptors + avail from a
+4 KiB boundary, used ring on the next page, ≤ 128 entries, 8 KiB), which
+both versions accept, with a release fence before publishing `avail.idx`, an
+acquire fence after reading `used.idx` and `arch::cpu::io_barrier()`
+(`dsb sy` / `mfence`) before the doorbell. DMA memory (`DmaBuf`) is whole
+frames from the frame allocator through the direct map; bus addresses are
+physical (no IOMMU anywhere we run). Discovery registers each transport in
+a registry (`register_transport(Device { transport, irq }, source)`) that
+prints `[patina] virtio: mmio @ 0x… irq N device-id K (name) [source,
+version, vendor, edge|level irq]`; drivers `take(device_type)` and anything
+left (net until Phase 4) stays listed and undriven. Phase 4's virtio-net
+and the later virtio-pci transport plug in at exactly these points:
+virtio-pci implements `Transport` and calls `register_transport`; virtio-net
+calls `take(DEVICE_NET)`, `negotiate`, `VirtQueue::new`, `driver_ok`, and
+`attach_irq(line, callback)`.
+
+## D59: virtio-mmio discovery per platform; device IRQ routing (GIC SPIs, x86 I/O APIC)
+*2026-10-14 · Phase 3*
+
+`arch::devices::virtio_mmio(&Cmdline) -> Vec<MmioDesc>` (pa, size, irq,
+edge, active_low, source). aarch64: every enabled `compatible =
+"virtio,mmio"` DTB node, `interrupts` = GIC triple (SPI n → INTID 32 + n,
+flags 1/2 edge, 4/8 level); QEMU `virt` lists 32 transports, empty ones
+(device id 0) are skipped silently. x86_64, merged in this order and
+de-duplicated by base: `virtio_mmio.device=<size>@<base>:<gsi>[:<id>]`
+parameters (parsed by `patina-cmdline`; QEMU microvm with `acpi=off`,
+Firecracker; edge, active-high), then the DSDT's `LNRO0005` devices, then —
+only if both are empty and there is no DSDT at all — a probe of
+0xFEB00000 + 512·n for the magic with the GSI guessed as 5 + n. The DSDT is
+found RSDP → RSDT/XSDT → FADT (X_DSDT preferred) and byte-scanned, not
+interpreted: after each `LNRO0005` string the next Memory32Fixed (`86 09
+00`) and Extended Interrupt descriptor (`89 len 00 flags n gsi`, bit 1 =
+edge, bit 2 = active-low) before the next `LNRO`. All ACPI reading happens
+in `early_main` on the boot tables (`arch/x86_64/platform.rs`), RSDP from
+start_info, then the BIOS-area scan, then fw_cfg. Observed on this host
+(QEMU 11.1.2): microvm with ACPI on (the CLI default) has qboot's tables at
+an RSDP in the BIOS area (0xf5590), two I/O APICs (GSI 0-23, 24-47), a
+hardware-reduced FADT and a 420-473-byte DSDT with the two devices at
+0xfeb02e00 (console, GSI 47) and 0xfeb02c00 (rng, GSI 46), **Level,
+active-high**; with `acpi=off` QEMU appends
+`virtio_mmio.device=512@0xfeb00e00:12 virtio_mmio.device=512@0xfeb00c00:11`
+after `--` and the cmdline path takes them (edge). pc/q35 have a DSDT with
+no `LNRO0005` and no virtio-mmio bus: the kernel finds none. Routing:
+`arch::irq::configure(irq, edge, active_low)` + `register(irq, fn(u32))` on
+both arches. aarch64: the GIC is initialized on first use if `timer::init`
+has not run yet, `GICD_ICFGR` is set from the DTB flags, the SPI is routed
+to the registering (boot) CPU. x86_64 (`ioapic.rs`): I/O APICs from MADT
+type 1 (default 0xFEC00000, GSI 0 without ACPI), all pins masked at first
+use, interrupt source overrides (type 2) for ISA IRQs; `register` takes a
+vector from 0x30-0x7f (new IDT stubs), programs fixed delivery, physical
+destination = CPU 0's APIC id, the configured trigger/polarity, unmasked.
+The device stub saves FS like the timer/IPI paths (the return path may
+switch threads), calls the handler with IRQs masked, then sends the LAPIC
+EOI, which is also the I/O APIC EOI for level pins. Handlers only read+ack
+the transport's InterruptStatus and signal a driver `Event` (flag + wait
+queue); queue processing happens in the woken kernel thread, which always
+re-polls all queues, so an edge is never lost and a level line is quiet
+before EOI. With `PATINA_CPUS=4` device IRQs still go to CPU 0 while the
+scheduler runs everywhere (test-runtime 1/4 CPUs and test-ctl pass).
+
+## D60: The kernel RNG is a ChaCha20 DRBG seeded from virtio-rng (replaces D35)
+*2026-10-14 · Phase 3*
+
+`crates/rand` (`patina-rand`, in-tree, no dependencies, RFC 8439 and RFC
+7693 test vectors): `Drbg` hashes all inputs into a BLAKE2s pool; `reseed`
+sets `key = BLAKE2s(old key ‖ pool digest)` and restarts the pool keyed by
+that digest; `fill` uses ChaCha20 (nonce 0) with fast key erasure (block 0
+becomes the next key, blocks 1.. are output, the key changes every call).
+`kernel/src/random.rs` keeps `random::fill(&mut [u8])` (getrandom,
+AT_RANDOM, the VFS worker's /dev/urandom). `seed_boot` (from the loader)
+mixes 64 bytes from virtio-rng (polled, bounded 100 ms, so a silent device
+does not hang the boot), up to four `cpu::hw_random` words, the boot
+counter and `patina.epoch`, then logs `[patina] random: seeded from
+virtio-rng (64 bytes) + RDSEED/RDRAND` (or the fallback, with a WARNING
+when only the boot counter was available). With virtio-rng a kernel thread
+reseeds from 32 fresh device bytes every 60 s and when `fill` reports 1 MiB
+generated since the last reseed. `fill` also stirs the clock into the pool
+(cheap, only matters for an unseeded boot). The virtio-rng driver is
+polled (no IRQ): requests are rare; a timed-out request stays outstanding
+and is collected by the next read.
+
+## D61: virtio-console multiport; `patina.ctl` by name; `hvc0` with an early ring
+*2026-10-14 · Phase 3*
+
+`drivers/virtio/console.rs`. `VIRTIO_CONSOLE_F_MULTIPORT` is accepted when
+offered; ports 0-3 get queues (port 0 = 0/1, control = 2/3, port n = 2n+2 /
+2n+3), 8 posted 512-byte rx buffers each and one 4 KiB tx buffer. Boot
+handshake, polled: DEVICE_READY; for each DEVICE_ADD answer PORT_READY (0
+for ports ≥ 4); record PORT_NAME, CONSOLE_PORT, PORT_OPEN (host side
+connected); send our PORT_OPEN for console and named ports; stop after 20 ms
+without a new control message (QEMU answers during the notify). The control
+channel finds its port by the exact name `patina.ctl` (QEMU: port 1, since
+port 0 is reserved for a `virtconsole`); later control messages (PORT_OPEN
+when a client attaches to the socket chardev, or detaches) are processed by
+the ctl thread. Transmit is bounded-synchronous: stage into the DMA buffer,
+notify, poll the used ring (100 ms for hvc0, 50 ms for ctl); a buffer the
+device has not returned stays in flight and later data is dropped until it
+returns, so a host that stops reading costs nothing. Without multiport the
+device is one console port. `console=hvc0` (both arches, QEMU
+`PATINA_CONSOLE=hvc0`): arch boot keeps its UART if the DTB/port probe has
+one and `console::start_early_ring()` also records output in an 8 KiB ring;
+when the console device is up, the first console port becomes the kernel
+console (`console::switch_to`), after replaying the ring, so hvc0 gets the
+whole boot log. The `Console` trait gained `flush()` (called after every
+print) so hvc0 sends one buffer per print, not per `\r\n`. hvc0 works with
+IRQs masked and on the exit/panic path: its tx lock is a normal lock until
+`sched::exiting()` (an exit owner exists), then taken with a bounded spin
+and force-broken, like the console lock. Verified on QEMU (both arches,
+test-ctl `hvc0` case: boot log, Go output, sentinel on hvc0 while ctl runs on
+port 1). Unverified: Apple VZ (`VZVirtioConsoleDeviceSerialPortConfiguration`,
+expected single-port or multiport with port 0 as console).
+
+## D62: virtio-vsock listener on port 4242 (UNVERIFIED)
+*2026-10-14 · Phase 3*
+
+`drivers/virtio/vsock.rs`, written against virtio 1.2 §5.10 and Linux's
+`virtio_transport_common.c`; it compiles on both arches but has never run:
+QEMU on macOS has no vhost-vsock and Firecracker/Cloud Hypervisor cannot
+run here. Stream sockets only (`VIRTIO_VSOCK_F_STREAM` accepted if
+offered), guest CID from config space (low 32 bits), rx (16 × 4 KiB posted
+buffers, header + payload in one descriptor), tx (8 × 4 KiB slots, polled),
+event queue (4-byte buffers; TRANSPORT_RESET drops the connection and
+re-reads the CID). One connection on the listening port: a new REQUEST
+replaces the current one (old peer gets RST) and is answered with
+RESPONSE; requests for other ports, foreign data and RESPONSEs get RST;
+SHUTDOWN → RST and close; RST → close. Credit: `buf_alloc` = 64 KiB,
+`fwd_cnt` counts delivered bytes, CREDIT_UPDATE after half of it was
+consumed since the last advertisement and on CREDIT_REQUEST; sends check
+`peer_buf_alloc − (tx_cnt − peer_fwd_cnt)` and, without credit, drop the
+data and send CREDIT_REQUEST. `flush` waits until the device has consumed
+every tx slot (the exit event before poweroff). The ctl layer prefers vsock
+when the device exists. The first real run (Firecracker or Cloud
+Hypervisor on a Linux host, Apple VZ) must check: the CONNECT handshake end
+to end, the header `len` for packets the device splits, and credit with a
+host that reads slowly.
+
+## D63: Control channel: one kernel thread, pending-event buffer, grace timer
+*2026-10-14 · Phase 3*
+
+`kernel/src/ctl.rs` over `patina_ctlproto` (design §10). Transport chosen
+after `drivers::init`: vsock if present, else the `patina.ctl` console port,
+else `[patina] ctl: no transport` (pc/q35). The loader calls
+`ctl::ready(go)` just before `start_thread0` (Go version from
+`.go.buildinfo` via `patina_loader::buildinfo`, `cpus` =
+`arch::smp::cpu_count()` because the APs are not online yet, `mem_mb` =
+total RAM), which also spawns the control thread. The thread waits on the
+transport's interrupt `Event` (plus a 250 ms poll), feeds bytes through
+`LineFramer<4096>` and answers: `ping` → `pong` (id, uptime); `signal` →
+`send_to_process(SigInfo::kill(sig, SI_USER, 1, 0))` for SIGTERM, SIGINT,
+SIGHUP, SIGUSR1, SIGUSR2, SIGQUIT (names with or without `SIG`, or numbers),
+anything else → `error` "signal not injectable"; `dump` → SIGQUIT; `time`
+→ `wallclock::set_now` (new `kernel/src/wallclock.rs`: an adjustable
+CLOCK_REALTIME offset read by `clock_gettime`, POSIX/itimer realtime clocks
+and futex absolute timeouts; `Process.epoch_ns` stays the boot value);
+`stop` → SIGTERM and a grace deadline (`grace_ms`, default 10 s, 0 =
+immediately) after which the thread calls `exit_with(137, None, true)`.
+`crate::exit`/`exit_signal` became one `exit_with(code, signal, forced)`:
+`stop_other_cpus` (EXIT_OWNER: a normal exit racing the forced one wins or
+loses cleanly, the loser's CPU halts), the `exit` event, the `[patina] exit
+code N` sentinel, poweroff. Events are encoded on the stack and appended to
+a 4 KiB pending buffer that is written whenever a host is connected
+(console PORT_OPEN / an accepted vsock connection) and dropped when full,
+so `ready` reaches a host that connects after boot, and a host that
+disconnects and reconnects keeps working (test-ctl `stop-handler`). `exit`
+and `panic` are written synchronously with a 100 ms bound (vsock also waits
+for the device to consume them) and use force-broken locks once exiting.
+`panic` comes from the panic handler before the dump (test-ctl `panic`);
+`log` (warn) from the ENOSYS-once path (test-ctl `ready-ping`, `signals
+-enosys`). Malformed or unknown requests get `DecodeError::reply()`; an
+over-long line gets `error` "line too long".
+The channel is unauthenticated (design §15).
+
+## D64: x86_64 poweroff order: isa-debug-exit, ACPI S5 from the FADT, i8042
+*2026-10-14 · Phase 3*
+
+`arch/x86_64/power.rs`. Cloud Hypervisor REBOOTS on an i8042 reset or the
+ACPI reset register, so the old fixed order (debug-exit, PM1a at 0x604,
+i8042) could rerun the program there. Now: (1) QEMU `isa-debug-exit` at
+0xf4 if a read does not return 0xff; (2) ACPI S5 from the FADT gathered at
+boot: hardware-reduced FADT (flag bit 20) with a SLEEP_CONTROL_REG → write
+`SLP_TYP << 2 | SLP_EN` (0x34 for S5 = 5; I/O or MMIO per the GAS: Cloud
+Hypervisor port 0x600, QEMU microvm MMIO 0xfea00200), else PM1a_CNT →
+`SLP_TYP << 10 | SLP_EN` with SLP_TYPa from the DSDT `\_S5` package (byte
+scan; QEMU pc/q35 `_S5` = 0 at 0x604); (3) the i8042 reset (Firecracker,
+which has no ACPI sleep register; never reached on Cloud Hypervisor since
+its S5 write does not return); (4) halt. Each method tried prints
+`[patina] poweroff: <method>` after the sentinel. Verified without
+isa-debug-exit: `-M pc` → `acpi s5 via pm1a_cnt (io 0x604, SLP_TYP 0)`,
+`-M microvm` → `acpi s5 via sleep control register (mem 0xfea00200,
+SLP_TYP 5)`, QEMU exits in both; with it (run-qemu.sh, CLI) microvm, pc and
+q35 exit through isa-debug-exit as before. Firecracker and Cloud Hypervisor
+are unverified.

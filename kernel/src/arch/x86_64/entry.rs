@@ -143,6 +143,10 @@ __isr\n:
     ISR_NOERR {ipi_resched}
     ISR_NOERR {ipi_stop}
     ISR_NOERR {ipi_tlb}
+    // Device interrupts (I/O APIC), vectors 0x30-0x7f.
+    .irp n, 48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127
+    ISR_NOERR \n
+    .endr
 
 __isr_common:
     PUSH_GPRS
@@ -228,6 +232,11 @@ __isr_ipi:
     .quad __isr{ipi_resched}
     .quad __isr{ipi_stop}
     .quad __isr{ipi_tlb}
+    .global __isr_dev
+__isr_dev:
+    .irp n, 48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127
+    .quad __isr\n
+    .endr
 "#,
     timer = const TIMER_VECTOR,
     spurious = const SPURIOUS_VECTOR,
@@ -257,6 +266,8 @@ unsafe extern "C" {
     pub(super) static __isr_spurious: u64;
     /// Reschedule and Stop IPI stubs.
     pub(super) static __isr_ipi: [u64; 3];
+    /// Device interrupt stubs for vectors 0x30-0x7f.
+    pub(super) static __isr_dev: [u64; 0x50];
     fn __patina_syscall_entry();
     pub(super) fn __patina_enter_user(frame: *const TrapFrame) -> !;
 }

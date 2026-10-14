@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+pub mod buildinfo;
 pub mod elf;
 pub mod stack;
 

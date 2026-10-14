@@ -15,6 +15,8 @@ mod arch;
 mod bootinfo;
 mod cmdline;
 mod console;
+mod ctl;
+mod drivers;
 mod fs;
 mod loader;
 mod mm;
@@ -26,33 +28,43 @@ mod sync;
 mod syscall;
 mod task;
 mod trap;
+mod wallclock;
 
 use alloc::format;
 
 use bootinfo::{BootInfo, PlatformInfo};
 
-/// Exit sentinel printed before poweroff; the host scripts / CLI parse it.
-/// Stops the other CPUs first (no user code runs or prints after the
-/// sentinel); if another CPU is already exiting, this CPU just halts. The
-/// sentinel goes through `panic_write_fmt`, which breaks a console lock a
-/// CPU that failed to stop might still hold.
+/// Exit with `code`: see [`exit_with`].
 pub fn exit(code: i32) -> ! {
-    task::sched::stop_other_cpus();
-    console::panic_write_fmt(format_args!("\n[patina] exit code {}\n", code));
-    arch::power::poweroff(code)
+    exit_with(code, None, false)
 }
 
 /// The process was terminated by signal `sig` (`SIG_DFL` terminate/core):
-/// print `[patina] exit signal <NAME>` (the future control-channel `exit`
-/// event's `signal` field, design §10) and exit with `128 + sig` through
-/// the normal exit path.
+/// print `[patina] exit signal <NAME>` and exit with `128 + sig`, the
+/// control-channel `exit` event carrying the name (design §10.2).
 pub fn exit_signal(sig: i32) -> ! {
     task::sched::stop_other_cpus();
-    match patina_abi::signal::name(sig) {
+    let name = patina_abi::signal::name(sig);
+    match name {
         Some(n) => console::panic_write_fmt(format_args!("\n[patina] exit signal {}\n", n)),
         None => console::panic_write_fmt(format_args!("\n[patina] exit signal {}\n", sig)),
     }
-    exit(128 + sig)
+    exit_with(128 + sig, name, false)
+}
+
+/// The one VM exit path. Stops the other CPUs first (no user code runs or
+/// prints after this; if another CPU is already exiting, this CPU just
+/// halts), emits the control-channel `exit` event and waits (bounded) for
+/// the host to get it, prints the `[patina] exit code N` sentinel the
+/// host scripts / CLI parse, and powers off. The sentinel goes through
+/// `panic_write_fmt`, which breaks a console lock a CPU that failed to
+/// stop might still hold. `forced`: a control-channel `stop` whose grace
+/// period ran out.
+pub fn exit_with(code: i32, signal: Option<&str>, forced: bool) -> ! {
+    task::sched::stop_other_cpus();
+    ctl::emit_exit(code, signal, forced);
+    console::panic_write_fmt(format_args!("\n[patina] exit code {}\n", code));
+    arch::power::poweroff(code)
 }
 
 fn human(bytes: usize) -> alloc::string::String {
@@ -141,6 +153,9 @@ pub fn kernel_main(bi: &'static BootInfo) -> ! {
         human(heap_used),
         human(heap_total)
     );
+
+    drivers::init(&cl);
+    ctl::init((bi.memory.total_bytes() >> 20) as u64);
 
     selftest::run(bi.cmdline);
 

@@ -55,6 +55,11 @@ fn enosys(n: usize) -> SysResult {
             n,
             current::syscall_name(n).unwrap_or("?")
         );
+        crate::ctl::log_warn(format_args!(
+            "ENOSYS {} ({})",
+            n,
+            current::syscall_name(n).unwrap_or("?")
+        ));
     }
     Err(Errno(ENOSYS))
 }

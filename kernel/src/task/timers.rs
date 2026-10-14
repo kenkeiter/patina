@@ -75,7 +75,7 @@ impl Clock {
     /// Current value in ns; `None` if the clock's thread has exited.
     pub fn now(&self) -> Option<u64> {
         match self {
-            Clock::Realtime => Some(timer::now_ns() + super::process().epoch_ns),
+            Clock::Realtime => Some(timer::now_ns() + crate::wallclock::epoch_ns()),
             Clock::Monotonic => Some(timer::now_ns()),
             Clock::ThreadCpu(w) => w
                 .upgrade()
@@ -461,7 +461,7 @@ fn run(wait: bool) {
                 continue;
             }
             let now = match &t.clock {
-                Clock::Realtime => Some(mono + super::process().epoch_ns),
+                Clock::Realtime => Some(mono + crate::wallclock::epoch_ns()),
                 Clock::Monotonic => Some(mono),
                 Clock::ProcessCpu => Some(proc_now()),
                 c @ Clock::ThreadCpu(_) => c.now(),

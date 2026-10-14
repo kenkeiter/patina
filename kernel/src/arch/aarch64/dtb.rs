@@ -10,6 +10,19 @@ use super::power::Conduit;
 
 pub const MAX_RANGES: usize = 32;
 pub const MAX_UARTS: usize = 8;
+/// virtio-mmio nodes recorded (QEMU `virt` has 32 transports).
+pub const MAX_VIRTIO: usize = 64;
+
+/// A `compatible = "virtio,mmio"` node.
+#[derive(Clone, Copy, Debug)]
+pub struct VirtioDesc {
+    pub base: usize,
+    pub size: usize,
+    /// GIC INTID (SPI n = 32 + n, PPI n = 16 + n).
+    pub intid: u32,
+    /// `interrupts` flags say edge-triggered (IRQ_TYPE_EDGE_*).
+    pub edge: bool,
+}
 
 /// Fixed-capacity list of physical ranges `(start, end)`.
 pub struct Ranges {
@@ -75,6 +88,8 @@ pub struct Platform {
     /// enabled and use `enable-method = "psci"` (or name none), in DT order.
     pub cpus: [u64; MAX_DT_CPUS],
     pub ncpus: usize,
+    /// virtio-mmio transports, in DT order.
+    pub virtio: [Option<VirtioDesc>; MAX_VIRTIO],
 }
 
 /// CPU nodes recorded from the DTB (more are counted but ignored).
@@ -123,6 +138,7 @@ pub unsafe fn parse(va: usize) -> Result<Platform, DtbError> {
         psci_cpu_on: None,
         cpus: [0; MAX_DT_CPUS],
         ncpus: 0,
+        virtio: [None; MAX_VIRTIO],
     };
 
     for node in fdt.all_nodes() {
@@ -211,6 +227,18 @@ pub unsafe fn parse(va: usize) -> Result<Platform, DtbError> {
         };
     }
     parse_cpus(&fdt, &mut p);
+    let mut nv = 0;
+    for n in fdt.all_nodes() {
+        if nv < MAX_VIRTIO
+            && !is_disabled(&n)
+            && n.compatible()
+                .is_some_and(|c| c.all().any(|c| c == "virtio,mmio"))
+            && let Some(v) = virtio_from_node(&n)
+        {
+            p.virtio[nv] = Some(v);
+            nv += 1;
+        }
+    }
     p.gic = gic_from_fdt(&fdt);
     p.timer_virt_intid = fdt
         .find_compatible(&["arm,armv8-timer", "arm,armv7-timer"])
@@ -288,6 +316,29 @@ fn gic_from_fdt(fdt: &Fdt<'static>) -> Option<GicDesc> {
         version,
         dist: (d.starting_address as usize, d.size.unwrap_or(0x10000)),
         cpu: (c.starting_address as usize, c.size.unwrap_or(0x20000)),
+    })
+}
+
+/// `reg` + the first `interrupts` triple (GIC binding: `<type num flags>`,
+/// type 0 = SPI, 1 = PPI; flags[3:0] 1/2 = edge, 4/8 = level).
+fn virtio_from_node(n: &FdtNode<'_, 'static>) -> Option<VirtioDesc> {
+    let reg = n.reg()?.next()?;
+    let irq = n.property("interrupts")?.value;
+    let cell = |i: usize| {
+        irq.get(i * 4..i * 4 + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let (ty, num, flags) = (cell(0)?, cell(1)?, cell(2).unwrap_or(4));
+    let intid = match ty {
+        0 => 32 + num,
+        1 => 16 + num,
+        _ => return None,
+    };
+    Some(VirtioDesc {
+        base: reg.starting_address as usize,
+        size: reg.size.unwrap_or(0x200),
+        intid,
+        edge: flags & 0x3 != 0,
     })
 }
 

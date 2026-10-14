@@ -48,7 +48,7 @@ pub fn clock_getres(clk: i32, tp: usize) -> SysResult {
 
 pub fn gettimeofday(tv: usize) -> SysResult {
     if tv != 0 {
-        let ns = timer::now_ns() + task::process().epoch_ns;
+        let ns = timer::now_ns() + crate::wallclock::epoch_ns();
         with_space(|s| s.write_val(tv, &Timeval::from_nanos(ns)))?;
     }
     Ok(0)
@@ -98,7 +98,7 @@ pub fn clock_nanosleep(clk: i32, flags: i32, req: usize, rem: usize) -> SysResul
         return sleep_restartable(timer::now_ns().saturating_add(ns), rem);
     }
     let deadline = if is_realtime(clk) {
-        ns.saturating_sub(task::process().epoch_ns)
+        ns.saturating_sub(crate::wallclock::epoch_ns())
     } else {
         ns
     };

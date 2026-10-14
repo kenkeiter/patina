@@ -74,15 +74,30 @@ const MAX_INTID: usize = 1020;
 
 static HANDLERS: SpinLock<[Option<Handler>; MAX_INTID]> = SpinLock::new([None; MAX_INTID]);
 
+/// Set the trigger mode of device interrupt `intid` (an SPI; from the
+/// DTB `interrupts` flags) before [`register`]. GIC SPIs are active-high
+/// only, so `active_low` is ignored. Initializes the GIC if needed.
+pub fn configure(intid: u32, edge: bool, _active_low: bool) {
+    if !gic::is_initialized() {
+        gic::init();
+    }
+    gic::set_trigger(intid, edge);
+}
+
 /// Install `handler` for `intid` and enable the interrupt at the GIC
-/// (SGIs/PPIs on this CPU, SPIs routed to this CPU). Requires the GIC to be
-/// initialized (`timer::init` does it).
+/// (SGIs/PPIs on this CPU, SPIs routed to this CPU). Initializes the GIC
+/// if `timer::init` has not done so yet (device drivers register before
+/// the scheduler starts); the interrupt is taken once IRQs are unmasked.
+/// The handler runs with IRQs masked and must not block.
 pub fn register(intid: u32, handler: Handler) {
     assert!(
         (intid as usize) < MAX_INTID,
         "irq::register: bad INTID {}",
         intid
     );
+    if !gic::is_initialized() {
+        gic::init();
+    }
     HANDLERS.lock()[intid as usize] = Some(handler);
     gic::enable(intid);
 }
