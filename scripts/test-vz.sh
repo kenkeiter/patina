@@ -25,6 +25,9 @@
 #                    whichever appears), GET http://A:8080/, 20 concurrent
 #                    GETs, /big sha256, ctl stop -> 0
 #   threads / signals-self / sockets   the Phase 2-4 programs at 2 vCPUs
+#   vsock            AF_VSOCK (D76): cli/scripts/vztest.sh -test.run
+#                    TestVZVsock (testapps/vsockapp; host dials the guest's
+#                    listener, 1 MiB echoes, at 1/2/4 vCPUs), 300 s bound
 #
 # Environment: PATINA_TIMEOUT (per run, default 60 s; every run also has a
 # hard outer timeout), PATINA_PARAMS (read by `patina run` itself: extra
@@ -313,6 +316,17 @@ prog_case threads vz-threads threads 0 '^PASS threads$' -- -cpus 2
 prog_case signals-self vz-signals signals 0 '^PASS signals \(handler\)$' -- -self
 prog_case signals-nohandler-self vz-signals-n signals 143 '^\[patina\] exit signal SIGTERM$' -- -mode nohandler -self
 prog_case sockets vz-sockets sockets 0 '^PASS sockets$'
+
+# ---- AF_VSOCK (D76): the in-process VZ test (host side dials the guest's
+# listener through VZVirtioSocketDevice; it builds testapps/vsockapp itself).
+echo "== vsock" >&2
+log=$out/vsock.log
+rc=0
+"$TIMEOUT_BIN" -k 5 300 "$root/cli/scripts/vztest.sh" -test.run 'TestVZVsock$' -test.v >"$log" 2>&1 || rc=$?
+if [[ $rc -ne 0 ]]; then fail vsock "TestVZVsock exit $rc"
+elif ! has "$log" '^--- PASS: TestVZVsock'; then fail vsock "no '--- PASS: TestVZVsock'"
+else pass vsock "$(grep -c '^    --- PASS' "$log") vCPU counts"
+fi
 
 echo
 printf '%s\n' "${results[@]}"

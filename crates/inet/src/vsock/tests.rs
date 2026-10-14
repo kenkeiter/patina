@@ -1324,3 +1324,24 @@ fn model_random_streams() {
     assert_eq!(p.h.len(), 1, "host: only the listener");
     assert_eq!(p.g.next_deadline(), None);
 }
+
+#[test]
+fn peer_beyond_credit_is_dropped_and_counted() {
+    let mut c = guest();
+    let l = c.create();
+    c.bind(l, Addr::new(VMADDR_CID_ANY, 1234)).unwrap();
+    c.listen(l, 8).unwrap();
+    let host = Addr::new(HOST, 40000);
+    let me = Addr::new(GUEST, 1234);
+    c.input(dev(hdr(OP_REQUEST, host, me), &[]));
+    let (s, _) = c.accept(l).unwrap();
+    c.take_out();
+    // A peer ignoring the advertised buffer loses the packet that does not
+    // fit (Linux `virtio_transport_inc_rx_pkt`); the kernel logs the count.
+    let full = vec![7u8; DEFAULT_BUFFER_SIZE as usize];
+    c.input(dev(hdr(OP_RW, host, me), &full));
+    assert_eq!(c.rx_drops(), 0);
+    c.input(dev(hdr(OP_RW, host, me), b"x"));
+    assert_eq!(c.rx_drops(), 1);
+    assert_eq!(c.rx_bytes(s), DEFAULT_BUFFER_SIZE as usize);
+}

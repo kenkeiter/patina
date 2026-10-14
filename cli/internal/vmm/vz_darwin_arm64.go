@@ -620,6 +620,15 @@ func newVZConn(fd int, release func()) (*vzConn, error) {
 	return &vzConn{Conn: nc, release: release}, nil
 }
 
+// CloseWrite half-closes the connection (shutdown(SHUT_WR) on the
+// framework's descriptor) when it is a socket.
+func (c *vzConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errors.ErrUnsupported
+}
+
 func (c *vzConn) Close() error {
 	err := c.Conn.Close()
 	c.once.Do(func() {

@@ -1,110 +1,70 @@
-//! virtio-vsock (virtio 1.2 §5.10), stream sockets, listen-only
-//! (decision D62). UNVERIFIED: QEMU on the macOS dev host has no
-//! vhost-vsock, so this was written against the spec and Linux's
-//! `net/vmw_vsock/virtio_transport{,_common}.c` and only compile-tested.
+//! virtio-vsock (virtio 1.2 §5.10), stream sockets (decisions D62, D76).
+//! Verified on Apple VZ (D83-D85 for the control channel, D76 for
+//! AF_VSOCK); written against the spec and Linux's
+//! `net/vmw_vsock/virtio_transport{,_common}.c`.
 //!
-//! The control channel listens on one port ([`listen`], 4242). One
-//! connection at a time: a new `REQUEST` replaces the current connection
-//! (the old peer gets `RST`). Requests for other ports, data for unknown
-//! connections and `RESPONSE`s (we never connect) are answered with `RST`.
-//! A peer `SHUTDOWN` closes the connection and is answered with `RST`; a
-//! peer `RST` just closes it. An event-queue `TRANSPORT_RESET` (live
-//! migration) drops the connection and re-reads the guest CID.
+//! The driver multiplexes two users by destination port:
 //!
-//! Credit (§5.10.6.3): we advertise `buf_alloc` = [`BUF_ALLOC`] and count
-//! consumed bytes in `fwd_cnt` (data is handed to the caller as it
-//! arrives, so the receive space is never really occupied), sending
-//! `CREDIT_UPDATE` after half of it was consumed since the last update and
-//! on `CREDIT_REQUEST`. Sends respect the peer's credit
-//! (`peer_buf_alloc - (tx_cnt - peer_fwd_cnt)`); without credit the data is dropped and a
-//! `CREDIT_REQUEST` sent (control-channel events are small and the host
-//! reads them promptly).
+//! * The control channel listens on one kernel-owned port ([`listen`],
+//!   4242) with the connection logic below. One connection at a time: a new
+//!   `REQUEST` replaces the current connection (the old peer gets `RST`).
+//!   `RESPONSE`s (we never connect from that port) are answered with
+//!   `RST`. A peer `SHUTDOWN` closes the connection and is answered with
+//!   `RST`; a peer `RST` just closes it.
+//! * Every other packet is handed raw to the AF_VSOCK socket layer
+//!   (`net::vsock`, the `patina_inet::vsock::Core` state machine), which
+//!   answers packets nobody takes with `RST` and transmits its own packets
+//!   through [`try_send`].
+//!
+//! Receiving is done by one kernel thread (`net::vsock`'s `vsockd`, woken
+//! by [`IRQ`]) through [`poll`]: control-channel bytes are buffered (64 KiB)
+//! and [`EVENT`] is signalled for the control thread, which drains them
+//! with [`service`]. An event-queue `TRANSPORT_RESET` (live migration)
+//! drops the control connection, re-reads the guest CID and is reported to
+//! the caller of [`poll`].
+//!
+//! Control-channel credit (§5.10.6.3): we advertise `buf_alloc` =
+//! [`BUF_ALLOC`] and count consumed bytes in `fwd_cnt` as they arrive,
+//! sending `CREDIT_UPDATE` after half of it was consumed since the last
+//! update and on `CREDIT_REQUEST`. Sends respect the peer's credit
+//! (`peer_buf_alloc - (tx_cnt - peer_fwd_cnt)`); without credit the data
+//! is dropped and a `CREDIT_REQUEST` sent (control-channel events are small
+//! and the host reads them promptly).
 //!
 //! Queues: rx (0) with [`RX_BUFS`] posted 4 KiB buffers (header + payload
 //! in one device-writable descriptor), tx (1) with [`TX_SLOTS`] 4 KiB
-//! slots (header + payload in one descriptor), event (2) with 4-byte
-//! buffers. Transmit is bounded-synchronous like the console's: a send
-//! waits for a free slot, and [`flush`] waits until the device has taken
-//! everything (used before poweroff for the `exit` event).
+//! slots (header + payload in one descriptor; completions interrupt so
+//! queued socket packets go out as slots free), event (2) with 4-byte
+//! buffers. Control-channel transmit is bounded-synchronous like the
+//! console's: a send waits for a free slot, and [`flush`] waits until the
+//! device has taken everything (used before poweroff for the `exit` event).
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use patina_inet::vsock::{
+    EVENT_TRANSPORT_RESET, F_STREAM, HDR_LEN as HDR, Hdr, OP_CREDIT_REQUEST, OP_CREDIT_UPDATE,
+    OP_REQUEST, OP_RESPONSE, OP_RST, OP_RW, OP_SHUTDOWN, TYPE_STREAM,
+};
 
 use super::queue::{Buf, DmaBuf, VirtQueue};
 use super::{DEVICE_VSOCK, Transport, attach_irq, driver_ok, negotiate, poll_until};
 use crate::drivers::Event;
 use crate::sync::{OnceCell, SpinLock, SpinLockGuard};
 
-const F_STREAM: u64 = 1 << 0;
-
-const HDR: usize = 44;
 const PKT: usize = 4096;
 const MAX_PAYLOAD: usize = PKT - HDR;
-const RX_BUFS: usize = 16;
-const TX_SLOTS: usize = 8;
+/// Largest payload of one transmitted packet (AF_VSOCK sockets split
+/// their data to this).
+pub const TX_PAYLOAD: usize = MAX_PAYLOAD;
+const RX_BUFS: usize = 32;
+/// At most 32 (the `free` bitmap is a u32; `(1 << 32) - 1` would overflow).
+const TX_SLOTS: usize = 16;
 const EV_BUFS: usize = 4;
 /// Receive space advertised to the peer.
 pub const BUF_ALLOC: u32 = 64 * 1024;
-
-const TYPE_STREAM: u16 = 1;
-const OP_REQUEST: u16 = 1;
-const OP_RESPONSE: u16 = 2;
-const OP_RST: u16 = 3;
-const OP_SHUTDOWN: u16 = 4;
-const OP_RW: u16 = 5;
-const OP_CREDIT_UPDATE: u16 = 6;
-const OP_CREDIT_REQUEST: u16 = 7;
-const EVENT_TRANSPORT_RESET: u32 = 0;
 const HOST_CID: u64 = 2;
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Hdr {
-    src_cid: u64,
-    dst_cid: u64,
-    src_port: u32,
-    dst_port: u32,
-    len: u32,
-    ty: u16,
-    op: u16,
-    flags: u32,
-    buf_alloc: u32,
-    fwd_cnt: u32,
-}
-
-impl Hdr {
-    fn parse(b: &[u8]) -> Hdr {
-        let u64_ = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap_or([0; 8]));
-        let u32_ = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-        let u16_ = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
-        Hdr {
-            src_cid: u64_(0),
-            dst_cid: u64_(8),
-            src_port: u32_(16),
-            dst_port: u32_(20),
-            len: u32_(24),
-            ty: u16_(28),
-            op: u16_(30),
-            flags: u32_(32),
-            buf_alloc: u32_(36),
-            fwd_cnt: u32_(40),
-        }
-    }
-
-    fn encode(&self) -> [u8; HDR] {
-        let mut b = [0u8; HDR];
-        b[0..8].copy_from_slice(&self.src_cid.to_le_bytes());
-        b[8..16].copy_from_slice(&self.dst_cid.to_le_bytes());
-        b[16..20].copy_from_slice(&self.src_port.to_le_bytes());
-        b[20..24].copy_from_slice(&self.dst_port.to_le_bytes());
-        b[24..28].copy_from_slice(&self.len.to_le_bytes());
-        b[28..30].copy_from_slice(&self.ty.to_le_bytes());
-        b[30..32].copy_from_slice(&self.op.to_le_bytes());
-        b[32..36].copy_from_slice(&self.flags.to_le_bytes());
-        b[36..40].copy_from_slice(&self.buf_alloc.to_le_bytes());
-        b[40..44].copy_from_slice(&self.fwd_cnt.to_le_bytes());
-        b
-    }
-}
 
 /// The one accepted connection.
 #[derive(Clone, Copy, Debug)]
@@ -165,10 +125,19 @@ struct Vsock {
 }
 
 static DEV: OnceCell<Vsock> = OnceCell::new();
-/// Signalled by the device interrupt; the control channel thread waits on it.
+/// Signalled by the device interrupt (rx, tx completions, events); the
+/// receiving thread (`net::vsock`) waits on it. Anyone may signal it to
+/// make that thread run (queued transmits, a new timer).
+pub static IRQ: Event = Event::new();
+/// Signalled when control-channel bytes were buffered or the control
+/// connection changed; the control channel thread waits on it.
 pub static EVENT: Event = Event::new();
 /// Bumped on every accepted / closed connection.
 pub static CONN_GEN: AtomicU32 = AtomicU32::new(0);
+/// Control-channel bytes received and not yet taken by [`service`].
+static CTL_RX: SpinLock<VecDeque<u8>> = SpinLock::new(VecDeque::new());
+/// Bound of [`CTL_RX`] (the credit the control connection advertises).
+const CTL_RX_CAP: usize = BUF_ALLOC as usize;
 
 fn lock<T>(l: &SpinLock<T>) -> SpinLockGuard<'_, T> {
     if !crate::task::sched::exiting() {
@@ -189,7 +158,7 @@ fn irq() {
     if let Some(d) = DEV.get() {
         d.t.ack_interrupt();
     }
-    EVENT.signal();
+    IRQ.signal();
 }
 
 /// Claim and start the first virtio-vsock device, if any.
@@ -208,8 +177,7 @@ pub fn init() {
             buf: DmaBuf::new(RX_BUFS * PKT)?,
             slot_of: [0; 256],
         };
-        let mut txq = VirtQueue::new(&*t, 1, TX_SLOTS as u16)?;
-        txq.set_no_interrupt(true);
+        let txq = VirtQueue::new(&*t, 1, TX_SLOTS as u16)?;
         let tx = Tx {
             q: txq,
             buf: DmaBuf::new(TX_SLOTS * PKT)?,
@@ -252,10 +220,7 @@ pub fn init() {
     if let Some(line) = dev.irq {
         attach_irq(line, irq);
     }
-    crate::kprintln!(
-        "[patina] virtio-vsock: guest cid {} (UNVERIFIED driver)",
-        cid
-    );
+    crate::kprintln!("[patina] virtio-vsock: guest cid {}", cid);
 }
 
 fn post_rx(rx: &mut Rx, slot: usize) {
@@ -360,7 +325,27 @@ fn conn_hdr(v: &Vsock, c: &mut Conn, op: u16) -> Hdr {
     h
 }
 
-fn handle(v: &Vsock, h: &Hdr, payload: &[u8], on_data: &mut dyn FnMut(&[u8])) {
+/// A new control connection, or the old one closed: forget its buffered
+/// bytes and tell the control thread.
+fn ctl_conn_changed() {
+    CTL_RX.lock().clear();
+    CONN_GEN.fetch_add(1, Ordering::SeqCst);
+    EVENT.signal();
+}
+
+/// Buffer control-connection bytes for [`service`] (dropped beyond
+/// [`CTL_RX_CAP`]: a host exceeding the advertised credit).
+fn ctl_data(payload: &[u8]) {
+    {
+        let mut b = CTL_RX.lock();
+        let n = payload.len().min(CTL_RX_CAP.saturating_sub(b.len()));
+        b.extend(&payload[..n]);
+    }
+    EVENT.signal();
+}
+
+/// A packet for the control channel's port.
+fn handle(v: &Vsock, h: &Hdr, payload: &[u8]) {
     let port = v.port.load(Ordering::Relaxed);
     let me = v.cid.load(Ordering::Relaxed);
     if h.ty != TYPE_STREAM || port == 0 || h.dst_port != port || (h.dst_cid != me && me != 0) {
@@ -390,7 +375,7 @@ fn handle(v: &Vsock, h: &Hdr, payload: &[u8], on_data: &mut dyn FnMut(&[u8])) {
             *g = Some(c);
         }
         drop(g);
-        CONN_GEN.fetch_add(1, Ordering::SeqCst);
+        ctl_conn_changed();
         return;
     }
     if !ours {
@@ -407,7 +392,7 @@ fn handle(v: &Vsock, h: &Hdr, payload: &[u8], on_data: &mut dyn FnMut(&[u8])) {
             let stale = c.fwd_cnt.wrapping_sub(c.last_fwd_sent) >= BUF_ALLOC / 2;
             let upd = stale.then(|| conn_hdr(v, c, OP_CREDIT_UPDATE));
             drop(g);
-            on_data(payload);
+            ctl_data(payload);
             if let Some(u) = upd {
                 send(v, &u, &[], 10_000_000);
             }
@@ -423,24 +408,25 @@ fn handle(v: &Vsock, h: &Hdr, payload: &[u8], on_data: &mut dyn FnMut(&[u8])) {
             drop(g);
             let r = conn_hdr(v, &mut c, OP_RST);
             send(v, &r, &[], 10_000_000);
-            CONN_GEN.fetch_add(1, Ordering::SeqCst);
+            ctl_conn_changed();
         }
         OP_RST => {
             *g = None;
             drop(g);
-            CONN_GEN.fetch_add(1, Ordering::SeqCst);
+            ctl_conn_changed();
         }
         _ => {}
     }
 }
 
-/// Process received packets and events (control-channel thread);
-/// connection data goes to `on_data`.
-pub fn service(on_data: &mut dyn FnMut(&[u8])) {
-    let Some(v) = DEV.get() else {
-        return;
-    };
-    // Events first: a transport reset invalidates the connection.
+/// Process the device's events and received packets (the one receiving
+/// thread, `net::vsock`). Packets for the control channel's port are
+/// handled here (their bytes buffered for [`service`]); every other packet
+/// (header and payload, trimmed to the header's `len`) goes to `sock`.
+/// Returns the new guest CID after a `TRANSPORT_RESET` event.
+pub fn poll(sock: &mut dyn FnMut(&[u8])) -> Option<u32> {
+    let v = DEV.get()?;
+    // Events first: a transport reset invalidates the connections.
     let mut reset = false;
     {
         let mut ev = v.ev.lock();
@@ -459,11 +445,13 @@ pub fn service(on_data: &mut dyn FnMut(&[u8])) {
             ev.q.kick(&*v.t);
         }
     }
+    let mut new_cid = None;
     if reset {
-        v.cid
-            .store(v.t.config_read64(0) & 0xffff_ffff, Ordering::Relaxed);
+        let cid = v.t.config_read64(0) & 0xffff_ffff;
+        v.cid.store(cid, Ordering::Relaxed);
+        new_cid = Some(cid as u32);
         if v.conn.lock().take().is_some() {
-            CONN_GEN.fetch_add(1, Ordering::SeqCst);
+            ctl_conn_changed();
         }
     }
     let mut pkt = [0u8; PKT];
@@ -480,13 +468,78 @@ pub fn service(on_data: &mut dyn FnMut(&[u8])) {
             rx.q.kick(&*v.t);
             n
         };
-        if n < HDR {
+        let Some(h) = Hdr::decode(&pkt[..n]) else {
             continue;
-        }
-        let h = Hdr::parse(&pkt[..HDR]);
+        };
         let plen = (h.len as usize).min(n - HDR);
-        handle(v, &h, &pkt[HDR..HDR + plen], on_data);
+        let port = v.port.load(Ordering::Relaxed);
+        if port != 0 && h.dst_port == port {
+            handle(v, &h, &pkt[HDR..HDR + plen]);
+        } else {
+            sock(&pkt[..HDR + plen]);
+        }
     }
+    new_cid
+}
+
+/// Hand the control connection's buffered bytes to `on_data` (control
+/// thread). [`EVENT`] says when there may be more.
+pub fn service(on_data: &mut dyn FnMut(&[u8])) {
+    if DEV.get().is_none() {
+        return;
+    }
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = {
+            let mut b = CTL_RX.lock();
+            let n = b.len().min(chunk.len());
+            for (d, s) in chunk[..n].iter_mut().zip(b.drain(..n)) {
+                *d = s;
+            }
+            n
+        };
+        if n == 0 {
+            return;
+        }
+        on_data(&chunk[..n]);
+    }
+}
+
+/// The guest CID from the device's config space (`None`: no device).
+pub fn guest_cid() -> Option<u32> {
+    DEV.get().map(|v| v.cid.load(Ordering::Relaxed) as u32)
+}
+
+/// Queue one packet (`hdr.len` must equal `payload.len()`, at most
+/// [`TX_PAYLOAD`]) if a transmit slot is free now; false otherwise (the
+/// caller keeps it and retries after the next [`IRQ`]).
+pub fn try_send(hdr: &[u8; HDR], payload: &[u8]) -> bool {
+    let Some(v) = DEV.get() else {
+        return false;
+    };
+    if payload.len() > MAX_PAYLOAD {
+        return false;
+    }
+    let mut tx = lock(&v.tx);
+    tx.reap();
+    if tx.free == 0 {
+        return false;
+    }
+    let slot = tx.free.trailing_zeros() as usize;
+    tx.buf.write(slot * PKT, hdr);
+    tx.buf.write(slot * PKT + HDR, payload);
+    let b = Buf {
+        addr: tx.buf.pa(slot * PKT),
+        len: (HDR + payload.len()) as u32,
+        write: false,
+    };
+    let Some(head) = tx.q.add(&[b]) else {
+        return false;
+    };
+    tx.slot_of[head as usize] = slot as u8;
+    tx.free &= !(1 << slot);
+    tx.q.kick(&*v.t);
+    true
 }
 
 /// Send `data` on the connection (split into packets). False if there is

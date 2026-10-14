@@ -178,7 +178,9 @@ pub fn socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
         Ok(AF_INET | AF_INET6) => crate::net::inet::create(domain as u16, ty, protocol)?,
         Ok(AF_UNIX) => crate::net::unix::create(ty, protocol)?,
         Ok(AF_NETLINK) => crate::net::netlink::create(ty, protocol)?,
-        // AF_PACKET, AF_VSOCK, ...: not supported.
+        // EAFNOSUPPORT without a virtio-vsock device (D76).
+        Ok(AF_VSOCK) => crate::net::vsock::create(ty, protocol)?,
+        // AF_PACKET, ...: not supported.
         _ => return Err(Errno(EAFNOSUPPORT)),
     };
     install(
@@ -630,5 +632,6 @@ pub fn trace_addr(n: usize, a: &[u64; 6]) -> Option<alloc::string::String> {
         SockAddr::Unix(p) => alloc::format!("{:?}", alloc::string::String::from_utf8_lossy(&p)),
         SockAddr::Unspec => alloc::string::String::from("AF_UNSPEC"),
         SockAddr::Netlink { pid, groups } => alloc::format!("nl:{}/{:#x}", pid, groups),
+        SockAddr::Vsock { cid, port, .. } => alloc::format!("vsock:{}:{}", cid, port),
     })
 }

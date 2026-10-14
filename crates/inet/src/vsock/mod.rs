@@ -294,6 +294,8 @@ pub struct Core {
     dev_payload: usize,
     out: Vec<Packet>,
     dirty: BTreeSet<SockId>,
+    /// `RW` packets dropped because the peer exceeded our credit.
+    rx_drops: u64,
 }
 
 fn sock_mut(socks: &mut BTreeMap<SockId, Sock>, id: SockId) -> Result<&mut Sock, Errno> {
@@ -313,7 +315,14 @@ impl Core {
             dev_payload: DEFAULT_DEV_PAYLOAD,
             out: Vec::new(),
             dirty: BTreeSet::new(),
+            rx_drops: 0,
         }
+    }
+
+    /// Replace the ephemeral-port seed (no effect once a port was picked):
+    /// the kernel creates the core before its RNG is seeded.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.seed = seed;
     }
 
     /// A device appeared (or its CID changed): `Some(cid)`; `None`: gone.
@@ -348,6 +357,12 @@ impl Core {
     /// Packets to transmit (loopback ones go back into [`Core::input`]).
     pub fn take_out(&mut self) -> Vec<Packet> {
         core::mem::take(&mut self.out)
+    }
+
+    /// `RW` packets dropped so far because the peer sent beyond the credit
+    /// we advertised (a misbehaving peer; the stream has a hole).
+    pub fn rx_drops(&self) -> u64 {
+        self.rx_drops
     }
 
     /// Whether packets are waiting in the outbox.
@@ -684,6 +699,7 @@ impl Core {
                 // `virtio_transport_inc_rx_pkt`: a peer exceeding our
                 // advertised buffer loses the packet.
                 if s.rx_bytes() + payload.len() > s.buf_alloc as usize {
+                    self.rx_drops += 1;
                     return;
                 }
                 s.rx.extend(payload.iter());

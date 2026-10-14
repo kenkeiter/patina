@@ -7,6 +7,7 @@
 //! * [`inet`]: AF_INET/AF_INET6 TCP and UDP sockets (D68);
 //! * [`unix`]: AF_UNIX stream, datagram and seqpacket sockets (D71).
 //! * [`netlink`]: read-only AF_NETLINK/NETLINK_ROUTE sockets (D73).
+//! * [`vsock`]: AF_VSOCK stream sockets over virtio-vsock (D76).
 
 pub mod device;
 pub mod inet;
@@ -15,10 +16,12 @@ pub mod netlink;
 pub mod socket;
 pub mod stack;
 pub mod unix;
+pub mod vsock;
 
 /// Start the stack (after `drivers::init`, which registers the NIC).
 pub fn init(cmdline: &patina_cmdline::Cmdline) {
     stack::init(cmdline);
+    vsock::init();
 }
 
 pub use stack::effective_config;
