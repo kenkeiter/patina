@@ -125,9 +125,13 @@ func FindKernel(arch, explicit string) (string, error) {
 		}
 	}
 	// TODO: fetch versioned kernel release artifacts (design §12).
+	looked := strings.Join(tried, ", ")
+	if looked == "" {
+		looked = "no patina repo root above " + strings.Join(starts, ", ")
+	}
 	return "", fmt.Errorf("no %s kernel found (looked in: %s); pass --kernel <path>, set PATINA_KERNEL_DIR, "+
 		"or build one with scripts/build-kernel.sh %s (downloading release kernels is not implemented yet)",
-		arch, strings.Join(tried, ", "), arch)
+		arch, looked, arch)
 }
 
 // GoBuild compiles pkg for linux/<arch> into out.
