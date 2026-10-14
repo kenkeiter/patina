@@ -1,6 +1,8 @@
 //! Device drivers (Phase 3): virtio over mmio, discovered through the
 //! arch layer (`arch::devices::virtio_mmio`: DTB on aarch64; cmdline,
-//! DSDT or a probe on x86_64).
+//! DSDT or a probe on x86_64), and virtio over PCI (Phase 4, D70:
+//! `pci.rs` enumerates `arch::devices::pci_hosts`, `virtio/pci.rs` is the
+//! transport).
 //!
 //! Boot order (`init`, from `kernel_main` before the self-tests and the
 //! loader): discover and register every virtio transport, then bring up
@@ -11,6 +13,7 @@
 //! that never answers must not hang the boot. Interrupts are attached for
 //! use once the scheduler runs.
 
+pub mod pci;
 pub mod virtio;
 
 use alloc::sync::Arc;
@@ -49,9 +52,10 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
         };
         virtio::register_transport(dev, d.source);
     }
+    n += pci::init(cmdline);
     if n == 0 {
         crate::kprintln!(
-            "[patina] virtio: no devices ({} mmio region(s) described)",
+            "[patina] virtio: no devices ({} mmio region(s) described, no virtio-pci)",
             found.len()
         );
     }

@@ -36,7 +36,8 @@ Environment for `run-qemu.sh` (and `smoke.sh`): `PATINA_MEM` (MiB, default
 virtio-console port; `run-qemu.sh` always adds the virtio-serial device, the
 port and a `virtio-rng-device`, like the CLI), `PATINA_CTL_WAIT=1` (QEMU
 `wait=on`: boot only once a client is attached), `PATINA_CONSOLE=hvc0`
-(console on virtio-console port 0 instead of the UART). `test-hello.sh --app` passes `PATINA_PARAMS` as extra kernel
+(console on virtio-console port 0 instead of the UART), `PATINA_VIRTIO`
+(`1` virtio-mmio, `pci` the same devices as virtio-pci — default on x86 `pc`/`q35`, `0` none; `PATINA_VIRTIO_PCI_OPTS` e.g. `,disable-legacy=on`). `test-hello.sh --app` passes `PATINA_PARAMS` as extra kernel
 params (e.g. `patina.strace=1`). `test-runtime.sh` runs every suite at each
 CPU count in `PATINA_CPUS_LIST` (default `1 2 4`) and prints one PASS/FAIL
 row per case (logs in `out/test/runtime/`); `test-smp.sh` logs to
@@ -151,11 +152,11 @@ booted) · `—` not applicable.
 | QEMU `virt` aarch64, HVF | V **boot-hvf** | V PL011; V `hvc0` (**hvc0**) | V PSCI HVC | V **initrd-args** | V **selftest-smp-a64** (1/2/4/8 CPUs, GICv3, PSCI HVC); scheduler: **test-smp**, **threads-smp**, **fdtest-smp**, **test-signals-smp**, **pproftest**, **test-runtime** (1/2/4 CPUs) | V DTB discovery, GIC SPIs, rng, console port `patina.ctl` — **virtio-discovery**, **test-ctl** |
 | QEMU `virt` aarch64, TCG | V **boot-tcg**, **el2-drop** | V PL011 | V PSCI HVC / SMC | V (same DTB path; **initrd-args** run on HVF) | V **selftest-smp-a64** (GICv3 1/2/4, GICv2, EL2 entry + PSCI SMC); scheduler: **test-smp** (`PATINA_ACCEL=tcg`, 4 CPUs) | V modern (v2) MMIO with `force-legacy=false` (**virtio-discovery**) |
 | QEMU `microvm` x86_64, TCG | V **boot-x86** | V 16550 port 0x3f8; V `hvc0` (**hvc0**) | V isa-debug-exit; V ACPI S5 sleep-control register (**poweroff-order**) | V **initrd-args-x86** | V **selftest-smp-x86** (1/2/4/8 CPUs, MADT via BIOS-area RSDP scan); scheduler: **test-smp**, **threads-smp**, **fdtest-smp**, **test-signals-smp**, **pproftest**, **test-runtime** (1/2/4 CPUs), **tlbstress** (D52 shootdown) | V DSDT discovery (ACPI on) and cmdline entries (`acpi=off`), I/O APIC, rng, `patina.ctl` — **virtio-discovery**, **test-ctl** |
-| QEMU `pc` / `q35` x86_64, TCG | V **machines-x86** | V 16550 | V isa-debug-exit; V ACPI S5 via PM1a (**poweroff-order**, pc) | V **machines-x86** | V **selftest-smp-x86** (MADT) | V none found (`virtio: no devices`, `ctl: no transport`), virtio-pci is Phase 4 |
+| QEMU `pc` / `q35` x86_64, TCG | V **machines-x86** | V 16550 | V isa-debug-exit; V ACPI S5 via PM1a (**poweroff-order**, pc) | V **machines-x86** | V **selftest-smp-x86** (MADT) | V virtio-pci (D70): q35 ECAM from the MCFG, pc port 0xCF8, MSI-X via the LAPIC; rng, `patina.ctl` — **virtio-pci-x86** |
 | Firecracker aarch64 | U (no KVM on this host) | U 16550 MMIO | U PSCI | U | U | U DTB discovery, vsock 4242 |
 | Firecracker x86_64 | U | U | U i8042 reset (last in the D64 order) | U | U (MP table / MADT) | U `virtio_mmio.device=` cmdline entries, DSDT, vsock |
-| Cloud Hypervisor aarch64 | U | U PL011 | U PSCI | U | U | U needs virtio-pci (Phase 4) |
-| Cloud Hypervisor x86_64 | U | U | U ACPI S5 at port 0x600 (D64) | U | U | U needs virtio-pci (Phase 4) |
+| Cloud Hypervisor aarch64 | U | U PL011 | U PSCI | U | U | U virtio-pci (D70): DTB ECAM bus 0, MSI-X only via the GICv3 ITS (KVM, 64 KiB ITS pages) or GICv2m (MSHV) |
+| Cloud Hypervisor x86_64 | U | U | U ACPI S5 at port 0x600 (D64) | U | U | U virtio-pci (D70): MCFG ECAM 0xe8000000 bus 0, MSI-X, 64-bit BARs above RAM |
 | Apple VZ aarch64 | U (needs the CLI's VZ shim) | U `hvc0` = virtio-console port 0 (driven since Phase 3, verified only on QEMU) | U PSCI | U | U | U DTB discovery, vsock 4242 |
 
 ## Phase 1 — Hello
@@ -342,6 +343,7 @@ CLI and `os` tests:
 
 ## Phase 4 — Net
 
+- [x] virtio-pci transport + PCI discovery (D70): ECAM (DTB / MCFG) or port 0xCF8, BAR sizing and assignment (QEMU `virt` without firmware), modern capabilities, MSI-X (x86 LAPIC; aarch64 GICv3 ITS LPIs and GICv2m SPIs), INTx through the DTB `interrupt-map` (shared lines) — **virtio-pci-a64** (`PATINA_VIRTIO=pci scripts/test-ctl.sh aarch64`, hvf = v2m, `PATINA_ACCEL=tcg` = ITS, `PATINA_CPUS=4`; `PATINA_VIRTIO=pci PATINA_CONSOLE=hvc0 scripts/test-hello.sh --app fileio aarch64`, also with `PATINA_PARAMS=patina.pci.irq=intx`), **virtio-pci-x86** (`PATINA_MACHINE=q35|pc scripts/test-ctl.sh x86_64`, `PATINA_MACHINE=q35 PATINA_CONSOLE=hvc0 scripts/test-hello.sh --app fileio x86_64`); Cloud Hypervisor paths untested
 - [ ] virtio-net (`virtio-drivers`), smoltcp interface task
 - [ ] Socket syscalls (Tier 2): `socket socketpair bind listen accept4 connect getsockname getpeername setsockopt getsockopt sendto recvfrom sendmsg recvmsg shutdown`
 - [ ] Loopback (127.0.0.1, ::1), `AF_UNIX` stream + datagram
@@ -351,4 +353,4 @@ CLI and `os` tests:
 
 ## Phase 5 — Hardening
 
-- [ ] Runtime test-suite harness + skip list (**Milestone B**), Tier-3 syscalls, vDSO, virtio-pci (`q35`), console-port control fallback, `AF_VSOCK` for the program, `--strace`, multi-queue net, benchmarks.
+- [ ] Runtime test-suite harness + skip list (**Milestone B**), Tier-3 syscalls, vDSO, console-port control fallback, `AF_VSOCK` for the program, `--strace`, multi-queue net, benchmarks.

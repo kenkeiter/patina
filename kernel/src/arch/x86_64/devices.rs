@@ -13,14 +13,18 @@
 //!    guess: microvm without the second I/O APIC numbers slot n as GSI
 //!    5 + n (as seen with `acpi=off`: slot 7 at 0xfeb00e00 = GSI 12).
 //!
-//! virtio-pci (Cloud Hypervisor, QEMU q35) is not discovered here; that
-//! is Phase 4/5 (ECAM from the MCFG) and plugs into
-//! `drivers::virtio::register_transport` the same way.
+//! PCI host bridges ([`pci_hosts`], D70): one per ACPI MCFG entry (QEMU
+//! q35: ECAM at 0xb0000000, buses 0-255; Cloud Hypervisor: 0xe8000000,
+//! bus 0 per segment). Without an MCFG but with a PC-style platform
+//! (QEMU `pc`: a DSDT and the legacy I/O APIC), bus 0 through the
+//! 0xCF8/0xCFC port mechanism. Firmware (SeaBIOS) or the VMM assigns the
+//! BARs, so no memory windows are described.
 
 use alloc::vec::Vec;
 
 use super::platform;
 use crate::drivers::MmioDesc;
+use crate::drivers::pci::PciHostDesc;
 use crate::mm::PhysAddr;
 
 const PROBE_BASE: usize = 0xfeb0_0000;
@@ -84,4 +88,48 @@ pub fn virtio_mmio(cmdline: &patina_cmdline::Cmdline) -> Vec<MmioDesc> {
         }
     }
     out
+}
+
+/// PCI host bridges the platform describes (see the module docs).
+pub fn pci_hosts() -> Vec<PciHostDesc> {
+    let (mcfg, legacy_pc) = platform::with(|f| {
+        (
+            f.mcfg,
+            f.fadt
+                .is_some_and(|x| x.flags & super::acpi::FADT_HW_REDUCED == 0),
+        )
+    });
+    let mut out = Vec::new();
+    if let Some(m) = mcfg {
+        for &(base, segment, start, end) in &m.entries[..m.n] {
+            let mut d = PciHostDesc::empty("ecam acpi mcfg");
+            // The MCFG base addresses bus 0; ours addresses `bus_start`.
+            d.ecam = base + ((start as u64) << 20);
+            d.segment = segment;
+            d.bus_start = start;
+            d.bus_end = end;
+            out.push(d);
+        }
+    } else if legacy_pc && port_cf8_present() {
+        let mut d = PciHostDesc::empty("port 0xcf8 config");
+        d.bus_end = 0xff;
+        out.push(d);
+    }
+    out
+}
+
+/// Configuration mechanism #1 answers: CONFIG_ADDRESS reads back the
+/// enable bit written to it (the classic probe).
+fn port_cf8_present() -> bool {
+    use super::port::{inl, outl};
+    // SAFETY: 0xCF8 is CONFIG_ADDRESS on PC-compatible platforms (checked
+    // by the caller: a full, non-hardware-reduced FADT); writing it only
+    // selects a register. The old value is restored.
+    unsafe {
+        let old = inl(0xcf8);
+        outl(0xcf8, 0x8000_0000);
+        let v = inl(0xcf8);
+        outl(0xcf8, old);
+        v == 0x8000_0000
+    }
 }

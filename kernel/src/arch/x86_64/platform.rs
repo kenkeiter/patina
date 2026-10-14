@@ -2,7 +2,8 @@
 //! `early_main` on the boot page tables (the tables may sit in pages the
 //! frame allocator would later hand out): the MADT I/O APICs and interrupt
 //! source overrides (`ioapic.rs`), the FADT sleep registers (`power.rs`)
-//! and the DSDT's virtio-mmio devices and `_S5` value (`devices.rs`).
+//! the DSDT's virtio-mmio devices and `_S5` value (`devices.rs`) and the
+//! MCFG's PCI ECAM regions (`devices::pci_hosts`, D70).
 //!
 //! RSDP sources, first that works: `hvm_start_info.rsdp_paddr`, the RSDP
 //! `smp::enumerate` found by the BIOS-area scan (QEMU microvm/pc/q35,
@@ -10,7 +11,7 @@
 //! offsets into the blob). Without ACPI (older Firecracker) every field
 //! stays empty and the users fall back to defaults.
 
-use super::acpi::{self, DsdtInfo, Fadt, IrqInfo, Mem};
+use super::acpi::{self, DsdtInfo, Fadt, IrqInfo, Mcfg, Mem};
 use super::smp;
 use crate::sync::SpinLock;
 
@@ -19,6 +20,8 @@ pub struct Facts {
     pub irq: Option<IrqInfo>,
     pub fadt: Option<Fadt>,
     pub dsdt: Option<DsdtInfo>,
+    /// PCI Express ECAM regions (D70).
+    pub mcfg: Option<Mcfg>,
 }
 
 static FACTS: SpinLock<Facts> = SpinLock::new(Facts {
@@ -26,6 +29,7 @@ static FACTS: SpinLock<Facts> = SpinLock::new(Facts {
     irq: None,
     fadt: None,
     dsdt: None,
+    mcfg: None,
 });
 
 fn gather(mem: &impl Mem, rsdp: u64, source: &'static str) -> bool {
@@ -35,11 +39,13 @@ fn gather(mem: &impl Mem, rsdp: u64, source: &'static str) -> bool {
     let fadt = acpi::fadt(mem, rsdp);
     let dsdt = fadt.and_then(|f| acpi::dsdt_scan(mem, f.dsdt));
     let irq = acpi::madt_irq(mem, rsdp);
+    let mcfg = acpi::mcfg(mem, rsdp);
     *FACTS.lock() = Facts {
         source,
         irq,
         fadt,
         dsdt,
+        mcfg,
     };
     true
 }
@@ -69,6 +75,21 @@ pub(super) fn init(start_info_rsdp: usize) {
         f.dsdt.map_or(0, |d| d.n_virtio),
         f.dsdt.and_then(|d| d.s5_typ),
     );
+    match f.mcfg {
+        Some(m) if m.n > 0 => {
+            for &(base, seg, s, e) in &m.entries[..m.n] {
+                crate::kprintln!(
+                    "[patina] acpi: mcfg @ {:#x}: ecam {:#x} segment {} bus {}-{}",
+                    m.addr,
+                    base,
+                    seg,
+                    s,
+                    e
+                );
+            }
+        }
+        _ => crate::kprintln!("[patina] acpi: no mcfg (no pci ecam)"),
+    }
 }
 
 /// Run `f` on the gathered facts.

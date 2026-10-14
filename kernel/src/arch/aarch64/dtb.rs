@@ -7,6 +7,7 @@ use fdt::Fdt;
 use fdt::node::FdtNode;
 
 use super::power::Conduit;
+use crate::drivers::pci::{IntxEntry, MAX_INTX_MAP, PciHostDesc, PciWindow};
 
 pub const MAX_RANGES: usize = 32;
 pub const MAX_UARTS: usize = 8;
@@ -90,6 +91,12 @@ pub struct Platform {
     pub ncpus: usize,
     /// virtio-mmio transports, in DT order.
     pub virtio: [Option<VirtioDesc>; MAX_VIRTIO],
+    /// The first enabled `pci-host-ecam-generic` node (D70).
+    pub pci: Option<PciHostDesc>,
+    /// GICv3 ITS (`arm,gic-v3-its`) register frame `(base, size)`.
+    pub its: Option<(usize, usize)>,
+    /// GICv2m MSI frame (`arm,gic-v2m-frame`).
+    pub v2m: Option<super::v2m::V2mDesc>,
 }
 
 /// CPU nodes recorded from the DTB (more are counted but ignored).
@@ -139,6 +146,9 @@ pub unsafe fn parse(va: usize) -> Result<Platform, DtbError> {
         cpus: [0; MAX_DT_CPUS],
         ncpus: 0,
         virtio: [None; MAX_VIRTIO],
+        pci: None,
+        its: None,
+        v2m: None,
     };
 
     for node in fdt.all_nodes() {
@@ -240,6 +250,33 @@ pub unsafe fn parse(va: usize) -> Result<Platform, DtbError> {
         }
     }
     p.gic = gic_from_fdt(&fdt);
+    p.pci = pci_from_fdt(&fdt);
+    p.its = fdt
+        .all_nodes()
+        .find(|n| {
+            !is_disabled(n)
+                && n.compatible()
+                    .is_some_and(|c| c.all().any(|c| c == "arm,gic-v3-its"))
+        })
+        .and_then(|n| n.reg()?.next())
+        .map(|r| (r.starting_address as usize, r.size.unwrap_or(0x2_0000)));
+    p.v2m = fdt
+        .all_nodes()
+        .find(|n| {
+            !is_disabled(n)
+                && n.compatible()
+                    .is_some_and(|c| c.all().any(|c| c == "arm,gic-v2m-frame"))
+        })
+        .and_then(|n| {
+            let r = n.reg()?.next()?;
+            let base = cell_prop(&n, "arm,msi-base-spi");
+            let num = cell_prop(&n, "arm,msi-num-spis");
+            Some(super::v2m::V2mDesc {
+                base: r.starting_address as usize,
+                size: r.size.unwrap_or(0x1000),
+                spis: base.zip(num).map(|(b, n)| (b as u32, n as u32)),
+            })
+        });
     p.timer_virt_intid = fdt
         .find_compatible(&["arm,armv8-timer", "arm,armv7-timer"])
         .and_then(|n| n.property("interrupts"))
@@ -317,6 +354,140 @@ fn gic_from_fdt(fdt: &Fdt<'static>) -> Option<GicDesc> {
         dist: (d.starting_address as usize, d.size.unwrap_or(0x10000)),
         cpu: (c.starting_address as usize, c.size.unwrap_or(0x20000)),
     })
+}
+
+/// A raw `#...-cells`-style 1- or 2-cell property (`None` if absent).
+fn cell_prop(n: &FdtNode<'_, '_>, name: &str) -> Option<usize> {
+    n.property(name).and_then(|p| be_uint(p.value))
+}
+
+/// Big-endian cell array view (no allocation: runs before the heap).
+struct Cells<'a>(&'a [u8]);
+
+impl Cells<'_> {
+    fn len(&self) -> usize {
+        self.0.len() / 4
+    }
+    fn get(&self, i: usize) -> u32 {
+        self.0
+            .get(4 * i..4 * i + 4)
+            .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    /// `n` (1 or 2) cells at `i` as one number.
+    fn wide(&self, i: usize, n: usize) -> u64 {
+        (0..n).fold(0u64, |a, k| (a << 32) | self.get(i + k) as u64)
+    }
+}
+
+/// The `pci-host-ecam-generic` node (QEMU `virt`, Cloud Hypervisor):
+/// `reg` = ECAM of the first bus, `bus-range`, `ranges` (child address 3
+/// cells: phys.hi space code [25:24] 0b10 = 32-bit memory, 0b11 = 64-bit;
+/// parent address = the root's #address-cells; size = the node's
+/// #size-cells), `interrupt-map(-mask)` (child unit address 3 cells + the
+/// node's #interrupt-cells, then the parent phandle, the parent's
+/// #address-cells and #interrupt-cells: a GIC triple), `msi-parent` /
+/// `msi-map` (recorded). Cloud Hypervisor's `interrupt-map` is empty: its
+/// virtio-pci devices are MSI-X only.
+fn pci_from_fdt(fdt: &Fdt<'static>) -> Option<PciHostDesc> {
+    let n = fdt.all_nodes().find(|n| {
+        !is_disabled(n)
+            && n.compatible()
+                .is_some_and(|c| c.all().any(|c| c == "pci-host-ecam-generic"))
+    })?;
+    let reg = n.reg()?.next()?;
+    let mut d = PciHostDesc::empty("ecam dtb");
+    d.ecam = reg.starting_address as u64;
+    let size = reg.size.unwrap_or(1 << 20) as u64;
+    let buses = (size >> 20).clamp(1, 256);
+    match n.property("bus-range").map(|p| Cells(p.value)) {
+        Some(c) if c.len() >= 2 => {
+            d.bus_start = c.get(0).min(255) as u8;
+            d.bus_end = c.get(1).min(255) as u8;
+        }
+        _ => {
+            d.bus_start = 0;
+            d.bus_end = (buses - 1) as u8;
+        }
+    }
+    // Never touch ECAM beyond `reg`.
+    d.bus_end = d
+        .bus_end
+        .min((d.bus_start as u64 + buses - 1).min(255) as u8)
+        .max(d.bus_start);
+    d.segment = cell_prop(&n, "linux,pci-domain").unwrap_or(0) as u16;
+
+    let root_ac = fdt
+        .find_node("/")
+        .and_then(|r| cell_prop(&r, "#address-cells"))
+        .unwrap_or(2);
+    let sc = cell_prop(&n, "#size-cells").unwrap_or(2);
+    if let Some(r) = n.property("ranges") {
+        let v = Cells(r.value);
+        let stride = 3 + root_ac + sc;
+        for e in 0..v.len() / stride {
+            let base = e * stride;
+            let hi = v.get(base);
+            let w = PciWindow {
+                pci: v.wide(base + 1, 2),
+                cpu: v.wide(base + 3, root_ac),
+                size: v.wide(base + 3 + root_ac, sc),
+            };
+            match (hi >> 24) & 3 {
+                0b10 if d.mem32.is_none() => d.mem32 = Some(w),
+                0b11 if d.mem64.is_none() => d.mem64 = Some(w),
+                _ => {}
+            }
+        }
+    }
+
+    if let (Some(map), Some(mask)) = (n.property("interrupt-map"), n.property("interrupt-map-mask"))
+    {
+        let m = Cells(mask.value);
+        let child_ic = cell_prop(&n, "#interrupt-cells").unwrap_or(1);
+        if m.len() > 3 {
+            d.intx_mask = (m.get(0), m.get(3));
+        }
+        let v = Cells(map.value);
+        let mut i = 0;
+        while i + 3 + child_ic < v.len() && d.n_intx < MAX_INTX_MAP {
+            let hi = v.get(i);
+            let pin = v.get(i + 3);
+            let Some(parent) = fdt.find_phandle(v.get(i + 3 + child_ic)) else {
+                break;
+            };
+            let pac = cell_prop(&parent, "#address-cells").unwrap_or(0);
+            let pic = cell_prop(&parent, "#interrupt-cells").unwrap_or(3);
+            let p = i + 3 + child_ic + 1 + pac;
+            if p + pic > v.len() || pic < 2 {
+                break;
+            }
+            // GIC binding: <type num flags>, type 0 = SPI, 1 = PPI.
+            let flags = if pic > 2 { v.get(p + 2) } else { 4 };
+            let irq = match v.get(p) {
+                0 => Some(32 + v.get(p + 1)),
+                1 => Some(16 + v.get(p + 1)),
+                _ => None,
+            };
+            if let Some(irq) = irq {
+                d.intx[d.n_intx] = Some(IntxEntry {
+                    hi,
+                    pin,
+                    irq,
+                    edge: flags & 0x3 != 0,
+                });
+                d.n_intx += 1;
+            }
+            i = p + pic;
+        }
+    }
+    d.msi_parent = n.property("msi-parent").is_some() || n.property("msi-map").is_some();
+    // msi-map = <rid-base &msi-controller msi-base length>.
+    if let Some(m) = n.property("msi-map").map(|p| Cells(p.value))
+        && m.len() >= 4
+    {
+        d.msi_devid_offset = m.get(2).wrapping_sub(m.get(0));
+    }
+    Some(d)
 }
 
 /// `reg` + the first `interrupts` triple (GIC binding: `<type num flags>`,

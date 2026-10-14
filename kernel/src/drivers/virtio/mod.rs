@@ -1,8 +1,8 @@
 //! virtio core: the [`Transport`] abstraction, the device registry, IRQ
 //! plumbing and the drivers (rng, console, vsock). Decision D58.
 //!
-//! * Transports implement [`Transport`] (`mmio.rs` now; virtio-pci in a
-//!   later phase plugs in through [`register_transport`]). Drivers only
+//! * Transports implement [`Transport`] (`mmio.rs`; `pci.rs`, D70) and
+//!   are added with [`register_transport`]. Drivers only
 //!   see the trait plus [`queue::VirtQueue`], so they are transport-agnostic.
 //! * Discovery (`drivers::init`) probes every platform-described
 //!   transport, prints one `[patina] virtio: ...` line per device and
@@ -19,6 +19,7 @@
 pub mod console;
 pub mod mmio;
 pub mod net;
+pub mod pci;
 pub mod queue;
 pub mod rng;
 pub mod vsock;
@@ -88,6 +89,11 @@ pub trait Transport: Send + Sync {
     /// Read and acknowledge the interrupt status ([`INT_VRING`],
     /// [`INT_CONFIG`]); 0 if the device did not interrupt.
     fn ack_interrupt(&self) -> u32;
+    /// Interrupt kind for the discovery line (`msi-x`, `intx`); `None`:
+    /// say `edge`/`level` from the [`IrqLine`] (virtio-mmio).
+    fn irq_kind(&self) -> Option<&'static str> {
+        None
+    }
     fn config_generation(&self) -> u32;
     fn config_read8(&self, off: usize) -> u8;
     fn config_read32(&self, off: usize) -> u32;
@@ -138,10 +144,11 @@ pub fn register_transport(dev: Device, source: &str) {
         device_name(id),
         source,
         det,
-        match dev.irq {
-            Some(l) if l.edge => "edge",
-            Some(_) => "level",
-            None => "no",
+        match (dev.irq, dev.transport.irq_kind()) {
+            (Some(_), Some(k)) => k,
+            (Some(l), None) if l.edge => "edge",
+            (Some(_), None) => "level",
+            (None, _) => "no",
         }
     );
     DEVICES.lock().push(dev);

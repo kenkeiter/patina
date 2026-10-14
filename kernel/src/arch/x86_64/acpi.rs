@@ -321,6 +321,43 @@ pub fn find_table(mem: &impl Mem, rsdp: u64, sig: &[u8; 4]) -> Option<(u64, usiz
     None
 }
 
+pub const MAX_MCFG: usize = 4;
+
+/// MCFG configuration space allocations (Phase 4, D70): (ECAM base for
+/// bus 0, segment, start bus, end bus).
+#[derive(Clone, Copy, Debug)]
+pub struct Mcfg {
+    pub entries: [(u64, u16, u8, u8); MAX_MCFG],
+    pub n: usize,
+    /// Table address (for the log).
+    pub addr: u64,
+}
+
+/// The MCFG's allocation entries (header 36 bytes + 8 reserved, then 16
+/// bytes each: base u64, segment u16, start bus u8, end bus u8, reserved).
+pub fn mcfg(mem: &impl Mem, rsdp: u64) -> Option<Mcfg> {
+    let (t, len) = find_table(mem, rsdp, b"MCFG")?;
+    let mut out = Mcfg {
+        entries: [(0, 0, 0, 0); MAX_MCFG],
+        n: 0,
+        addr: t,
+    };
+    let mut off = 44;
+    while off + 16 <= len && out.n < MAX_MCFG {
+        let mut e = [0u8; 16];
+        if !mem.read(t + off as u64, &mut e) {
+            break;
+        }
+        let base = le64(&e);
+        if base != 0 && e[11] >= e[10] {
+            out.entries[out.n] = (base, u16::from_le_bytes([e[8], e[9]]), e[10], e[11]);
+            out.n += 1;
+        }
+        off += 16;
+    }
+    Some(out)
+}
+
 pub const MAX_IOAPICS: usize = 4;
 pub const MAX_ISOS: usize = 16;
 
