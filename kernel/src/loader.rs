@@ -293,8 +293,8 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
     space.set_commit_limit(limit);
     crate::kprintln!(
         "[patina] memory: commit limit {} MiB ({} MiB kernel reserve)",
-        limit * PAGE_SIZE >> 20,
-        reserve * PAGE_SIZE >> 20
+        (limit * PAGE_SIZE) >> 20,
+        (reserve * PAGE_SIZE) >> 20
     );
 
     let frame = ctx::TrapFrame::new_user(img.entry, image.sp);
