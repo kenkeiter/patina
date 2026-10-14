@@ -1,11 +1,12 @@
 # Go os package tests skipped under patina (scripts/test-os.sh).
 # One top-level test per line: TestName  # reason
 #
-# Network (sockets are Phase 4; socket() is ENOSYS).
-TestLargeCopyViaNetwork  # network: Phase 4
-TestSpliceFile  # network: Phase 4 (splice to unix/tcp sockets)
-TestGetPollFDAndNetwork  # network: Phase 4
-TestSendFile  # network: Phase 4 (sendfile to unix/tcp sockets)
+# AF_UNIX sockets are being added by another change (socket(AF_UNIX) is
+# EAFNOSUPPORT in this tree); the tcp subtests of these pass. Re-enable
+# once AF_UNIX is merged.
+TestSpliceFile  # AF_UNIX: pending (Basic-Unix, OneLess-Unix, Unix-To-TTY)
+TestGetPollFDAndNetwork  # AF_UNIX: pending (unix subtest)
+TestSendFile  # AF_UNIX: pending (sendfile-to-unix)
 #
 # Child processes: testenv.MustHaveExec does not probe on linux, so these
 # fail instead of skipping (fork/exec of /app fails).
