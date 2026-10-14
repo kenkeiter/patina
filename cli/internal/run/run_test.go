@@ -41,6 +41,21 @@ func TestSentinelWriter(t *testing.T) {
 	}
 }
 
+// CLI messages written while the console is mid-line start on a new line.
+func TestNoteWriter(t *testing.T) {
+	var out bytes.Buffer
+	s := &sentinelWriter{w: &out}
+	n := &noteWriter{s: s, w: &out}
+	s.Write([]byte("boot ok\n[patina] tim"))
+	n.Write([]byte("patina: control: ready\n"))
+	s.Write([]byte("er: x\n"))
+	n.Write([]byte("patina: control: exit code 0\n"))
+	want := "boot ok\n[patina] tim\npatina: control: ready\ner: x\npatina: control: exit code 0\n"
+	if out.String() != want {
+		t.Fatalf("got %q\nwant %q", out.String(), want)
+	}
+}
+
 type syncBuf struct {
 	mu sync.Mutex
 	b  bytes.Buffer

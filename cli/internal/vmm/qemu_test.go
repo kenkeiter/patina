@@ -18,7 +18,7 @@ func TestQEMUArgsGolden(t *testing.T) {
 	want := "-M virt,gic-version=3 -accel hvf -cpu host -smp 2 -m 512M -nodefaults -no-user-config -display none -no-reboot " +
 		"-kernel /r/k -initrd /r/i -append console=ttyAMA0 -- " +
 		"-chardev stdio,id=con0,signal=off -serial chardev:con0 " +
-		"-device virtio-serial-device,id=vser0 -chardev socket,id=ctl0,path=/r/qemu-ctl.sock,server=on,wait=off " +
+		"-device virtio-serial-device,id=vser0 -chardev socket,id=ctl0,path=/r/qemu-ctl.sock,server=on,wait=on " +
 		"-device virtserialport,bus=vser0.0,chardev=ctl0,name=patina.ctl -device virtio-rng-device"
 	if s := strings.Join(got, " "); s != want {
 		t.Fatalf("aarch64 argv\n got %s\nwant %s", s, want)
@@ -43,6 +43,20 @@ func TestQEMUArgsGolden(t *testing.T) {
 	p, _ := (&QEMU{}).KernelParams(cfg)
 	if len(p) != 1 || p[0] != "ip=10.0.2.15::10.0.2.2:255.255.255.0:patina:eth0:off:10.0.2.3" {
 		t.Errorf("user-net params %v", p)
+	}
+}
+
+func TestQEMUStderrFilter(t *testing.T) {
+	var out strings.Builder
+	f := &lineFilter{w: &out, drop: qemuBenign}
+	in := "qemu-system-aarch64: -chardev socket,id=ctl0,path=/r/qemu-ctl.sock,server=on,wait=on: info: QEMU waiting for connection on: disconnected:unix:/r/qemu-ctl.sock,server=on\n" +
+		"qemu-system-aarch64: real error\nunterminated"
+	for i := 0; i < len(in); i += 5 {
+		f.Write([]byte(in[i:min(i+5, len(in))]))
+	}
+	f.flush()
+	if got := out.String(); got != "qemu-system-aarch64: real error\nunterminated" {
+		t.Fatalf("got %q", got)
 	}
 }
 

@@ -29,7 +29,9 @@ import (
 // The control channel uses the console-port fallback on every host for now
 // (QEMU has no vsock on macOS): a virtio-serial-device (virtio-mmio) with one
 // virtserialport named "patina.ctl", backed by a Unix socket chardev in
-// server mode that `patina run` connects to.
+// server mode that `patina run` connects to. The chardev uses wait=on: QEMU
+// creates the socket but does not start the guest until `patina run`'s
+// control proxy has connected, so no event (ready, a fast exit) is missed.
 type QEMU struct{}
 
 // Name implements Driver.
@@ -139,8 +141,9 @@ func QEMUArgs(cfg *Config, accel string) ([]string, error) {
 		"-chardev", "stdio,id=con0,signal=off",
 		"-serial", "chardev:con0",
 		// Control channel: virtio-console port "patina.ctl" over a Unix socket.
+		// wait=on: the guest starts only once the control proxy is attached.
 		"-device", "virtio-serial-device,id=vser0",
-		"-chardev", "socket,id=ctl0,path="+ControlSocket(cfg.RunDir)+",server=on,wait=off",
+		"-chardev", "socket,id=ctl0,path="+ControlSocket(cfg.RunDir)+",server=on,wait=on",
 		"-device", "virtserialport,bus=vser0.0,chardev=ctl0,name=patina.ctl",
 		"-device", "virtio-rng-device",
 	)
@@ -208,6 +211,7 @@ type qemuMachine struct {
 	mu      sync.Mutex
 	cmd     *exec.Cmd
 	stderr  *capBuffer
+	errf    *lineFilter
 	started time.Time
 	killed  bool
 }
@@ -222,7 +226,8 @@ func (m *qemuMachine) launch() error {
 	cmd.Stdin = nil // /dev/null: QEMU must not touch our terminal
 	cmd.Stdout = m.cfg.Serial
 	m.stderr = &capBuffer{max: 16 << 10}
-	cmd.Stderr = io.MultiWriter(m.cfg.Stderr, m.stderr)
+	m.errf = &lineFilter{w: m.cfg.Stderr, drop: qemuBenign}
+	cmd.Stderr = io.MultiWriter(m.errf, m.stderr)
 	// Own process group: the terminal's Ctrl-C goes to `patina run`, which
 	// turns it into a graceful stop instead of QEMU dying on SIGINT.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -259,6 +264,7 @@ func (m *qemuMachine) Wait() (*Exit, error) {
 		cmd := m.cmd
 		m.mu.Unlock()
 		err := cmd.Wait()
+		m.errf.flush()
 		code := cmd.ProcessState.ExitCode()
 		var ee *exec.ExitError
 		if err != nil && !errors.As(err, &ee) {
@@ -297,6 +303,52 @@ func (m *qemuMachine) Kill() error {
 		return nil
 	}
 	return m.cmd.Process.Kill()
+}
+
+// qemuBenign matches QEMU stderr lines that are expected and tell the user
+// nothing (they still reach capBuffer for the hvf fallback check).
+func qemuBenign(line []byte) bool {
+	// "qemu-system-aarch64: -chardev socket,...,wait=on: info: QEMU waiting for connection on: ..."
+	return bytes.Contains(line, []byte("info: QEMU waiting for connection on:"))
+}
+
+// lineFilter forwards complete lines to w, except those drop matches. A
+// partial line is held until its newline (or forwarded once over 4 KiB).
+type lineFilter struct {
+	w    io.Writer
+	drop func([]byte) bool
+	mu   sync.Mutex
+	buf  []byte
+}
+
+func (f *lineFilter) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.buf = append(f.buf, p...)
+	for {
+		i := bytes.IndexByte(f.buf, '\n')
+		if i < 0 {
+			if len(f.buf) > 4096 {
+				f.w.Write(f.buf)
+				f.buf = f.buf[:0]
+			}
+			return len(p), nil
+		}
+		if line := f.buf[:i+1]; !f.drop(line) {
+			f.w.Write(line)
+		}
+		f.buf = f.buf[i+1:]
+	}
+}
+
+// flush forwards a final unterminated line (after the process exited).
+func (f *lineFilter) flush() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.buf) > 0 && !f.drop(f.buf) {
+		f.w.Write(f.buf)
+	}
+	f.buf = nil
 }
 
 // capBuffer keeps the first max bytes written to it.

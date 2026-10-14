@@ -27,6 +27,7 @@ const (
 	ExitTimeout = 124 // --timeout expired (like timeout(1))
 	ExitKilled  = 137 // guest did not stop within the grace period; VMM killed
 	ExitUnknown = 1   // guest ended without reporting a code
+	ExitPanic   = 255 // kernel panic (the panic event, design §10.2)
 )
 
 // Options configure Run.
@@ -62,6 +63,10 @@ func Run(o Options) (int, error) {
 	if o.Grace <= 0 {
 		o.Grace = 10 * time.Second
 	}
+	// CLI messages share the terminal with the guest console: write them
+	// between console lines (noteWriter), never inside one.
+	sentinel := &sentinelWriter{w: o.Stdout}
+	o.Stderr = &noteWriter{s: sentinel, w: o.Stderr}
 	logw := io.Discard
 	if o.Verbose {
 		logw = o.Stderr
@@ -102,7 +107,6 @@ func Run(o Options) (int, error) {
 		return 0, err
 	}
 
-	sentinel := &sentinelWriter{w: o.Stdout}
 	cfg := &vmm.Config{
 		Arch: m.Arch, Kernel: kernel, Initrd: initrd,
 		MemMB: o.MemMB, CPUs: o.CPUs, RunDir: dir, Accel: o.Accel, Net: o.Net, Bin: o.VMMBin,
@@ -134,9 +138,10 @@ func Run(o Options) (int, error) {
 	}
 
 	var (
-		evMu    sync.Mutex
-		exitEv  *ctl.Event
-		gotExit = make(chan struct{})
+		evMu     sync.Mutex
+		exitEv   *ctl.Event
+		panicked bool
+		gotExit  = make(chan struct{})
 	)
 	hub, err := ctl.NewHub(filepath.Join(dir, runstate.ProxySocket), mach.Control(), func(e *ctl.Event) {
 		switch e.Ev {
@@ -148,6 +153,9 @@ func Run(o Options) (int, error) {
 			}
 			evMu.Unlock()
 		case "panic":
+			evMu.Lock()
+			panicked = true
+			evMu.Unlock()
 			fmt.Fprintf(o.Stderr, "patina: %s\n", e.Describe())
 			return
 		}
@@ -200,12 +208,12 @@ func Run(o Options) (int, error) {
 		}
 		stopping = true
 		if err := hub.Send(ctl.Stop(o.Grace)); err != nil {
-			fmt.Fprintf(o.Stderr, "\npatina: %s; cannot send stop (%v), killing VM\n", why, err)
+			fmt.Fprintf(o.Stderr, "patina: %s; cannot send stop (%v), killing VM\n", why, err)
 			forced = true
 			mach.Kill()
 			return
 		}
-		fmt.Fprintf(o.Stderr, "\npatina: %s; stopping (grace %s, interrupt again to kill)\n", why, o.Grace)
+		fmt.Fprintf(o.Stderr, "patina: %s; stopping (grace %s, interrupt again to kill)\n", why, o.Grace)
 		// The guest enforces the grace itself; allow slack before assuming it
 		// never received the request.
 		killC = time.After(o.Grace + 2*time.Second)
@@ -244,13 +252,19 @@ loop:
 	}
 
 	evMu.Lock()
-	ev := exitEv
+	ev, kpanic := exitEv, panicked
 	evMu.Unlock()
+	// Precedence (doc/cli-contract.md): --timeout, then the exit event, a
+	// panic event, the serial sentinel, the VMM's own carrier
+	// (isa-debug-exit), and finally a kill by the CLI.
 	switch {
 	case timedOut:
+		// Like timeout(1): 124 whatever the guest did with the stop.
 		return ExitTimeout, nil
 	case ev != nil && ev.Code != nil:
 		return *ev.Code, nil
+	case kpanic:
+		return ExitPanic, nil
 	case sentinel.Code() != nil:
 		return *sentinel.Code(), nil
 	case res.ex.GuestCode != nil:
@@ -272,15 +286,19 @@ type sentinelWriter struct {
 	mu   sync.Mutex
 	line []byte
 	over bool
+	mid  bool // the console is in the middle of a line
 	code *int
 }
 
 const maxSentinelLine = 256
 
 func (s *sentinelWriter) Write(p []byte) (int, error) {
-	n, err := s.w.Write(p)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	n, err := s.w.Write(p)
+	if len(p) > 0 {
+		s.mid = p[len(p)-1] != '\n'
+	}
 	for _, c := range p {
 		if c == '\n' {
 			if !s.over {
@@ -300,6 +318,24 @@ func (s *sentinelWriter) Write(p []byte) (int, error) {
 		s.line = append(s.line, c)
 	}
 	return n, err
+}
+
+// noteWriter writes CLI messages (one Write per message) to w so that they
+// never land inside a guest console line: it holds the console's lock while
+// writing and starts a new line first if the console is mid-line.
+type noteWriter struct {
+	s *sentinelWriter
+	w io.Writer
+}
+
+func (n *noteWriter) Write(p []byte) (int, error) {
+	n.s.mu.Lock()
+	defer n.s.mu.Unlock()
+	if n.s.mid {
+		n.w.Write([]byte("\n"))
+		n.s.mid = false
+	}
+	return n.w.Write(p)
 }
 
 func trimCR(b []byte) []byte {

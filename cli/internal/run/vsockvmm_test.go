@@ -179,6 +179,15 @@ func TestFirecrackerNoExitCode(t *testing.T) {
 	}
 }
 
+// A panic event with no exit event and no sentinel is exit code 255.
+func TestFirecrackerPanicEvent(t *testing.T) {
+	setupFakeVMM(t, "panic")
+	code, out, errs, err := runVsockVMM(t, target.Firecracker, target.X86_64, Options{})
+	if err != nil || code != ExitPanic || !strings.Contains(errs, "patina: KERNEL PANIC: fake panic") {
+		t.Fatalf("code %d err %v\nstdout:\n%s\nstderr:\n%s", code, err, out, errs)
+	}
+}
+
 func TestFirecrackerAPIError(t *testing.T) {
 	setupFakeVMM(t, "exit", fakevmm.EnvFail, "/vsock")
 	_, out, errs, err := runVsockVMM(t, target.Firecracker, target.X86_64, Options{Name: "fcfail"})

@@ -1528,3 +1528,28 @@ The VFS semantics the suite exercises needed no changes. That includes
 `Chtimes` ns precision, `Readdir` paging and seeking, `os.Root` (`openat2`
 `ENOSYS` fallback), FIFOs, pipe deadlines, `RemoveAll`, `Truncate`,
 `Link` and `Lchown`.
+## D66: `patina run` against the real kernel: exit-code precedence, panic → 255, stop/timeout semantics, e2e test
+*2026-10-14 · Phase 3*
+
+`patina run` (cli/internal/run) picks the exit code in this order: `--timeout`
+expired → 124 (like timeout(1), even when the guest then exits 0 on the
+stop's SIGTERM or is forced), the `exit` event's code, a `panic` event →
+255, the `[patina] exit code N` serial line, QEMU isa-debug-exit (x86,
+status ≥ 3), the CLI killed the VMM → 137, else 1. SIGINT, SIGTERM and
+(new) SIGHUP become `stop` with `--grace` (default 10 s); a second one kills
+the VMM (137); the CLI also kills after grace + 2 s without an exit. The QEMU
+control chardev changed from `wait=off` to `wait=on`: QEMU does not start
+the guest until the control proxy is connected, so `ready` and the `exit` of
+a program that ends in milliseconds always reach the CLI (with `wait=off` a
+fast hvf guest finished before the proxy's 100 ms retry connected and the
+code came from the sentinel). The resulting "QEMU waiting for connection"
+info line is filtered from stderr. CLI messages are written between guest
+console lines (a mid-line console gets a newline first), so `-v` event lines
+never split a kernel line. No kernel change was needed: the pending-event
+buffer, the exit flush before poweroff and the grace timer worked as D63
+describes. Verified by `PATINA_E2E=1 go test ./internal/run -run E2E -v`
+(cli/internal/run/e2e_qemu_test.go, 10 cases × 2 arches, all PASS, 3 runs
+in a row): hello args/exit 3, ctl stop handler/nohandler/forced, ping, dump,
+signal SIGUSR1, `--timeout`, SIGINT → 143, double SIGINT → 137. A `patina
+run` killed with SIGKILL still leaves QEMU running (own process group, no
+parent-death signal on macOS).
