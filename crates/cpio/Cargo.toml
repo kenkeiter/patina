@@ -1,0 +1,9 @@
+[package]
+name = "patina-cpio"
+version = "0.1.0"
+edition = "2021"
+description = "no_std cpio newc/crc archive reader"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]

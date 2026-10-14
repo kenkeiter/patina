@@ -1,0 +1,9 @@
+[package]
+name = "patina-cmdline"
+version = "0.1.0"
+edition = "2021"
+description = "patina kernel command line parser (argv, env, ip=, virtio_mmio.device=)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
