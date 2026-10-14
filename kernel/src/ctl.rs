@@ -304,6 +304,14 @@ fn thread() {
         let mut lines: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
         let mut too_long = false;
         let mut on_bytes = |b: &[u8]| {
+            // A new vsock connection starts with a clean line buffer; lines
+            // of the replaced connection are dropped.
+            let g = vsock::CONN_GEN.load(Ordering::SeqCst);
+            if g != conn_gen {
+                conn_gen = g;
+                framer.reset();
+                lines.clear();
+            }
             framer.feed(b, |f| match f {
                 Frame::Line(l) => lines.push(l.to_vec()),
                 Frame::TooLong => too_long = true,
@@ -317,13 +325,6 @@ fn thread() {
             }),
             T_VSOCK => vsock::service(&mut on_bytes),
             _ => return,
-        }
-        // A new vsock connection starts with a clean line buffer.
-        let g = vsock::CONN_GEN.load(Ordering::SeqCst);
-        if g != conn_gen {
-            conn_gen = g;
-            framer.reset();
-            lines.clear();
         }
         let c = connected();
         if c && !was_connected {
