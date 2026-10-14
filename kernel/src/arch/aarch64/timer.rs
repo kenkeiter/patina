@@ -225,5 +225,11 @@ pub fn now_ns() -> u64 {
     let t = cntvct().wrapping_sub(BOOT_COUNT.load(Ordering::Relaxed));
     // Split to avoid overflow: (t % freq) * 1e9 < freq * 1e9 < 2^64 for any
     // counter frequency below 18 GHz.
-    (t / freq) * 1_000_000_000 + (t % freq) * 1_000_000_000 / freq
+    patina_vdso::vvar::freq_to_ns(t, freq)
+}
+
+/// (counter base, scale) for the vDSO's vvar page (D75): CNTVCT_EL0 at
+/// monotonic 0 and the counter frequency, the same math as [`now_ns`].
+pub fn vdso_clock() -> (u64, u64) {
+    (BOOT_COUNT.load(Ordering::Relaxed), cntfrq())
 }

@@ -2100,3 +2100,315 @@ not a 2-byte `sun_family`-only address that Go decodes as the abstract name
 net 254 passed, 55 skipped (1 by our list: `TestSplice`), 0 failed;
 net/http 611 passed, 10 skipped, 0 failed; os 248 passed, 33 skipped (10 by
 our list), 0 failed.
+## D74: Milestone B harness (test-gopkg.sh), package list and skip-list policy
+*2026-10-14 · Phase 5*
+
+`scripts/test-gopkg.sh <pkg>... [--arch aarch64|x86_64|both] [--cpus N]
+[--run RE] [--no-short] [--mem MiB]` generalises the os and net runs (D65,
+D73) to any std package; `test-os.sh` and `test-gonet.sh` are now thin
+wrappers (their knobs map to the new flags; logs moved to
+`out/test/gopkg/<pkg>-<arch>-cpuN.log`). Per package and arch it builds
+the kernel, `go test -c` (static, `-trimpath`), and packs `/app`, the
+package directory at `/src/<pkg>`, `$GOROOT/src/testdata` at
+`/src/testdata` and `$GOROOT/src/go.mod` at `/src/go.mod`. With that file
+`internal/testenv` finds GOROOT (`/`) by walking up from the cwd, which a
+`-trimpath` binary otherwise lacks; `time`'s `TestLoadLocationFromTZData`
+and net/http's `TestNoUnicodeStrings` then run. Per-package extras: `os`
+gets the small `/usr/bin` of D65; `time` gets
+`$GOROOT/lib/time/zoneinfo.zip` at `/lib/time/zoneinfo.zip` (its tests
+load `../../lib/time/zoneinfo.zip`; no `ZONEINFO` is needed). Every run
+has `patina.cwd=/src/<pkg>`, `HOME=/root`, a slirp NIC and the CLI's static
+`ip=` line (harmless for non-net packages), and `-test.v -test.timeout
+<t> -test.short -test.skip ^(…)$`. Defaults: 1 GiB, 900 s QEMU timeout,
+`-test.timeout 13m`; `runtime` gets 2 GiB, 1500 s and 23m (1 GiB is enough
+with `-short`; the margin is for `--no-short`). Overrides: `--mem` /
+`PATINA_MEM` / `GOPKG_MEM_<pkg>`, `PATINA_TIMEOUT` / `GOPKG_TIMEOUT_<pkg>`,
+`GOPKG_TEST_TIMEOUT` / `GOPKG_GOTIMEOUT_<pkg>`. Counting, the summary line
+and the failure rules are those of D65, plus a final summary block.
+
+Packages: design §13's `runtime`, `os`, `net`, `os/signal`, `time`,
+`sync`, `syscall`, plus `io`, `bufio`, `context`, `net/http`,
+`runtime/pprof` and `os/user`. All pass on aarch64 at 1 and 4 vCPUs (counts
+in doc/status.md, **test-gopkg**); `runtime` also passes on x86_64 at 1
+vCPU. The whole set takes a few minutes on aarch64/HVF.
+
+Skip lists follow D65 (only tests that fail, one reason each, the list
+only shrinks). They are `runtime.txt` (11), `os.txt` (10, unchanged),
+`net.txt` (1, unchanged), `os_signal.txt` (2), `sync.txt` (2) and
+`syscall.txt` (10). By category: "needs os/exec (no execve, D57)" 35 —
+tests that re-execute the test binary or run `cat`, because
+`testenv.MustHaveExec` does not probe on Linux; "GODEBUG re-exec" 1
+(`runtime` `TestIssue66841`). No test needed a "/proc details",
+"needs more RAM" or "too slow" entry. `syscall` `TestFcntlFlock` is listed
+for exec only; its `F_SETLK` half failed first and was fixed. No test was
+non-deterministic: three 4-vCPU `runtime` runs were identical.
+
+Kernel changes the run needed:
+
+- `recvmsg` reports `MSG_CMSG_CLOEXEC` back in `msg_flags` when the caller
+  passed it, as Linux's `____sys_recvmsg` does (syscall
+  `TestSCMCredentials`).
+- Per-thread credentials. `Thread::cred` holds real, effective, saved and
+  fs uid/gid, an all-or-nothing capability model and `keepcaps`;
+  `Thread::groups` holds the supplementary groups. `clone` copies the
+  parent's. The `set*uid`, `set*gid`, `setfs*id` and `setgroups` rules,
+  including `cap_emulate_setxuid`, live in `patina_abi::cred` with host
+  tests (Go's `TestSetuidEtc` sequence is one). `get*id`, `getres*id` and
+  `getgroups` report them, `capget` reports the sets (it used to report
+  empty sets, D57), and `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS` work.
+  `/proc/1/status` shows the main thread's `Uid`/`Gid`/`Groups`/`CapPrm`/
+  `CapEff`. `/proc/1/task` lists the live threads, each `<tid>` directory
+  with `status` (`Pid:` = tid), `stat` and `comm`; the directories are
+  synced when `/proc/1/task` is opened. Nothing enforces file permissions:
+  after dropping euid 0 the program can still do everything. Exposed by
+  syscall `TestSetuidEtc` (needs `/proc/<pid>/task` and real `Uid:` lines)
+  and `TestAllThreadsSyscall`, and by os/signal
+  `TestAllThreadsSyscallSignals` (`PR_SET_KEEPCAPS` through
+  `AllThreadsSyscall` was `EINVAL`).
+- `fcntl` record locks (`F_GETLK`, `F_SETLK`, `F_SETLKW`, `F_OFD_*`) were
+  `EINVAL`. They are now checked as `fs/locks.c` does: lock type, whence
+  and range (`patina_fsutil::lock_range`, host-tested; `EINVAL` /
+  `EOVERFLOW`), `EBADF` for a lock the open mode forbids, and `l_pid` 0
+  for OFD locks. They are always granted, and `F_GETLK` answers `F_UNLCK`.
+  With one process a POSIX lock never conflicts. OFD locks are treated
+  like `flock` (D57), so two descriptions do not exclude each other
+  (syscall `TestFcntlFlock`).
+- `umount2` gives `EINVAL` for an existing path (nothing is mounted on
+  the single filesystem) and `ENOENT` for a missing one, instead of
+  `ENOSYS` (syscall `TestUnshareMountNameSpace` cleanup).
+
+`ENOSYS` lines left in the runs are `pidfd_open` (D57) and `clone3`,
+which the syscall tests use for namespaces and pidfds. Both stay `ENOSYS`
+on purpose: Go falls back to `clone`, which cannot create a process (D57).
+`cargo fmt --all --check` still reports `kernel/src/arch/aarch64/{dtb,its,
+mod}.rs` and `kernel/src/drivers/virtio/pci.rs`. Those paths belong to
+another change and were left alone.
+
+## D75: vDSO (clock_gettime, gettimeofday, getrandom) and the vvar page
+*2026-10-14 · Phase 5*
+
+Go reads the clock constantly (`nanotime` in the scheduler, `walltime` +
+`nanotime` per `time.Now`) and, since 1.24, `crypto/rand` goes through the
+vDSO's `getrandom`. Without `AT_SYSINFO_EHDR` each of those is a syscall.
+patina now ships a small in-tree vDSO on both arches.
+
+**Build.** `crates/vdso` (`patina-vdso`, a normal workspace crate, no new
+dependency). Its `build.rs` compiles `image/vdso.rs` for
+`x86_64-unknown-none` and `aarch64-unknown-none` with the pinned
+toolchain's `rustc --emit=obj` (`-Copt-level=s -Cpanic=abort
+-Crelocation-model=pic`, `#![no_builtins]`, `-Dwarnings`) and links each
+object with the toolchain's `rust-lld -flavor gnu -shared -Bsymbolic
+--hash-style=sysv -z rodynamic -z norelro --no-undefined -soname
+linux-vdso.so.1`, `image/vdso.lds` and `image/<arch>.map` (version script).
+Because only the crate's own object is linked, any call into `core`
+(`memcpy`, a panic path) is an undefined symbol and fails the build; the
+ChaCha20 block keeps its state in 16 locals for that reason. The crate
+embeds both images (`IMAGE_X86_64`, `IMAGE_AARCH64`; `IMAGE` is the target
+arch's) and the kernel `include`s nothing itself: it depends on
+`patina-vdso`. `scripts/build-kernel.sh` and its callers are unchanged, the
+kernel's clippy runs as before (the image is built by the dependency's
+build script), and `cargo test -p patina-vdso` checks both images on the
+host with a small ELF reader in the crate: ELF64 `ET_DYN`, one read-exec
+`PT_LOAD` at vaddr/offset 0 with `filesz == memsz`, `PT_DYNAMIC` inside it,
+`DT_HASH`/`DT_SYMTAB`/`DT_STRTAB`/`DT_SYMENT`/`DT_VERSYM`/`DT_VERDEF`, no
+relocation tags or sections, no writable or NOBITS sections, every symbol
+Go looks up resolving through the SysV hash table with the version check
+of `runtime/vdso_linux.go` (and the SysV hash of each name equal to Go's
+precomputed one), `__vvar_page` equal to where the kernel maps the vvar
+page, and the image's ChaCha20 equal to `patina_rand::chacha` (RFC 8439).
+Images are about 4 KiB: one text page.
+
+**Symbols.** Exactly what Go looks up per arch: amd64 `__vdso_clock_gettime`,
+`__vdso_gettimeofday`, `__vdso_getrandom` (plus `__vdso_time`,
+`__vdso_clock_getres`) in version `LINUX_2.6`; arm64 `__kernel_clock_gettime`,
+`__kernel_getrandom` (plus `__kernel_gettimeofday`, `__kernel_clock_getres`)
+in `LINUX_2.6.39`. C ABI, leaf code, no data, no GOT.
+
+**Layout and mapping.** The kernel maps the image's PT_LOAD pages read-exec
+at `VDSO_BASE = 0x7fff_f800_0000` (above the initial stack, away from
+Go's hints and the top-down mmap area; no randomization) as a `Vdso` VMA,
+and the vvar frame read-only on the next page (the link script defines
+`__vvar_page` at the page-aligned end of the PT_LOAD; the code reaches it
+`rip`/`adrp`-relative) as a `Vvar` VMA. `AT_SYSINFO_EHDR` is the first auxv
+entry. `/proc/self/maps` names them `[vdso]` and `[vvar]` (vdso first:
+the order is the reverse of Linux x86, which nothing depends on). The vvar
+frame is kernel-owned and shared: `Shootdown::free_frame` never frees it,
+so `munmap`/`mremap`/`madvise(DONTNEED)` of it only drop the mapping, and a
+fault in a `Vvar` VMA maps the same frame again instead of a zero page.
+The image pages are ordinary frames of the address space. `mprotect` is
+not restricted (a program could make its own vvar writable; there is only
+one process). `patina.novdso=1` maps neither and omits
+`AT_SYSINFO_EHDR`, for A/B measurements; the loader's log line says
+`vdso on|off`.
+
+**vvar and the seqlock.** `patina_vdso::vvar::Vvar` at offset 0 of the
+page: `seq` (u32, odd while the kernel writes), `clock_mode` (counter or
+none), `counter_base` (the counter at monotonic 0), `scale`,
+`realtime_offset` (ns), `rng_generation`, `rng_ready`. All fields are
+atomics written by the kernel through the direct map; writers are
+serialized by a spinlock, make `seq` odd, `Release` fence, store, then
+`seq += 1` with `Release`; readers load `seq` (`Acquire`, retry while
+odd), the fields, an `Acquire` fence, and retry if `seq` changed. The
+clock parameters are written once in the loader (after the TSC is
+calibrated / with CNTFRQ); afterwards only `realtime_offset` changes, from
+`wallclock::set_epoch_ns` (the control channel's `time` op), so a step of
+`CLOCK_REALTIME` is visible to the vDSO immediately.
+
+**Clock math.** No NTP-style slewing exists in patina, so there is no
+`cycle_last`/`mult`/`shift` state: the vDSO uses the kernel's exact
+formula, which now lives in `patina_vdso::vvar` and is called by the
+kernel's `timer::now_ns` too: x86_64 `(tsc - base) * mult >> 32` (mult =
+ns per tick, 32.32, from the PIT calibration), aarch64 `(c / f) * 1e9 +
+(c % f) * 1e9 / f` with `f` = CNTFRQ_EL0. The vDSO and the syscalls
+therefore agree to the nanosecond for the same counter value. Counter
+reads: `lfence; rdtsc` (Linux's `rdtsc_ordered`) and `isb; mrs
+cntvct_el0`. Fast clocks: `REALTIME`, `REALTIME_COARSE`, `TAI` (realtime;
+the kernel has no TAI offset) and `MONOTONIC`, `MONOTONIC_RAW`,
+`MONOTONIC_COARSE`, `BOOTTIME` (monotonic), as the kernel's own
+`resolve_clock` maps them; anything else (CPU-time clocks, alarms, bad
+ids) and the case where the kernel published no counter make the real
+syscall from inside the vDSO (`syscall` / `svc #0`), so results and
+errors are always the kernel's. `clock_getres` returns 1 ns for the fast
+clocks, as the syscall does. CR4.TSD is now explicitly cleared on every
+CPU (it was clear by default; Go's `cputicks` already used RDTSC).
+
+**TSC assumption (x86_64).** The vDSO assumes the TSC is synchronized and
+constant-rate across CPUs, as `timer::now_ns` already did: true under
+QEMU TCG (one host clock) and on KVM with an invariant TSC. patina does
+not check CPUID 0x8000_0007 EDX[8] (invariant TSC) and uses the TSC
+regardless; on a host whose vCPUs' TSCs drift, monotonic time could step
+backwards across CPU migrations by the skew, in the kernel and the vDSO
+alike. Firecracker/Cloud Hypervisor (KVM, kvmclock-capable) are the likely
+places to meet this; a kvmclock/pvclock clock mode would be the fix.
+
+**getrandom: implemented** (the Linux 6.11 contract). The parameter query
+`getrandom(NULL, 0, 0, &params, ~0UL)` reports a 144-byte opaque state,
+`PROT_READ|PROT_WRITE` and `MAP_PRIVATE|MAP_ANONYMOUS` (no
+`MAP_DROPPABLE`: patina's mmap does not know it; a reclaimable mapping
+does not matter without swap). The state is `batch[96] ‖ key[32] ‖
+generation ‖ pos ‖ in_use`. A call with a state of another size,
+unsupported flags (anything but `GRND_NONBLOCK`/`GRND_INSECURE`), a
+misaligned or null state, `rng_ready == 0`, or a re-entered state
+(`in_use`, e.g. from a signal handler) takes the syscall. Otherwise: if
+`state.generation != vvar.rng_generation` the key is refilled with a
+32-byte `getrandom` syscall and the batch emptied; output comes from the
+batch (consumed bytes are wiped with volatile stores), then whole
+ChaCha20 blocks straight into the buffer (64-bit counter from 0, zero
+nonce), then two more blocks overwrite `batch ‖ key` (fast key erasure:
+the key that produced the output is gone when the call returns); if the
+generation changed during the call the whole output is regenerated with
+a fresh key. Lengths are capped at `MAX_RW_COUNT` like the syscall. The
+kernel bumps `rng_generation` after every reseed of its DRBG
+(`random::seed_boot`, `add_entropy_and_reseed`, i.e. the periodic and the
+1 MiB virtio-rng reseeds) and starts it at 1 so fresh zeroed states fetch
+a key on first use. Stack use: Go calls `vgetrandom1` on the goroutine
+stack (NOSPLIT, no g0 switch), so the deepest path is kept at about 300
+bytes (getrandom 96 + the out-of-line block function 208 on both arches,
+checked with `llvm-objdump`).
+
+**Measured** (`testapps/vdsobench`, 1 vCPU, release; aarch64 = HVF,
+x86_64 = TCG; `RESULT` lines, vDSO / `patina.novdso=1`):
+
+| | aarch64 | x86_64 |
+|---|---|---|
+| `time.Now()` (walltime + nanotime) | 63.4 ns / 333.5 ns (5.3×) | 361.9 ns / 3004 ns (8.3×) |
+| `crypto/rand.Read` 32 B | 120 ns / 569 ns (4.7×) | 1139 ns / 3837 ns (3.4×) |
+| raw `clock_gettime` syscall (reference) | 157–232 ns | 1318–1380 ns |
+
+With 4 vCPUs: 63.6 ns (aarch64) and 437.6 ns (x86_64) per `time.Now()`.
+Under `patina.strace=1` the 1e6-call `time.Now` loop and the 1e5-call
+`crypto/rand` loop contain no `clock_gettime`, `gettimeofday` or
+`getrandom` syscalls on either arch (all 104000 `clock_gettime` lines in
+the log are the test's own syscall comparisons); the whole run makes one
+vDSO key-fetch `getrandom(…, 32, 0)` at the first `rand.Read`, and one more
+after the kernel reseeds (forced by 1.1 MiB of syscall `getrandom`).
+
+**Unverified.** KVM hosts (TSC stability, see above; the HVF aarch64 runs
+use the real CNTVCT); the `in_use` re-entry path (Go never calls getrandom
+from a signal handler); the vvar refault after `madvise(DONTNEED)` and
+`munmap`/`mremap` of the vDSO (no test does it); Go's SIGPROF traceback
+through vDSO frames under heavy profiling (the `pproftest` case of
+`test-runtime.sh` passes, but it does not target vDSO PCs).
+
+## D79: Benchmarks and the Go version matrix
+*2026-10-14 · Phase 5*
+
+**What is measured.** `testapps/bench` (std only) prints one
+`bench <name>: <value> <unit>` line per benchmark and `PASS bench`. Each
+benchmark warms up with a tenth of its count, then runs a fixed count
+(latency rows: ns or µs per op) or a fixed duration (throughput rows: 1 s
+for pipes, 2 s for TCP/AF_UNIX, 64 KiB writes, MB/s = 10^6 B/s); `-n F`
+scales both, `-only` picks rows. Rows: `getpid` through `RawSyscall` (bare
+entry/exit) and `Syscall` (+ Go's `entersyscall`/`exitsyscall`); raw
+`clock_gettime` and 32-byte `getrandom` syscalls against `time.Now()` and
+`crypto/rand.Read` (vDSO, D75); a raw `FUTEX_WAIT`/`FUTEX_WAKE` ping-pong
+between two `LockOSThread`ed goroutines, plus channel and
+`sync.Mutex`+`Cond` ping-pongs for context; a blocking-pipe ping-pong
+between two locked threads and pipe throughput; an `os.Pipe` ping-pong
+(non-blocking fds through Go's netpoller: the epoll wakeup path); TCP
+(`TCP_NODELAY`) and AF_UNIX round trip and throughput over loopback; a
+locked goroutine that exits (Go kills its M: one clone + one thread exit);
+1 MiB anonymous `mmap` + one touched page + `munmap`; `kill(self,
+SIGUSR1)` to a `signal.Notify` channel. The raw ping-pongs raise
+GOMAXPROCS to 2 for their duration: with one P, the thread blocked in the
+futex would hold it and the partner could only run after sysmon retakes
+it (≥ 20 µs), which measures Go, not the kernel. `scripts/bench.sh` builds
+kernel and program, runs each (arch, vCPU count) 3 times under
+`run-qemu.sh` (`PATINA_MEM=512`, 600 s timeout), with `--novdso` reruns
+the clock rows with `patina.novdso=1`, and prints medians. The host runs
+other agents' guests concurrently, so a single run can be 10–30 % off; the
+median of 3 is what `doc/status.md` records. x86_64 is TCG on this host:
+its numbers are an emulator's, kept to catch regressions and ratios only.
+
+**Results (aarch64, HVF, 1 vCPU).** Syscall entry/exit 57 ns; vDSO
+`time.Now` 60 ns vs 266 ns without (Go then makes two syscalls per call);
+futex round trip 0.65 µs; pipe ping-pong 1.0 µs; TCP RTT 4.3 µs, 690 MB/s;
+AF_UNIX RTT 1.9 µs, 2.8 GB/s; thread create+exit 3.8 µs; signal round
+trip 3.2 µs. None reaches the pathology thresholds set for this task
+(futex > 50 µs, pipe ping-pong > 100 µs, TCP loopback < 200 MB/s, signal >
+100 µs on HVF), so no kernel change came out of it.
+
+**Known costs (explained, not fixed).** (1) TCP loopback carries ~4× less
+than AF_UNIX and has ~2.3× its round trip: every segment goes through
+smoltcp (segmentation, checksums, ACK processing) under the single stack
+lock and the net task (D67), while AF_UNIX has no protocol stack in the
+path (D71). (2) With 2 vCPUs, `signal-rtt` (3.2
+→ 6.9 µs) and `thread-create-exit` (3.8 → 6.6 µs) roughly double on HVF:
+the woken thread is placed on the other CPU, which costs a Reschedule IPI
+to a CPU idling in `wfi` (an HVF exit and re-entry); futex and pipe
+ping-pongs grow less (0.65 → 0.90, 1.0 → 1.4 µs). (3) x86_64
+`mmap-munmap-1M` at 2 vCPUs is 3× the 1-vCPU cost: `munmap` on x86 sends
+an `IpiKind::TlbFlush` IPI to the other CPU (`mm/tlb.rs`), which TCG
+makes expensive; aarch64 uses broadcast `tlbi …is` and shows no change.
+
+**Go version matrix.** Design §13 asks for the latest two Go releases.
+`scripts/build-testapp.sh` takes `GO=<go command>` (default `go`, so no
+behaviour change); go1.26.9 was installed through `golang.org/dl` outside
+the repo. hello, threads, fdtest, fileio, signals, sockets, unixsock,
+httphello `-selftest` and bench built with go1.26.9 pass on both arches
+under `patina.strace=1`, as with go1.27.1; the ENOSYS set is the same for
+both (`copy_file_range`, silent, Go falls back) and the distinct-syscall
+sets match up to timing noise. `scripts/test-os.sh aarch64` with go1.26.9
+first in `PATH` (test-gopkg.sh calls plain `go`; the knob does not reach
+it, a PATH shim does) gives 247 passed / 0 failed, ENOSYS `pidfd_open`
+only; 1.27 has one more top-level test (248).
+
+**Static diff of Go 1.27.1's syscalls against the dispatch table.** Every
+`SYS_*` number referenced by `runtime/sys_linux_{amd64,arm64}.s`,
+`internal/runtime/syscall/linux`, `internal/syscall/unix` (incl. its
+`*Trap` numbers), `syscall` (incl. `_SYS_clone3`, `_SYS_faccessat2`,
+`_SYS_fchmodat2`), `os`, `os/signal`, `net`, `internal/poll`,
+`crypto/rand` and `time` was compared with `kernel/src/syscall/mod.rs`.
+Nothing a normal `os`/`net`/runtime path issues is missing. Not
+implemented (fall to `enosys`, logged once): `inotify_init`/`inotify_init1`/
+`inotify_add_watch`/`inotify_rm_watch` (D57; `syscall` wrappers only, no
+std path uses them), `select` (amd64) and `pselect6` (arm64) — only
+`syscall.Select`, no std path, but third-party code calling it gets
+ENOSYS, the most plausible gap; `utime` and `ustat` (amd64 legacy
+wrappers; `os.Chtimes` uses `utimensat`); privileged or exec-only calls
+`ptrace`, `mount`, `pivot_root`, `unshare`, `acct`, `adjtimex`,
+`settimeofday`, `reboot`, `sethostname`, `setdomainname`, `syslog`,
+`ioperm`, `iopl`. `fcntl64` and the `*32` id calls are 32-bit-only names.
+ENOSYS by design and handled by Go: `pidfd_open`, `pidfd_send_signal`,
+`clone3`, `openat2`, `copy_file_range`, `execve`, `rseq`, `membarrier`,
+`set_robust_list` (D57).

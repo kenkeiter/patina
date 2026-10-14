@@ -59,6 +59,11 @@ pub enum VmaKind {
     Elf,
     /// The initial thread's stack.
     Stack,
+    /// The vDSO image (`[vdso]`, D75).
+    Vdso,
+    /// The kernel-owned vvar page (`[vvar]`, D75): a fault in it maps the
+    /// shared frame again, never a fresh one.
+    Vvar,
 }
 
 /// One mapping `[start, end)`, page aligned.
@@ -327,6 +332,16 @@ impl AddressSpace {
         }
         if self.resident.contains(&va) {
             let (pa, _) = self.tables.translate(va).ok_or(Errno(EFAULT))?;
+            return Ok(pa);
+        }
+        if vma.kind == VmaKind::Vvar {
+            // Unmapped by madvise(DONTNEED) or moved by mremap: map the
+            // shared frame again (it is never freed).
+            let pa = crate::vdso::vvar_frame().ok_or(Errno(EFAULT))?;
+            self.tables
+                .map(va, pa, pte_flags(vma.prot))
+                .map_err(|_| Errno(ENOMEM))?;
+            self.resident.insert(va);
             return Ok(pa);
         }
         let pa = match frame::alloc_frames_zeroed(0) {

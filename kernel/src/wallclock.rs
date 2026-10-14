@@ -28,6 +28,7 @@ pub fn set_now(now_epoch_ns: i64) {
 pub fn set_epoch_ns(e: u64) {
     EPOCH_NS.store(e, Ordering::Relaxed);
     SET.store(true, Ordering::Release);
+    crate::vdso::set_realtime_offset(e);
 }
 
 /// Current wall-clock time in ns since the Unix epoch.

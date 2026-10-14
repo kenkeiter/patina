@@ -295,7 +295,10 @@ fn lookup_parent_follows_intermediate_links() {
     let p = fs.lookup_parent(R, b"/lb2").unwrap();
     assert_eq!((p.dir, p.name.as_deref()), (R, Some(&b"lb2"[..])));
     let p = fs.lookup_parent(R, b"/a/b/c/").unwrap();
-    assert_eq!((p.dir, p.name.as_deref(), p.trailing), (b, Some(&b"c"[..]), true));
+    assert_eq!(
+        (p.dir, p.name.as_deref(), p.trailing),
+        (b, Some(&b"c"[..]), true)
+    );
     let p = fs.lookup_parent(R, b"/a/b/..").unwrap();
     assert_eq!((p.dir, p.name), (b, None));
     assert_eq!(fs.lookup_parent(R, b""), Err(err(ENOENT)));

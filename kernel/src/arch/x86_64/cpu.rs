@@ -144,6 +144,9 @@ pub fn rdtsc() -> u64 {
 // ---------------------------------------------------------------------------
 // Optional features.
 
+/// CR4.TSD: RDTSC faults at CPL 3 when set (kept clear: Go's `cputicks`
+/// and the vDSO read the TSC).
+const CR4_TSD: u64 = 1 << 2;
 const CR4_FSGSBASE: u64 = 1 << 16;
 const CR4_OSXSAVE: u64 = 1 << 18;
 const CR4_SMEP: u64 = 1 << 20;
@@ -181,7 +184,7 @@ pub fn init_features() {
     let (max_leaf, ..) = cpuid(0, 0);
     let (_, _, ecx1, _) = cpuid(1, 0);
     let ebx7 = if max_leaf >= 7 { cpuid(7, 0).1 } else { 0 };
-    let mut cr4 = read_cr4();
+    let mut cr4 = read_cr4() & !CR4_TSD;
     if ebx7 & 1 != 0 {
         cr4 |= CR4_FSGSBASE;
         FSGSBASE.store(true, Ordering::Relaxed);

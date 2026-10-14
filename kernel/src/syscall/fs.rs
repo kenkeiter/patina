@@ -14,8 +14,9 @@ use patina_abi::current::O_DIRECT;
 use patina_abi::epoll::{EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE, EpollFlags};
 use patina_abi::errno::{EAGAIN, EBADF, EFAULT, EINVAL, EPIPE, Errno};
 use patina_abi::fs::{
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, Iovec, O_CLOEXEC,
-    O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, UIO_MAXIOV,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW,
+    F_SETFD, F_SETFL, F_SETLK, F_SETLKW, FD_CLOEXEC, Iovec, O_CLOEXEC, O_NONBLOCK, O_RDONLY,
+    O_RDWR, O_WRONLY, UIO_MAXIOV,
 };
 use patina_abi::misc::{FIOCLEX, FIONBIO, FIONCLEX};
 
@@ -346,7 +347,9 @@ pub fn fallocate(fd: i32, mode: i32, off: i64, len: i64) -> SysResult {
     if mode != 0 {
         return Err(Errno(patina_abi::errno::EOPNOTSUPP));
     }
-    let end = off.checked_add(len).ok_or(Errno(patina_abi::errno::EFBIG))? as u64;
+    let end = off
+        .checked_add(len)
+        .ok_or(Errno(patina_abi::errno::EFBIG))? as u64;
     let st = of.file.stat()?;
     if st.st_mode & patina_abi::fs::S_IFMT != patina_abi::fs::S_IFREG {
         return Err(Errno(patina_abi::errno::ENODEV));
@@ -470,10 +473,54 @@ pub fn fcntl(fd: i32, cmd: i32, arg: u64) -> SysResult {
             get(fd)?.set_status(arg as u32);
             Ok(0)
         }
+        F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
+            record_lock(fd, cmd, arg as usize)
+        }
         _ => {
             get(fd)?;
             Err(Errno(EINVAL))
         }
+    }
+}
+
+/// POSIX (`F_SETLK`...) and open-file-description (`F_OFD_*`) record
+/// locks. The `struct flock` is checked as Linux does (type, range,
+/// access mode); then, with one process, a POSIX lock never conflicts
+/// (`F_GETLK` reports `F_UNLCK`) and is granted at once. OFD locks are
+/// treated the same way, like `flock` (D57: granted, not tracked), so two
+/// descriptions in this process do not exclude each other.
+fn record_lock(fd: i32, cmd: i32, p: usize) -> SysResult {
+    use patina_abi::errno::EOVERFLOW;
+    use patina_abi::fs::{F_RDLCK, F_UNLCK, F_WRLCK, Flock, SEEK_CUR};
+    use patina_fsutil::{LockRangeError, lock_range};
+    let of = get(fd)?;
+    let mut fl: Flock = with_space(|s| s.read_val(p))?;
+    let ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+    if ofd && fl.l_pid != 0 {
+        return Err(Errno(EINVAL));
+    }
+    let get = matches!(cmd, F_GETLK | F_OFD_GETLK);
+    match fl.l_type {
+        F_RDLCK | F_WRLCK => {}
+        F_UNLCK if !get => {}
+        _ => return Err(Errno(EINVAL)),
+    }
+    let pos = of.file.lseek(0, SEEK_CUR).unwrap_or(0) as i64;
+    let size = of.file.stat().map(|st| st.st_size).unwrap_or(0);
+    lock_range(fl.l_whence, fl.l_start, fl.l_len, pos, size).map_err(|e| match e {
+        LockRangeError::Invalid => Errno(EINVAL),
+        LockRangeError::Overflow => Errno(EOVERFLOW),
+    })?;
+    if get {
+        fl.l_type = F_UNLCK;
+        with_space(|s| s.write_val(p, &fl))?;
+        return Ok(0);
+    }
+    let fm = of.flags();
+    match fl.l_type {
+        F_RDLCK if !fm.readable() => Err(Errno(EBADF)),
+        F_WRLCK if !fm.writable() => Err(Errno(EBADF)),
+        _ => Ok(0),
     }
 }
 
