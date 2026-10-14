@@ -1463,3 +1463,68 @@ isa-debug-exit: `-M pc` → `acpi s5 via pm1a_cnt (io 0x604, SLP_TYP 0)`,
 SLP_TYP 5)`, QEMU exits in both; with it (run-qemu.sh, CLI) microvm, pc and
 q35 exit through isa-debug-exit as before. Firecracker and Cloud Hypervisor
 are unverified.
+
+## D65: os package test run and skip list policy
+*2026-10-14 · Phase 3*
+
+`scripts/test-os.sh [arch...]` is the early Milestone B coverage run (§13);
+the Phase 5 harness will generalise it. It builds the kernel and `go test
+-c os` (static, `-trimpath`) and packs the test binary as `/app`, a copy
+of `$GOROOT/src/os` at `/src/os` and a small `/usr/bin`. `go test` runs a
+test binary in its package directory, and `TestReadDir`, `TestReadFile`,
+`TestFileReadDir/.`, `TestDirFSRootDir` and the testdata tests depend on
+that. So the run uses the new kernel parameter `patina.cwd=/src/os`
+(`fs/rootfs.rs`, documented in doc/cli-contract.md: the initial cwd, like
+a container WORKDIR; a missing directory is logged and `/` is used).
+`/usr/bin` is test data: on Linux `TestChdirAndGetwd` and
+`TestReaddirnamesOneAtATime` use it. It is not a kernel base directory.
+`HOME=/root` comes from `patina.env`. The program arguments are
+`-test.short -test.v -test.timeout 12m -test.skip ^(A|B|…)$` in the
+`-flag value` form, because a raw `k=v` word after `--` is a kernel
+parameter. The run uses 1 GiB of RAM and a 900 s QEMU timeout. The script
+counts the top-level `--- PASS/SKIP/FAIL` lines and prints
+`os <arch> (cpus=N): N passed, M skipped (K by our list), F failed, exit
+<code>`. It fails on any FAIL, a missing final `PASS`, a kernel
+fatal/panic, a Go crash or a timeout. Logs go to `out/test/os/`.
+`OS_TEST_RUN` and `OS_TEST_SHORT=0` are for debugging.
+
+The skip list is `testapps/skiplist/os.txt`: one top-level test per line,
+`TestName  # reason`, one file per package. A test goes on it only when it
+needs a facility that is absent by design. A kernel bug or a missing
+reasonable feature is fixed instead. There are two categories (14
+entries). Network (Phase 4, `socket` is `ENOSYS`): `TestLargeCopyViaNetwork`,
+`TestSpliceFile`, `TestGetPollFDAndNetwork` and `TestSendFile`. Child
+processes ("needs os/exec (no execve, D57)"): `TestFileChdirTestlog`,
+`TestStdPipe`, `TestReadNonblockingFd`, `TestProcessWithHandleLinux`,
+`TestKillFindProcess`, `TestKillStartProcess`, `TestGetppid`,
+`TestStatStdin`, `TestStartProcess` and `TestExecutable`. In Go 1.27,
+`testenv.MustHaveExec` does not probe on Linux, so these tests fail rather
+than skip. The process-creating `clone` fails with `EINVAL`
+(`fork/exec /app: invalid argument`).
+
+The tests skip 23 themselves. Six need `go build`. Seven follow from
+`-test.short`; with `OS_TEST_SHORT=0`, five of them run and pass.
+Five skip because we are root (`TestFilePermissions`,
+`TestReadOnlyWriteFile` and three `RemoveAll` permission tests). The rest
+are the Windows-only `TestStatConsole`, `TestLargeWriteToConsole` (needs
+`-large_write`), `TestMkdirAllAtSlash` (not on a builder), `TestTTYClose`
+(`/dev/tty` is `ENXIO`: there is no controlling terminal, D54) and
+`TestHostname` (it execs `hostname`). Results with `-test.short`, at 1 and
+4 vCPUs on both arches: 244 passed, 37 skipped (14 by our list), 0
+failed. With `OS_TEST_SHORT=0` (x86_64, 2 vCPUs; aarch64, 4 vCPUs): 249
+passed, 32 skipped, 0 failed.
+
+The only `ENOSYS` lines are `socket` (Phase 4) and `pidfd_open` (D57;
+Go falls back). Kernel fixes made for the run:
+
+- `/proc/sys/fs/pipe-max-size` (65536: the fixed pipe ring, with no
+  `F_SETPIPE_SZ`), used by `TestReadFileProc` and `TestDirFSReadFileProc`.
+- `uname` reports the configured host name (`ip=` host field, else
+  `patina`) as its nodename. It was a hard-coded `patina` and disagreed
+  with `/proc/sys/kernel/hostname` and `/etc/hostname`.
+- `patina.cwd`, described above.
+
+The VFS semantics the suite exercises needed no changes. That includes
+`Chtimes` ns precision, `Readdir` paging and seeking, `os.Root` (`openat2`
+`ENOSYS` fallback), FIFOs, pipe deadlines, `RemoveAll`, `Truncate`,
+`Link` and `Lchown`.

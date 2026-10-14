@@ -7,6 +7,8 @@
 #
 # Each extra `src:dst` copies file `src` to `dst` inside the archive
 # (a leading `/` on dst is dropped; parent directories are created 0755).
+# A directory maps with a trailing slash on dst, `dir:/dst/`: the tree under
+# `dir` is copied to `dst/` (symlinks are kept as symlinks).
 # Uses the host `cpio` (GNU cpio or bsdcpio/libarchive).
 set -euo pipefail
 
@@ -33,8 +35,16 @@ for spec in "$@"; do
     echo "mkinitrd: extra file must be src:dst, got '$spec'" >&2
     exit 2
   fi
-  [[ -f $src ]] || { echo "mkinitrd: no such file: $src" >&2; exit 1; }
   dst=${dst#/}
+  if [[ $dst == */ ]]; then
+    [[ -d $src ]] || { echo "mkinitrd: no such directory: $src" >&2; exit 1; }
+    dst=${dst%/}
+    [[ -n $dst && $dst != app ]] || { echo "mkinitrd: bad directory destination '$spec'" >&2; exit 2; }
+    mkdir -p "$stage/$dst"
+    cp -RP "$src/." "$stage/$dst/"
+    continue
+  fi
+  [[ -f $src ]] || { echo "mkinitrd: no such file: $src" >&2; exit 1; }
   [[ $dst != app ]] || { echo "mkinitrd: 'app' is reserved for the program" >&2; exit 2; }
   mkdir -p "$stage/$(dirname "$dst")"
   cp "$src" "$stage/$dst"

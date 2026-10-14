@@ -11,6 +11,7 @@ console=<dev> [ip=...] [patina.strace=1] patina.epoch=<unix-seconds> [patina.env
 - Tokens are separated by single spaces. `--` is always present; everything after the first `--` is argv[1:], and the kernel sets argv[0] = `/app`.
 - Keys, values and args are percent-encoded: every byte ≤0x20 or ≥0x7f, plus `% , = " ' \`. Decoding is `%XX` → that byte, all else literal.
 - `patina.env`: split on a raw `,`, then each item on its first raw `=`, then percent-decode.
+- `patina.cwd=<dir>` (optional, percent-decoded): the program's initial working directory, like a container's WORKDIR. It must be an existing directory in the initrd; otherwise the kernel logs it and starts in `/`. The CLI does not send it yet (used by `scripts/test-os.sh`).
 - Exception: QEMU microvm with `acpi=off` appends ` virtio_mmio.device=512@0xfeb00e00:12` *after* `--`. The CLI always escapes `=` in args, so a raw `virtio_mmio.device=` token after `--` is a kernel parameter, not an arg.
 - `console=`: `ttyAMA0` (PL011, QEMU aarch64), `ttyS0` (16550 at 0x3f8 on x86; Firecracker/CH), `hvc0` (virtio-console, Apple VZ).
 - Networking: `--net user` → `ip=10.0.2.15::10.0.2.2:255.255.255.0:patina:eth0:off:10.0.2.3` plus a virtio-net-device. A tap device → `ip=dhcp`.

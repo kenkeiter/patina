@@ -40,6 +40,9 @@ use super::file::File;
 use crate::sync::{OnceCell, SpinLock};
 
 static FS: OnceCell<SpinLock<Fs>> = OnceCell::new();
+/// The initial working directory (`patina.cwd`), if not the root. The
+/// cell holds a reference on it for the life of the system.
+static INITIAL_CWD: OnceCell<Ino> = OnceCell::new();
 
 /// The global filesystem as a `patina_vfs::FsRef`.
 #[derive(Clone, Copy, Debug)]
@@ -91,13 +94,22 @@ pub fn init(epoch_ns: u64) {
     }
 }
 
-/// A reference on the root directory (the initial cwd).
+/// A reference on the initial cwd: the `patina.cwd` directory
+/// ([`set_initial_cwd`]), else the root.
 pub fn root_ref() -> Ino {
     with(|fs| {
-        let r = fs.root();
+        let r = INITIAL_CWD.get().copied().unwrap_or_else(|| fs.root());
         let _ = fs.get_ref(r);
         r
     })
+}
+
+/// Make the directory `ino` the initial cwd. FS locked; takes a
+/// reference that is never dropped. Only the first call has an effect.
+pub fn set_initial_cwd(fs: &mut Fs, ino: Ino) {
+    if INITIAL_CWD.get().is_none() && fs.get_ref(ino).is_ok() && INITIAL_CWD.set(ino).is_err() {
+        fs.put_ref(ino);
+    }
 }
 
 /// Kernel behaviour of a special node (device, FIFO, generated file).

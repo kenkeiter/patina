@@ -1,0 +1,21 @@
+# Go os package tests skipped under patina (scripts/test-os.sh).
+# One top-level test per line: TestName  # reason
+#
+# Network (sockets are Phase 4; socket() is ENOSYS).
+TestLargeCopyViaNetwork  # network: Phase 4
+TestSpliceFile  # network: Phase 4 (splice to unix/tcp sockets)
+TestGetPollFDAndNetwork  # network: Phase 4
+TestSendFile  # network: Phase 4 (sendfile to unix/tcp sockets)
+#
+# Child processes: testenv.MustHaveExec does not probe on linux, so these
+# fail instead of skipping (fork/exec of /app fails).
+TestFileChdirTestlog  # needs os/exec (no execve, D57)
+TestStdPipe  # needs os/exec (no execve, D57)
+TestReadNonblockingFd  # needs os/exec (no execve, D57)
+TestProcessWithHandleLinux  # needs os/exec (no execve, D57)
+TestKillFindProcess  # needs os/exec (no execve, D57)
+TestKillStartProcess  # needs os/exec (no execve, D57)
+TestGetppid  # needs os/exec (no execve, D57)
+TestStatStdin  # needs os/exec (no execve, D57)
+TestStartProcess  # needs os/exec (no execve, D57): runs pwd
+TestExecutable  # needs os/exec (no execve, D57): re-executes itself
