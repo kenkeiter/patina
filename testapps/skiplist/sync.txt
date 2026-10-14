@@ -1,0 +1,6 @@
+# Go sync package tests skipped under patina (scripts/test-gopkg.sh, D74).
+# One top-level test per line: TestName  # reason
+#
+# Child processes: these check a child's crash output.
+TestMutexMisuse  # needs os/exec (no execve, D57): checks a child's "unlock of unlocked mutex" fatal error
+TestIssue76126  # needs os/exec (no execve, D57): checks a child's panic output

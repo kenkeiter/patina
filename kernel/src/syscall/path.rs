@@ -11,8 +11,8 @@ use core::sync::atomic::Ordering;
 use patina_abi::errno::{EBADF, EINVAL, ENOTDIR, EOPNOTSUPP, EPERM, ERANGE, Errno};
 use patina_abi::fs::{
     AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_STATX_SYNC_TYPE,
-    AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, O_CLOEXEC, S_IFCHR, S_IFDIR, S_IFIFO,
-    S_IFMT, S_IFREG, S_IFSOCK, ST_RELATIME, Statfs, Statx, StatxTimestamp, TMPFS_MAGIC,
+    AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW, O_CLOEXEC, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG,
+    S_IFSOCK, ST_RELATIME, Statfs, Statx, StatxTimestamp, TMPFS_MAGIC,
 };
 use patina_abi::time::{Timespec, Timeval};
 use patina_vfs::{FileType, SetTime};
@@ -438,6 +438,20 @@ pub fn statfs(path: usize, buf: usize) -> SysResult {
     namei::with_node(AT_FDCWD, &p, true, false, |_| Ok(()))?;
     with_space(|s| s.write_val(buf, &statfs_val()))?;
     Ok(0)
+}
+
+/// `umount2(path, flags)`: there is one filesystem and nothing is
+/// mounted on top of it, so an existing path is never a mount point
+/// (`EINVAL`, as Linux for a non-mount-point; `ENOENT` if missing).
+/// Go's syscall tests call it to clean up after a failed child.
+pub fn umount2(path: usize, flags: u32) -> SysResult {
+    // MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW.
+    if flags & !0xf != 0 {
+        return Err(Errno(EINVAL));
+    }
+    let p = upath(path)?;
+    namei::with_node(AT_FDCWD, &p, flags & 8 == 0, false, |_| Ok(()))?;
+    Err(Errno(EINVAL))
 }
 
 pub fn fstatfs(fd: i32, buf: usize) -> SysResult {

@@ -423,7 +423,12 @@ struct Received {
 }
 
 /// `room`: bytes of `msg_control` the caller offers (0: none).
-fn recv_common(of: &OpenFile, mut iov: Iov, flags: MsgFlags, room: usize) -> Result<Received, Errno> {
+fn recv_common(
+    of: &OpenFile,
+    mut iov: Iov,
+    flags: MsgFlags,
+    room: usize,
+) -> Result<Received, Errno> {
     let o = ops(of);
     let nonblock = of.flags().nonblocking() || flags.contains(MsgFlags::DONTWAIT);
     let until = deadline(o.timeouts().0);
@@ -445,7 +450,11 @@ fn recv_common(of: &OpenFile, mut iov: Iov, flags: MsgFlags, room: usize) -> Res
                         out |= MsgFlags::CTRUNC;
                     }
                     return Ok(Received {
-                        ret: if flags.contains(MsgFlags::TRUNC) { r.full } else { r.len },
+                        ret: if flags.contains(MsgFlags::TRUNC) {
+                            r.full
+                        } else {
+                            r.len
+                        },
                         from: r.from,
                         flags: out,
                         control: r.control,
@@ -507,7 +516,11 @@ fn recv_common(of: &OpenFile, mut iov: Iov, flags: MsgFlags, room: usize) -> Res
 
 pub fn sendto(fd: i32, buf: usize, len: usize, flags: u32, addr: usize, alen: usize) -> SysResult {
     let of = sock(fd)?;
-    let to = if addr != 0 { Some(read_addr(addr, alen)?) } else { None };
+    let to = if addr != 0 {
+        Some(read_addr(addr, alen)?)
+    } else {
+        None
+    };
     send_common(
         &of,
         Iov::new(vec![(buf, len.min(isize::MAX as usize))]),
@@ -517,7 +530,14 @@ pub fn sendto(fd: i32, buf: usize, len: usize, flags: u32, addr: usize, alen: us
     )
 }
 
-pub fn recvfrom(fd: i32, buf: usize, len: usize, flags: u32, addr: usize, alenp: usize) -> SysResult {
+pub fn recvfrom(
+    fd: i32,
+    buf: usize,
+    len: usize,
+    flags: u32,
+    addr: usize,
+    alenp: usize,
+) -> SysResult {
     let of = sock(fd)?;
     let r = recv_common(
         &of,
@@ -558,9 +578,15 @@ pub fn recvmsg(fd: i32, msg: usize, flags: u32) -> SysResult {
         return Err(Errno(EINVAL));
     }
     let iov = Iov::new(read_iov(m.msg_iov as usize, m.msg_iovlen as usize)?);
-    let room = if m.msg_control != 0 { m.msg_controllen as usize } else { 0 };
+    let room = if m.msg_control != 0 {
+        m.msg_controllen as usize
+    } else {
+        0
+    };
     let r = recv_common(&of, iov, MsgFlags::from_bits_retain(flags), room)?;
-    let mut out = r.flags;
+    // Linux (`____sys_recvmsg`) starts `msg_flags` from the caller's
+    // MSG_CMSG_CLOEXEC and reports it back (Go's TestSCMCredentials).
+    let mut out = r.flags | (MsgFlags::from_bits_retain(flags) & MsgFlags::CMSG_CLOEXEC);
     if m.msg_name != 0 {
         match &r.from {
             Some(a) => {

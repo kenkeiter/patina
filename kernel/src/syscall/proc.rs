@@ -1,7 +1,11 @@
 //! Process-level syscalls: exit, ids, uname, affinity, rlimits,
 //! getrandom, x86 `arch_prctl`.
 
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
+
+use patina_abi::current::nr;
 
 use patina_abi::epoll::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
 use patina_abi::errno::{EINVAL, ESRCH, Errno};
@@ -163,11 +167,12 @@ pub fn arch_prctl(frame: &mut crate::arch::ctx::TrapFrame, code: i32, addr: u64)
 
 // ---- Tier-3 stubs (design §7; policy in doc/decisions.md D57) ----------
 
-/// `prctl`: thread name, dumpable, no_new_privs, VMA names; else `EINVAL`.
+/// `prctl`: thread name, dumpable, no_new_privs, VMA names, keepcaps;
+/// else `EINVAL`.
 pub fn prctl(op: i32, arg2: u64) -> SysResult {
     use patina_abi::misc::{
-        PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_SET_DUMPABLE, PR_SET_NAME,
-        PR_SET_NO_NEW_PRIVS, PR_SET_VMA, TASK_COMM_LEN,
+        PR_GET_DUMPABLE, PR_GET_KEEPCAPS, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_SET_DUMPABLE,
+        PR_SET_KEEPCAPS, PR_SET_NAME, PR_SET_NO_NEW_PRIVS, PR_SET_VMA, TASK_COMM_LEN,
     };
     match op {
         PR_SET_NAME => {
@@ -199,11 +204,13 @@ pub fn prctl(op: i32, arg2: u64) -> SysResult {
         PR_SET_NO_NEW_PRIVS => Ok(0),
         PR_GET_NO_NEW_PRIVS => Ok(0),
         PR_SET_VMA => Ok(0),
+        PR_GET_KEEPCAPS => Ok(task::current().cred.lock().keepcaps as isize),
+        PR_SET_KEEPCAPS => task::current().cred.lock().set_keepcaps(arg2).map(|_| 0),
         _ => Err(Errno(EINVAL)),
     }
 }
 
-/// `capget`: version negotiation, then empty capability sets.
+/// `capget`: version negotiation, then the caller's capability sets.
 pub fn capget(hdr: usize, data: usize) -> SysResult {
     use patina_abi::misc::{
         CapUserData, CapUserHeader, LINUX_CAPABILITY_VERSION_1, LINUX_CAPABILITY_VERSION_2,
@@ -223,7 +230,14 @@ pub fn capget(hdr: usize, data: usize) -> SysResult {
         return Err(Errno(EINVAL));
     }
     if data != 0 {
-        let d = [CapUserData::default(); 2];
+        // The calling thread's sets (all or nothing, patina_abi::cred).
+        let c = *task::current().cred.lock();
+        let set = |i: u32| CapUserData {
+            effective: (c.cap_eff >> (32 * i)) as u32,
+            permitted: (c.cap_prm >> (32 * i)) as u32,
+            inheritable: 0,
+        };
+        let d = [set(0), set(1)];
         for (i, v) in d.iter().take(n).enumerate() {
             with_space(|s| s.write_val(data + i * size_of::<CapUserData>(), v))?;
         }
@@ -279,10 +293,68 @@ pub fn sysinfo(buf: usize) -> SysResult {
 }
 
 /// `getresuid`/`getresgid`: everything is 0 (root).
-pub fn getres(a: usize, b: usize, c: usize) -> SysResult {
-    for p in [a, b, c] {
-        with_space(|s| s.write_val(p, &0u32))?;
+pub fn getres(gid: bool, a: usize, b: usize, c: usize) -> SysResult {
+    let cr = *task::current().cred.lock();
+    let ids = if gid { cr.gid } else { cr.uid };
+    for (p, v) in [(a, ids.r), (b, ids.e), (c, ids.s)] {
+        with_space(|s| s.write_val(p, &v))?;
     }
+    Ok(0)
+}
+
+/// `getuid` / `geteuid` / `getgid` / `getegid` of the calling thread.
+pub fn get_id(n: usize) -> u32 {
+    let c = *task::current().cred.lock();
+    match n {
+        nr::GETUID => c.uid.r,
+        nr::GETEUID => c.uid.e,
+        nr::GETGID => c.gid.r,
+        _ => c.gid.e,
+    }
+}
+
+/// The `set*uid` / `set*gid` family on the calling thread's credentials
+/// (Linux rules in `patina_abi::cred`; Go applies them to every thread
+/// through `AllThreadsSyscall`).
+pub fn set_id(n: usize, a: u32, b: u32, c: u32) -> SysResult {
+    let t = task::current();
+    let mut cr = t.cred.lock();
+    let r = match n {
+        nr::SETUID => cr.setuid(a),
+        nr::SETGID => cr.setgid(a),
+        nr::SETREUID => cr.setreuid(a, b),
+        nr::SETREGID => cr.setregid(a, b),
+        nr::SETRESUID => cr.setresuid(a, b, c),
+        nr::SETRESGID => cr.setresgid(a, b, c),
+        nr::SETFSUID => return Ok(cr.setfsuid(a) as isize),
+        _ => return Ok(cr.setfsgid(a) as isize),
+    };
+    r.map(|_| 0)
+}
+
+/// `getgroups(size, list)`.
+pub fn getgroups(size: i32, list: usize) -> SysResult {
+    let g = task::current().groups.lock().clone();
+    let n = patina_abi::cred::getgroups_count(size, g.len())?;
+    for (i, v) in g.iter().take(n).enumerate() {
+        with_space(|s| s.write_val(list + i * 4, v))?;
+    }
+    Ok(g.len() as isize)
+}
+
+/// `setgroups(size, list)` (the calling thread; Go uses AllThreadsSyscall).
+pub fn setgroups(size: usize, list: usize) -> SysResult {
+    let t = task::current();
+    let cr = *t.cred.lock();
+    patina_abi::cred::check_setgroups(&cr, size)?;
+    let mut g = Vec::with_capacity(size);
+    for i in 0..size {
+        let v: u32 = with_space(|s| s.read_val(list + i * 4))?;
+        g.push(v);
+    }
+    // Linux keeps the list sorted (groups_sort).
+    g.sort_unstable();
+    *t.groups.lock() = Arc::new(g);
     Ok(0)
 }
 

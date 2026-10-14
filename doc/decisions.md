@@ -2100,6 +2100,89 @@ not a 2-byte `sun_family`-only address that Go decodes as the abstract name
 net 254 passed, 55 skipped (1 by our list: `TestSplice`), 0 failed;
 net/http 611 passed, 10 skipped, 0 failed; os 248 passed, 33 skipped (10 by
 our list), 0 failed.
+## D74: Milestone B harness (test-gopkg.sh), package list and skip-list policy
+*2026-10-14 · Phase 5*
+
+`scripts/test-gopkg.sh <pkg>... [--arch aarch64|x86_64|both] [--cpus N]
+[--run RE] [--no-short] [--mem MiB]` generalises the os and net runs (D65,
+D73) to any std package; `test-os.sh` and `test-gonet.sh` are now thin
+wrappers (their knobs map to the new flags; logs moved to
+`out/test/gopkg/<pkg>-<arch>-cpuN.log`). Per package and arch it builds
+the kernel, `go test -c` (static, `-trimpath`), and packs `/app`, the
+package directory at `/src/<pkg>`, `$GOROOT/src/testdata` at
+`/src/testdata` and `$GOROOT/src/go.mod` at `/src/go.mod`. With that file
+`internal/testenv` finds GOROOT (`/`) by walking up from the cwd, which a
+`-trimpath` binary otherwise lacks; `time`'s `TestLoadLocationFromTZData`
+and net/http's `TestNoUnicodeStrings` then run. Per-package extras: `os`
+gets the small `/usr/bin` of D65; `time` gets
+`$GOROOT/lib/time/zoneinfo.zip` at `/lib/time/zoneinfo.zip` (its tests
+load `../../lib/time/zoneinfo.zip`; no `ZONEINFO` is needed). Every run
+has `patina.cwd=/src/<pkg>`, `HOME=/root`, a slirp NIC and the CLI's static
+`ip=` line (harmless for non-net packages), and `-test.v -test.timeout
+<t> -test.short -test.skip ^(…)$`. Defaults: 1 GiB, 900 s QEMU timeout,
+`-test.timeout 13m`; `runtime` gets 2 GiB, 1500 s and 23m (1 GiB is enough
+with `-short`; the margin is for `--no-short`). Overrides: `--mem` /
+`PATINA_MEM` / `GOPKG_MEM_<pkg>`, `PATINA_TIMEOUT` / `GOPKG_TIMEOUT_<pkg>`,
+`GOPKG_TEST_TIMEOUT` / `GOPKG_GOTIMEOUT_<pkg>`. Counting, the summary line
+and the failure rules are those of D65, plus a final summary block.
+
+Packages: design §13's `runtime`, `os`, `net`, `os/signal`, `time`,
+`sync`, `syscall`, plus `io`, `bufio`, `context`, `net/http`,
+`runtime/pprof` and `os/user`. All pass on aarch64 at 1 and 4 vCPUs (counts
+in doc/status.md, **test-gopkg**); `runtime` also passes on x86_64 at 1
+vCPU. The whole set takes a few minutes on aarch64/HVF.
+
+Skip lists follow D65 (only tests that fail, one reason each, the list
+only shrinks). They are `runtime.txt` (11), `os.txt` (10, unchanged),
+`net.txt` (1, unchanged), `os_signal.txt` (2), `sync.txt` (2) and
+`syscall.txt` (10). By category: "needs os/exec (no execve, D57)" 35 —
+tests that re-execute the test binary or run `cat`, because
+`testenv.MustHaveExec` does not probe on Linux; "GODEBUG re-exec" 1
+(`runtime` `TestIssue66841`). No test needed a "/proc details",
+"needs more RAM" or "too slow" entry. `syscall` `TestFcntlFlock` is listed
+for exec only; its `F_SETLK` half failed first and was fixed. No test was
+non-deterministic: three 4-vCPU `runtime` runs were identical.
+
+Kernel changes the run needed:
+
+- `recvmsg` reports `MSG_CMSG_CLOEXEC` back in `msg_flags` when the caller
+  passed it, as Linux's `____sys_recvmsg` does (syscall
+  `TestSCMCredentials`).
+- Per-thread credentials. `Thread::cred` holds real, effective, saved and
+  fs uid/gid, an all-or-nothing capability model and `keepcaps`;
+  `Thread::groups` holds the supplementary groups. `clone` copies the
+  parent's. The `set*uid`, `set*gid`, `setfs*id` and `setgroups` rules,
+  including `cap_emulate_setxuid`, live in `patina_abi::cred` with host
+  tests (Go's `TestSetuidEtc` sequence is one). `get*id`, `getres*id` and
+  `getgroups` report them, `capget` reports the sets (it used to report
+  empty sets, D57), and `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS` work.
+  `/proc/1/status` shows the main thread's `Uid`/`Gid`/`Groups`/`CapPrm`/
+  `CapEff`. `/proc/1/task` lists the live threads, each `<tid>` directory
+  with `status` (`Pid:` = tid), `stat` and `comm`; the directories are
+  synced when `/proc/1/task` is opened. Nothing enforces file permissions:
+  after dropping euid 0 the program can still do everything. Exposed by
+  syscall `TestSetuidEtc` (needs `/proc/<pid>/task` and real `Uid:` lines)
+  and `TestAllThreadsSyscall`, and by os/signal
+  `TestAllThreadsSyscallSignals` (`PR_SET_KEEPCAPS` through
+  `AllThreadsSyscall` was `EINVAL`).
+- `fcntl` record locks (`F_GETLK`, `F_SETLK`, `F_SETLKW`, `F_OFD_*`) were
+  `EINVAL`. They are now checked as `fs/locks.c` does: lock type, whence
+  and range (`patina_fsutil::lock_range`, host-tested; `EINVAL` /
+  `EOVERFLOW`), `EBADF` for a lock the open mode forbids, and `l_pid` 0
+  for OFD locks. They are always granted, and `F_GETLK` answers `F_UNLCK`.
+  With one process a POSIX lock never conflicts. OFD locks are treated
+  like `flock` (D57), so two descriptions do not exclude each other
+  (syscall `TestFcntlFlock`).
+- `umount2` gives `EINVAL` for an existing path (nothing is mounted on
+  the single filesystem) and `ENOENT` for a missing one, instead of
+  `ENOSYS` (syscall `TestUnshareMountNameSpace` cleanup).
+
+`ENOSYS` lines left in the runs are `pidfd_open` (D57) and `clone3`,
+which the syscall tests use for namespaces and pidfds. Both stay `ENOSYS`
+on purpose: Go falls back to `clone`, which cannot create a process (D57).
+`cargo fmt --all --check` still reports `kernel/src/arch/aarch64/{dtb,its,
+mod}.rs` and `kernel/src/drivers/virtio/pci.rs`. Those paths belong to
+another change and were left alone.
 
 ## D75: vDSO (clock_gettime, gettimeofday, getrandom) and the vvar page
 *2026-10-14 · Phase 5*

@@ -1,0 +1,18 @@
+# Go runtime package tests skipped under patina (scripts/test-gopkg.sh, D74).
+# One top-level test per line: TestName  # reason
+#
+# Child processes: these re-execute the test binary (testenv.Executable /
+# os.Args[0]) and check the child's output or exit status.
+# testenv.MustHaveExec does not probe on linux, so they fail instead of
+# skipping (fork/exec /app: function not implemented).
+TestFinalizerRegisterABI  # needs os/exec (no execve, D57): runs itself
+TestRuntimePanic  # needs os/exec (no execve, D57): checks a child's panic output
+TestTracebackRuntimeFunction  # needs os/exec (no execve, D57): checks a child's traceback
+TestTracebackRuntimeMethod  # needs os/exec (no execve, D57): checks a child's traceback
+TestG0StackOverflow  # needs os/exec (no execve, D57): checks a child's crash
+TestCrashWhileTracing  # needs os/exec (no execve, D57): reads a child's trace
+TestArenaCollision  # needs os/exec (no execve, D57): runs itself
+TestMemHashGlobalSeed  # needs os/exec (no execve, D57): compares two children's hash seeds
+TestTracebackSystem  # needs os/exec (no execve, D57): checks a child's crash report
+TestIssue66841  # GODEBUG re-exec: reruns itself with GODEBUG=cpu.aes=off
+TestPanicSystemstack  # needs os/exec (no execve, D57): checks a child's crash output (runs without -test.short only)

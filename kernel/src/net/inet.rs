@@ -251,7 +251,10 @@ impl Sock {
                 ev |= EpollFlags::OUT | EpollFlags::WRNORM | EpollFlags::HUP;
             }
             Kind::Tcp(Tcp::Listen(l)) => {
-                if l.pending.iter().any(|&h| accept_ready(tcp_sock(sockets, h).state())) {
+                if l.pending
+                    .iter()
+                    .any(|&h| accept_ready(tcp_sock(sockets, h).state()))
+                {
                     ev |= EpollFlags::IN | EpollFlags::RDNORM;
                 }
             }
@@ -260,8 +263,8 @@ impl Sock {
                 let t = tcp_sock(sockets, c.h);
                 let st = t.state();
                 rxq = t.recv_queue();
-                let peer_fin =
-                    matches!(st, CloseWait | LastAck | Closing | TimeWait) || (st == Closed && c.est);
+                let peer_fin = matches!(st, CloseWait | LastAck | Closing | TimeWait)
+                    || (st == Closed && c.est);
                 let rcv_shut = self.shut_rd || peer_fin;
                 let snd_shut = self.shut_wr
                     || matches!(st, FinWait1 | FinWait2 | Closing | LastAck | TimeWait)
@@ -602,7 +605,12 @@ pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Er
 impl InetSocket {
     /// Decode a destination/bind address for this socket's family:
     /// (IP with `::ffff:` unmapped, port).
-    fn inet_addr(&self, a: &SockAddr, v6only: bool, mapped_err: i32) -> Result<(IpAddr, u16), Errno> {
+    fn inet_addr(
+        &self,
+        a: &SockAddr,
+        v6only: bool,
+        mapped_err: i32,
+    ) -> Result<(IpAddr, u16), Errno> {
         match (self.family, a) {
             (AF_INET, SockAddr::V4 { addr, port }) => Ok((IpAddr::V4(*addr), *port)),
             (AF_INET6, SockAddr::V6 { addr, port, .. }) => match addr.to_ipv4_mapped() {
@@ -828,7 +836,11 @@ impl InetSocket {
             SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW => Ok(so::timeval_bytes(o.sndtimeo, out)),
             SO_BROADCAST | SO_OOBINLINE | SO_PRIORITY | SO_RCVLOWAT | SO_SNDLOWAT
             | SO_DONTROUTE | SO_NO_CHECK | SO_TIMESTAMP_OLD => {
-                let def = if name == SO_RCVLOWAT || name == SO_SNDLOWAT { 1 } else { 0 };
+                let def = if name == SO_RCVLOWAT || name == SO_SNDLOWAT {
+                    1
+                } else {
+                    0
+                };
                 int(*o.misc.get(&(SOL_SOCKET, name)).unwrap_or(&def), out)
             }
             SO_BINDTODEVICE => Ok(0),
@@ -957,16 +969,19 @@ impl SocketOps for InetSocket {
             let Some((h, peer, local, st)) = found else {
                 return Err(Errno(EAGAIN));
             };
-            let mut ns = Sock::new(family, Kind::Tcp(Tcp::Conn(Conn {
-                h,
-                connecting: false,
-                started: 0,
-                last: st,
-                est: true,
-                reset: false,
-                peer,
-                local,
-            })));
+            let mut ns = Sock::new(
+                family,
+                Kind::Tcp(Tcp::Conn(Conn {
+                    h,
+                    connecting: false,
+                    started: 0,
+                    last: st,
+                    est: true,
+                    reset: false,
+                    peer,
+                    local,
+                })),
+            );
             ns.opts = opts;
             ns.opts.misc.clear();
             let id = s.alloc_id();
@@ -1050,10 +1065,11 @@ impl SocketOps for InetSocket {
                 addr: lip.map(Into::into),
                 port: lport,
             };
-            t.connect(s.iface.context(), remote, local).map_err(|e| match e {
-                tcp::ConnectError::InvalidState => Errno(EISCONN),
-                tcp::ConnectError::Unaddressable => Errno(EADDRNOTAVAIL),
-            })?;
+            t.connect(s.iface.context(), remote, local)
+                .map_err(|e| match e {
+                    tcp::ConnectError::InvalidState => Errno(EISCONN),
+                    tcp::ConnectError::Unaddressable => Errno(EADDRNOTAVAIL),
+                })?;
             let local = t.local_endpoint();
             let h = s.sockets.add(t);
             let sock = s.sock(self.id)?;
@@ -1151,10 +1167,7 @@ impl SocketOps for InetSocket {
             let Stack { socks, sockets, .. } = s;
             let sock = socks.get(&self.id).ok_or(Errno(EBADF))?;
             if let Kind::Tcp(Tcp::Conn(c)) = &sock.kind {
-                let l = sockets
-                    .get::<tcp::Socket>(c.h)
-                    .local_endpoint()
-                    .or(c.local);
+                let l = sockets.get::<tcp::Socket>(c.h).local_endpoint().or(c.local);
                 if let Some(l) = l {
                     return Ok(self.view(ip_of(l.addr), l.port));
                 }
@@ -1297,7 +1310,9 @@ impl SocketOps for InetSocket {
                 (SOL_TCP, TCP_NODELAY) => int(o.nodelay as i32, out),
                 (SOL_TCP, TCP_MAXSEG) => {
                     let ipv6 = match &sock.kind {
-                        Kind::Tcp(Tcp::Conn(c)) => c.peer.is_some_and(|p| p.addr.version() == smoltcp::wire::IpVersion::Ipv6),
+                        Kind::Tcp(Tcp::Conn(c)) => c
+                            .peer
+                            .is_some_and(|p| p.addr.version() == smoltcp::wire::IpVersion::Ipv6),
                         _ => self.family == AF_INET6,
                     };
                     int(if ipv6 { 1440 } else { 1460 }, out)

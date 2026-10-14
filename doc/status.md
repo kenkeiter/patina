@@ -28,6 +28,8 @@ scripts/test-os.sh [aarch64] [x86_64]               # Go's own `os` package test
 scripts/test-hello.sh --app sockets|unixsock [arch...] # Phase 4 AF_INET/AF_INET6 and AF_UNIX socket coverage over loopback
 scripts/test-net.sh [aarch64] [x86_64]              # Phase 4 Milestone A on QEMU: httphello via patina run --net user --publish, DHCP, PCI
 scripts/test-gonet.sh [--pkg net/http] [arch...]    # Go's own `net` (or net/http) package tests with testapps/skiplist/net.txt
+scripts/test-gopkg.sh <pkg>... [--arch aarch64|x86_64|both] [--cpus N] [--run RE] [--no-short] [--mem MiB]
+                                                    # Milestone B: any Go std package's tests with testapps/skiplist/<pkg>.txt (D74); test-os.sh/test-gonet.sh wrap it
 PATINA_NET=user scripts/run-qemu.sh <arch> -- patina.selftest=net   # virtio-net driver self-test (ARP against slirp)
 cargo test --workspace --exclude patina-kernel      # host tests
 ```
@@ -389,7 +391,43 @@ CLI and Milestone A:
 
 ## Phase 5 — Hardening
 
-- [ ] Runtime test-suite harness + skip list (**Milestone B**), Tier-3 syscalls, vDSO, console-port control fallback, `AF_VSOCK` for the program, `--strace`, multi-queue net, benchmarks.
+Milestone B (D74): Go 1.27.1 `go test -c` binaries, `-test.short`, aarch64
+= QEMU `virt` HVF, release kernel. Command for every row:
+`scripts/test-gopkg.sh <pkg> --arch aarch64 [--cpus 4]` (logs in
+`out/test/gopkg/`). Counts are top-level tests: passed / skipped (of which
+by our skip list) / failed.
+
+| Name | Package | aarch64, 1 vCPU | aarch64, 4 vCPUs |
+|---|---|---|---|
+| **test-gopkg** | `runtime` | 378 / 148 (11) / 0 | 385 / 141 (11) / 0 (3 runs identical; `--no-short`, 2 GiB: 399 passed, 1 failed — `TestPanicSystemstack`, needs exec, since listed) |
+| **test-gopkg** | `os` | 248 / 33 (10) / 0 | 248 / 33 (10) / 0 |
+| **test-gopkg** | `net` | 254 / 55 (1) / 0 | 254 / 55 (1) / 0 |
+| **test-gopkg** | `os/signal` | 18 / 3 (2) / 0 | 18 / 3 (2) / 0 |
+| **test-gopkg** | `time` | 180 / 4 (0) / 0 | 180 / 4 (0) / 0 |
+| **test-gopkg** | `sync` | 51 / 2 (2) / 0 | 51 / 2 (2) / 0 |
+| **test-gopkg** | `syscall` | 25 / 28 (10) / 0 | 25 / 28 (10) / 0 |
+| **test-gopkg** | `io` | 72 / 0 / 0 | 72 / 0 / 0 |
+| **test-gopkg** | `bufio` | 88 / 0 / 0 | 88 / 0 / 0 |
+| **test-gopkg** | `context` | 46 / 0 / 0 | 46 / 0 / 0 |
+| **test-gopkg** | `net/http` | 612 / 9 (0) / 0 | 611 / 10 (0) / 0 (before the go.mod change) |
+| **test-gopkg** | `runtime/pprof` | 44 / 3 (0) / 0 | 44 / 3 (0) / 0 |
+| **test-gopkg** | `os/user` | 12 / 0 / 0 | 12 / 0 / 0 |
+| **test-gopkg-x86** | `runtime`, x86_64 (microvm, TCG), 1 vCPU | 379 / 150 (11) / 0 | not run |
+
+`ENOSYS` lines across all runs: `pidfd_open` (D57; Go's os/exec probe, falls
+back) and `clone3` (syscall tests that ask for a namespace or pidfd; Go
+falls back to `clone`, which cannot create processes, D57). The 4-vCPU
+column of the other packages was run before the final `go.mod` harness
+change (time then had 179 passed, 5 skipped).
+
+- [x] Milestone B harness `scripts/test-gopkg.sh` (D74): per-package defaults (RAM, timeouts, extra files), skip lists `testapps/skiplist/<pkg>.txt`, summary/failure rules of D65; `test-os.sh`/`test-gonet.sh` are wrappers — **test-gopkg** (reproduced test-os-p4 248/0 and test-gonet 254/0)
+- [x] **Milestone B on aarch64** (QEMU, 1 and 4 vCPUs): the design §13 packages (`runtime`, `os`, `net`, `os/signal`, `time`, `sync`, `syscall`) plus `io`, `bufio`, `context`, `net/http`, `runtime/pprof`, `os/user`, 0 failed; 36 listed tests, all "needs os/exec" or "GODEBUG re-exec" — **test-gopkg**
+- [~] Milestone B on x86_64: only `runtime` at 1 vCPU was run (379 / 150 (11) / 0) — **test-gopkg-x86**
+- [x] `recvmsg` reports `MSG_CMSG_CLOEXEC` back in `msg_flags` — **test-gopkg** syscall `TestSCMCredentials`
+- [x] Per-thread credentials (`set*uid`/`set*gid`/`setfs*`/`setgroups`/`getgroups`/`getres*` with Linux's rules and capability fix-ups, `patina_abi::cred` host-tested), `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS`, `capget` reports the sets, `/proc/1/status` `Uid`/`Gid`/`Groups`/`CapPrm`/`CapEff`, `/proc/1/task/<tid>/{status,stat,comm}` — **test-gopkg** syscall `TestSetuidEtc`, `TestAllThreadsSyscall`; os/signal `TestAllThreadsSyscallSignals`
+- [x] `fcntl` record locks (`F_GETLK`/`F_SETLK`/`F_SETLKW`, `F_OFD_*`): validated like Linux, granted — **test-gopkg** syscall `TestFcntlFlock` (parent half; the child half needs exec and the test is listed)
+- [x] `umount2` → `EINVAL`/`ENOENT` instead of `ENOSYS` — **test-gopkg** syscall (`TestUnshareMountNameSpace` cleanup; no `umount2` ENOSYS line any more)
+- [ ] Still open in Phase 5: console-port control fallback, `AF_VSOCK` for the program (deferred until the vsock driver has run on a real transport), `--strace`, multi-queue net.
 
 ### vDSO
 

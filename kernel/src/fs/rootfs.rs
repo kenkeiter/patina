@@ -31,13 +31,12 @@ pub fn init(
 ) -> Result<PopulateReport, patina_cpio::Error> {
     vfs::init(c.epoch_ns.unwrap_or(0));
     devfs::register();
-    let host = c
-        .ip
-        .as_ref()
-        .and_then(|ip| ip.hostname.clone())
-        .filter(|h| !h.is_empty())
-        .or_else(|| crate::net::effective_config().hostname)
-        .unwrap_or_else(|| String::from("patina"));
+    let host =
+        c.ip.as_ref()
+            .and_then(|ip| ip.hostname.clone())
+            .filter(|h| !h.is_empty())
+            .or_else(|| crate::net::effective_config().hostname)
+            .unwrap_or_else(|| String::from("patina"));
     let _ = HOSTNAME.set(host);
     vfs::with(|fs| {
         let rep = match initrd {
@@ -139,8 +138,18 @@ fn etc(fs: &mut Fs) {
         }
     }
     put(fs, b"/etc/hosts", hosts.as_bytes(), 0o644);
-    put(fs, b"/etc/hostname", format!("{}\n", hostname()).as_bytes(), 0o644);
+    put(
+        fs,
+        b"/etc/hostname",
+        format!("{}\n", hostname()).as_bytes(),
+        0o644,
+    );
     put(fs, b"/etc/nsswitch.conf", b"hosts: files dns\n", 0o644);
-    put(fs, b"/etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n", 0o644);
+    put(
+        fs,
+        b"/etc/passwd",
+        b"root:x:0:0:root:/root:/bin/sh\n",
+        0o644,
+    );
     put(fs, b"/etc/group", b"root:x:0:\n", 0o644);
 }
