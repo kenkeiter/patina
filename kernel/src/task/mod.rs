@@ -20,6 +20,7 @@ pub mod sched;
 pub mod selftest;
 pub mod signal;
 pub mod sleep;
+pub mod timers;
 pub mod wait;
 
 use alloc::boxed::Box;

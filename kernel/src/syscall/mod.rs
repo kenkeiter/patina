@@ -261,6 +261,17 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::GETTIMEOFDAY => time::gettimeofday(u(0)),
         nr::NANOSLEEP => time::nanosleep(u(0), u(1)),
         nr::CLOCK_NANOSLEEP => time::clock_nanosleep(i(0), i(1), u(2), u(3)),
+        nr::TIMER_CREATE => time::timer_create(i(0), u(1), u(2)),
+        nr::TIMER_SETTIME => time::timer_settime(i(0), i(1), u(2), u(3)),
+        nr::TIMER_GETTIME => time::timer_gettime(i(0), u(1)),
+        nr::TIMER_GETOVERRUN => time::timer_getoverrun(i(0)),
+        nr::TIMER_DELETE => time::timer_delete(i(0)),
+        nr::GETITIMER => time::getitimer(i(0), u(1)),
+        nr::SETITIMER => time::setitimer(i(0), u(1), u(2)),
+        #[cfg(target_arch = "x86_64")]
+        nr::ALARM => time::alarm(a[0] as u32),
+        nr::GETRUSAGE => time::getrusage(i(0), u(1)),
+        nr::TIMES => time::times(u(0)),
 
         // thread.rs
         nr::CLONE => thread::clone(frame, a),

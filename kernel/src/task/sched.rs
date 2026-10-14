@@ -286,6 +286,33 @@ pub fn cpu_time_ns(t: &Thread) -> u64 {
     t.cpu_time_ns.load(Ordering::Relaxed)
 }
 
+/// CPU time (ns) of any thread including its running slice (CPU-clock
+/// timers checked from the tick, `clock_gettime` of another thread's
+/// clock). Lock-free: retried if the thread is switched out while being
+/// read. A reader racing the few instructions of a switch-in (state
+/// already `Running`, `run_start` not yet updated) can overcount once by
+/// the previous thread's slice; callers tolerate that.
+pub fn thread_cpu_time_ns(t: &Thread) -> u64 {
+    loop {
+        let acc = t.cpu_time_ns.load(Ordering::Acquire);
+        if t.state() != ThreadState::Running {
+            if t.cpu_time_ns.load(Ordering::Acquire) == acc {
+                return acc;
+            }
+            continue;
+        }
+        let c = t.cpu.load(Ordering::Relaxed);
+        let start = CPUS[c].run_start.load(Ordering::Acquire);
+        let now = timer::now_ns();
+        if t.cpu_time_ns.load(Ordering::Acquire) == acc
+            && t.state() == ThreadState::Running
+            && t.cpu.load(Ordering::Relaxed) == c
+        {
+            return acc + now.saturating_sub(start);
+        }
+    }
+}
+
 /// Choose the CPU for a thread that becomes runnable (see the module docs)
 /// and claim it if it is an idle remote CPU. Returns (cpu, needs IPI).
 fn place(t: &Thread) -> (usize, bool) {
@@ -630,6 +657,7 @@ pub fn tick() {
     let cpu = this_cpu();
     let now = timer::now_ns();
     let woke = super::sleep::expire(now);
+    super::timers::tick();
     let next = super::sleep::next_deadline().unwrap_or(NO_DEADLINE);
     if next != cpu.armed.load(Ordering::Relaxed) {
         cpu.armed.store(next, Ordering::Relaxed);
