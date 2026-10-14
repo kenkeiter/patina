@@ -25,7 +25,7 @@ mod time;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use patina_abi::current::{self, nr};
-use patina_abi::errno::{ECHILD, ENOSYS, EOPNOTSUPP, EPERM, Errno};
+use patina_abi::errno::{ECHILD, EINVAL, ENOSYS, EOPNOTSUPP, EPERM, Errno};
 #[cfg(target_arch = "x86_64")]
 use patina_abi::fs::AT_FDCWD;
 
@@ -251,9 +251,11 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::SYNC => Ok(0),
         nr::READAHEAD => fs::fadvise64(i(0), 0),
         // Go falls back to read/write on ENOSYS; not worth a log line.
-        nr::COPY_FILE_RANGE | nr::SENDFILE | nr::SPLICE | nr::TEE | nr::OPENAT2 => {
-            Err(Errno(ENOSYS))
-        }
+        nr::COPY_FILE_RANGE | nr::SENDFILE | nr::OPENAT2 => Err(Errno(ENOSYS)),
+        // Go's splice path (io.Copy between TCP conns, poll.Splice) falls
+        // back only on EINVAL ("splice unsupported for this fd type");
+        // ENOSYS would fail the copy.
+        nr::SPLICE | nr::TEE => Err(Errno(EINVAL)),
         #[cfg(target_arch = "x86_64")]
         nr::DUP2 => fs::dup2(i(0), i(1)),
         #[cfg(target_arch = "x86_64")]

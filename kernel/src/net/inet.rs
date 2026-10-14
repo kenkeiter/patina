@@ -104,6 +104,8 @@ pub enum Tcp {
 pub struct Udp {
     h: SocketHandle,
     peer: Option<IpEndpoint>,
+    /// Source address picked at `connect` (what `getsockname` shows).
+    local: Option<IpAddr>,
 }
 
 pub enum Kind {
@@ -577,6 +579,7 @@ pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Er
             Kind::Udp(Udp {
                 h: s.sockets.add(new_udp()),
                 peer: None,
+                local: None,
             })
         };
         let id = s.alloc_id();
@@ -990,6 +993,7 @@ impl SocketOps for InetSocket {
                     if *addr == SockAddr::Unspec {
                         if let Kind::Udp(u) = &mut sock.kind {
                             u.peer = None;
+                            u.local = None;
                         }
                         return Ok(());
                     }
@@ -999,8 +1003,14 @@ impl SocketOps for InetSocket {
                         return Err(Errno(ENETUNREACH));
                     }
                     s.autobind(self.id)?;
+                    let src = if ip.is_loopback() {
+                        Some(ip)
+                    } else {
+                        s.iface.get_source_address(&ip.into()).map(ip_of)
+                    };
                     if let Kind::Udp(u) = &mut s.sock(self.id)?.kind {
                         u.peer = Some(IpEndpoint::new(ip.into(), port));
+                        u.local = src;
                     }
                     return Ok(());
                 }
@@ -1145,8 +1155,12 @@ impl SocketOps for InetSocket {
                     return Ok(self.view(ip_of(l.addr), l.port));
                 }
             }
+            let conn_local = match &sock.kind {
+                Kind::Udp(u) => u.local,
+                _ => None,
+            };
             Ok(match sock.bound {
-                Some((ip, port)) => self.view(ip.unwrap_or(self.wildcard()), port),
+                Some((ip, port)) => self.view(ip.or(conn_local).unwrap_or(self.wildcard()), port),
                 None => self.view(self.wildcard(), 0),
             })
         })
