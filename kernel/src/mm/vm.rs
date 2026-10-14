@@ -168,6 +168,11 @@ impl AddressSpace {
             .filter(|v| addr < v.end)
     }
 
+    /// User pages that currently have a frame (`VmRSS`).
+    pub fn resident_pages(&self) -> usize {
+        self.resident.len()
+    }
+
     /// Iterate the VMAs in address order.
     pub fn vmas(&self) -> impl Iterator<Item = &Vma> {
         self.vmas.values()
@@ -237,9 +242,30 @@ impl AddressSpace {
     /// `sd` to free once no CPU can reach them.
     fn release_frames(&mut self, start: usize, end: usize, sd: &mut Shootdown) {
         let pages: Vec<usize> = self.resident.range(start..end).copied().collect();
+        let mut last_region = usize::MAX;
+        let mut regions = Vec::new();
         for va in pages {
             self.resident.remove(&va);
             if let Some(pa) = self.tables.unmap(va) {
+                sd.free_frame(pa);
+            }
+            if va >> 21 != last_region {
+                last_region = va >> 21;
+                regions.push(va);
+            }
+        }
+        // Free the page tables that became empty (D80): one walk per
+        // 2 MiB region that had resident pages. Their frames are freed
+        // only after the walk caches were invalidated (aarch64: broadcast,
+        // complete on return; x86_64: local here, other CPUs through the
+        // shootdown).
+        let mut tables = Vec::new();
+        for va in regions {
+            self.tables.prune(va, &mut tables);
+        }
+        if !tables.is_empty() {
+            crate::arch::uspace::flush_table_walks();
+            for pa in tables {
                 sd.free_frame(pa);
             }
         }

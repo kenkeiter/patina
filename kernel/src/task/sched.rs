@@ -574,6 +574,19 @@ pub fn print_stats() {
             p.switches.load(Ordering::Relaxed),
         ));
     }
+    let (heap_user, heap_actual, heap_total) = crate::mm::heap::stats();
+    let (slots, pooled, unmapped) = super::kstack::stats();
+    crate::console::panic_write_fmt(format_args!(
+        "[patina] stats mem: heap {} B used ({} B actual) / {} B, kstack slots {} ({} pooled, {} unmapped), tlb-pending frames {}, threads {}\n",
+        heap_user,
+        heap_actual,
+        heap_total,
+        slots,
+        pooled,
+        unmapped,
+        crate::mm::tlb::pending_frames(),
+        super::threads().len(),
+    ));
 }
 
 /// Switch this CPU from `prev` (`None`: the idle loop) to `next` (`None`:

@@ -34,6 +34,11 @@ bitflags! {
         const DEVICE = 1 << 3;
         /// Accessible from EL0.
         const USER = 1 << 4;
+        /// Kernel mapping that may be removed again (`unmap_page`):
+        /// x86_64 leaves it non-global so the CR3-reload shootdown covers
+        /// it; aarch64 ignores it (kernel pages are invalidated by
+        /// broadcast `TLBI VAAE1IS`).
+        const LOCAL = 1 << 5;
     }
 }
 
@@ -222,6 +227,45 @@ pub fn kernel_root() -> PhysAddr {
 /// Map `[va, va+len)` -> `[pa, pa+len)` in the kernel (TTBR1) tables.
 pub fn map_range(va: VirtAddr, pa: PhysAddr, len: usize, flags: MapFlags) -> Result<(), MapError> {
     map_in(kernel_root(), va.0, pa.0, len, flags)
+}
+
+/// Remove the kernel 4 KiB page mapping at `va` (made by [`map_range`])
+/// and invalidate it on every CPU (`TLBI VAAE1IS` + `DSB ISH`, complete on
+/// return). Returns the frame that was mapped. The caller serializes
+/// kernel map/unmap of the same region.
+pub fn unmap_page(va: VirtAddr) -> Option<PhysAddr> {
+    let mut table = kernel_root().0 as u64;
+    for level in 0..4 {
+        let idx = (va.0 >> (39 - 9 * level)) & (ENTRIES - 1);
+        // SAFETY: `table` is a live kernel table frame.
+        let slot = unsafe { table_ptr(table).add(idx) };
+        // SAFETY: as above.
+        let e = unsafe { slot.read_volatile() };
+        if e & DESC_VALID == 0 {
+            return None;
+        }
+        if level == 3 {
+            let arg = (va.0 as u64 >> 12) & ((1 << 44) - 1);
+            // SAFETY: clears a leaf nobody uses any more; TLB maintenance.
+            unsafe {
+                slot.write_volatile(0);
+                asm!(
+                    "dsb ishst",
+                    "tlbi vaae1is, {}",
+                    "dsb ish",
+                    "isb",
+                    in(reg) arg,
+                    options(nostack, preserves_flags)
+                );
+            }
+            return Some(PhysAddr((e & ADDR_MASK) as usize));
+        }
+        if e & DESC_TABLE == 0 {
+            return None; // a block: never created for 4 KiB kernel pages
+        }
+        table = e & ADDR_MASK;
+    }
+    None
 }
 
 const MAX_DEVICE_MAPS: usize = 32;

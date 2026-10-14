@@ -1,4 +1,3 @@
 package main
 
-func checkReclaim() {}
-func runOOM()       {}
+func runOOM() {}
