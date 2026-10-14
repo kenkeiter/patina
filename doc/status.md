@@ -22,6 +22,9 @@ scripts/test-signals.sh [aarch64] [x86_64]          # 6 signal cases per arch (s
 scripts/test-smp.sh [--app <name>] [--cpus "1 2 4"] [--repeat N] [arch...]
                                                     # app at each vCPU count (default smpstress; smpstress/threads get -cpus N)
 scripts/test-runtime.sh [aarch64] [x86_64]          # Phase 2 umbrella: hello, threads, smpstress, fdtest, signals, pproftest per CPU count
+scripts/test-hello.sh --app fileio [arch...]        # Phase 3 VFS/devfs/procfs/FIFO/os.Root coverage (48 checks)
+scripts/test-ctl.sh [aarch64] [x86_64]              # Phase 3 control channel over the patina.ctl port: 8 cases per arch
+scripts/test-os.sh [aarch64] [x86_64]               # Go's own `os` package tests under patina with testapps/skiplist/os.txt
 cargo test --workspace --exclude patina-kernel      # host tests
 ```
 
@@ -29,7 +32,11 @@ Environment for `run-qemu.sh` (and `smoke.sh`): `PATINA_MEM` (MiB, default
 512), `PATINA_CPUS` (default 1), `PATINA_ACCEL` (`hvf`/`kvm`/`tcg`),
 `PATINA_TIMEOUT` (seconds, default 60), `PATINA_KERNEL`, `PATINA_LOG`,
 `PATINA_QEMU_EXTRA`, `PATINA_MACHINE` (x86_64: `microvm` default, `pc`,
-`q35`). `test-hello.sh --app` passes `PATINA_PARAMS` as extra kernel
+`q35`), `PATINA_CTL_SOCK` (path of the Unix socket behind the `patina.ctl`
+virtio-console port; `run-qemu.sh` always adds the virtio-serial device, the
+port and a `virtio-rng-device`, like the CLI), `PATINA_CTL_WAIT=1` (QEMU
+`wait=on`: boot only once a client is attached), `PATINA_CONSOLE=hvc0`
+(console on virtio-console port 0 instead of the UART). `test-hello.sh --app` passes `PATINA_PARAMS` as extra kernel
 params (e.g. `patina.strace=1`). `test-runtime.sh` runs every suite at each
 CPU count in `PATINA_CPUS_LIST` (default `1 2 4`) and prints one PASS/FAIL
 row per case (logs in `out/test/runtime/`); `test-smp.sh` logs to
@@ -139,17 +146,17 @@ Test names (all QEMU 11.1.2 `-M microvm -accel tcg -cpu max`, release profile un
 `V` verified (named test) · `U` untested (code written to the spec, never
 booted) · `—` not applicable.
 
-| Target | boot | console | poweroff | initrd | SMP bring-up (Phase 2) |
-|---|---|---|---|---|---|
-| QEMU `virt` aarch64, HVF | V **boot-hvf** | V PL011 | V PSCI HVC | V **initrd-args** | V **selftest-smp-a64** (1/2/4/8 CPUs, GICv3, PSCI HVC); scheduler: **test-smp**, **threads-smp**, **fdtest-smp**, **test-signals-smp**, **pproftest**, **test-runtime** (1/2/4 CPUs) |
-| QEMU `virt` aarch64, TCG | V **boot-tcg**, **el2-drop** | V PL011 | V PSCI HVC / SMC | V (same DTB path; **initrd-args** run on HVF) | V **selftest-smp-a64** (GICv3 1/2/4, GICv2, EL2 entry + PSCI SMC); scheduler: **test-smp** (`PATINA_ACCEL=tcg`, 4 CPUs) |
-| QEMU `microvm` x86_64, TCG | V **boot-x86** | V 16550 port 0x3f8 | V isa-debug-exit | V **initrd-args-x86** | V **selftest-smp-x86** (1/2/4/8 CPUs, MADT via BIOS-area RSDP scan); scheduler: **test-smp**, **threads-smp**, **fdtest-smp**, **test-signals-smp**, **pproftest**, **test-runtime** (1/2/4 CPUs), **tlbstress** (D52 shootdown) |
-| QEMU `pc` / `q35` x86_64, TCG | V **machines-x86** | V 16550 | V isa-debug-exit; ACPI/i8042 fallback (one of them) | V **machines-x86** | V **selftest-smp-x86** (MADT) |
-| Firecracker aarch64 | U (no KVM on this host) | U 16550 MMIO | U PSCI | U | U |
-| Firecracker x86_64 | U | U | U | U | U (MP table / MADT) |
-| Cloud Hypervisor aarch64 | U | U 16550 MMIO | U PSCI | U | U |
-| Cloud Hypervisor x86_64 | U | U | U | U | U |
-| Apple VZ aarch64 | U (needs the CLI's VZ shim) | U (`hvc0` = virtio-console, not driven yet; falls back to a DTB UART if any) | U PSCI | U | U |
+| Target | boot | console | poweroff | initrd | SMP bring-up (Phase 2) | virtio + control channel (Phase 3) |
+|---|---|---|---|---|---|---|
+| QEMU `virt` aarch64, HVF | V **boot-hvf** | V PL011; V `hvc0` (**hvc0**) | V PSCI HVC | V **initrd-args** | V **selftest-smp-a64** (1/2/4/8 CPUs, GICv3, PSCI HVC); scheduler: **test-smp**, **threads-smp**, **fdtest-smp**, **test-signals-smp**, **pproftest**, **test-runtime** (1/2/4 CPUs) | V DTB discovery, GIC SPIs, rng, console port `patina.ctl` — **virtio-discovery**, **test-ctl** |
+| QEMU `virt` aarch64, TCG | V **boot-tcg**, **el2-drop** | V PL011 | V PSCI HVC / SMC | V (same DTB path; **initrd-args** run on HVF) | V **selftest-smp-a64** (GICv3 1/2/4, GICv2, EL2 entry + PSCI SMC); scheduler: **test-smp** (`PATINA_ACCEL=tcg`, 4 CPUs) | V modern (v2) MMIO with `force-legacy=false` (**virtio-discovery**) |
+| QEMU `microvm` x86_64, TCG | V **boot-x86** | V 16550 port 0x3f8; V `hvc0` (**hvc0**) | V isa-debug-exit; V ACPI S5 sleep-control register (**poweroff-order**) | V **initrd-args-x86** | V **selftest-smp-x86** (1/2/4/8 CPUs, MADT via BIOS-area RSDP scan); scheduler: **test-smp**, **threads-smp**, **fdtest-smp**, **test-signals-smp**, **pproftest**, **test-runtime** (1/2/4 CPUs), **tlbstress** (D52 shootdown) | V DSDT discovery (ACPI on) and cmdline entries (`acpi=off`), I/O APIC, rng, `patina.ctl` — **virtio-discovery**, **test-ctl** |
+| QEMU `pc` / `q35` x86_64, TCG | V **machines-x86** | V 16550 | V isa-debug-exit; V ACPI S5 via PM1a (**poweroff-order**, pc) | V **machines-x86** | V **selftest-smp-x86** (MADT) | V none found (`virtio: no devices`, `ctl: no transport`), virtio-pci is Phase 4 |
+| Firecracker aarch64 | U (no KVM on this host) | U 16550 MMIO | U PSCI | U | U | U DTB discovery, vsock 4242 |
+| Firecracker x86_64 | U | U | U i8042 reset (last in the D64 order) | U | U (MP table / MADT) | U `virtio_mmio.device=` cmdline entries, DSDT, vsock |
+| Cloud Hypervisor aarch64 | U | U PL011 | U PSCI | U | U | U needs virtio-pci (Phase 4) |
+| Cloud Hypervisor x86_64 | U | U | U ACPI S5 at port 0x600 (D64) | U | U | U needs virtio-pci (Phase 4) |
+| Apple VZ aarch64 | U (needs the CLI's VZ shim) | U `hvc0` = virtio-console port 0 (driven since Phase 3, verified only on QEMU) | U PSCI | U | U | U DTB discovery, vsock 4242 |
 
 ## Phase 1 — Hello
 
@@ -194,8 +201,8 @@ Phase 1 proper:
 - [x] Signal state: `rt_sigaction` for 1..64 (KILL/STOP rejected), per-thread `rt_sigprocmask`, `sigaltstack` stored and validated — **hello-strace** (114 `rt_sigaction` calls, `sigaltstack`, `rt_sigprocmask`); delivery, `rt_sigreturn` and `kill`/`tgkill` now work and are verified in Phase 2 (**test-signals**)
 - [x] `exit_group` / last thread exit → `[patina] exit code N` and poweroff — **test-hello** (exit 0 and 3)
 - [x] First Go binary (`testapps/hello`) prints and exits with the right code on both arches — **test-hello**, **test-hello-tcg**
-- [~] `AT_RANDOM`/`getrandom` from a non-cryptographic PRNG (D35) until virtio-rng (Phase 3)
-- [ ] `patina run` end-to-end through the CLI (the CLI's QEMU driver and bundle format are untested against this kernel; `scripts/test-hello.sh` uses `scripts/run-qemu.sh`)
+- [x] `AT_RANDOM`/`getrandom` from a ChaCha20 DRBG seeded by virtio-rng (D60, replaces D35) — Phase 3 **rng-seed**
+- [x] `patina run` end-to-end through the CLI — Phase 3 **test-cli**
 
 ## Phase 2 — Runtime
 
@@ -278,20 +285,60 @@ SMP and timers (arch layer, D47/D48):
 - [x] `setitimer`/`getitimer`, `timer_create`/`settime`/`gettime`/`getoverrun`/`delete` (`SIGEV_THREAD_ID`, `SI_TIMER` / `SI_KERNEL`), CPU-clock timers (D51) — **pproftest** (SIGALRM after 21–31 ms, 10–17 SIGUSR1 per 100 ms from a 5 ms timer, Go's per-M `timer_create(0x3, …)` in strace)
 - [x] pprof CPU profiles (Go's per-M `CLOCK_THREAD_CPUTIME_ID` SIGPROF timers and `ITIMER_PROF`) — **pproftest** (94–200 samples per run at 100 Hz)
 - [~] `alarm`, `getrusage`, `times`, `clock_nanosleep` on CPU clocks (`EINVAL`/`ENOTSUP`), `TIMER_ABSTIME`, `ITIMER_VIRTUAL`, overrun accounting under load — implemented, untested
-- [~] `getrandom`/`AT_RANDOM` seeded from `cpu::hw_random` (RNDR / RDSEED / RDRAND), logged as `[patina] random: seeded from …` (D50) — every **test-smp** log shows the line; HVF on this host has no RNDR (`seeded from boot counter only`), only TCG `-cpu max` does. Still not cryptographic (D35)
+- [x] `getrandom`/`AT_RANDOM` seeded from `cpu::hw_random` (RNDR / RDSEED / RDRAND), logged as `[patina] random: seeded from …` (D50) — every **test-smp** log shows the line; HVF on this host has no RNDR, only TCG `-cpu max` does. Since Phase 3 the generator is a ChaCha20 DRBG seeded from virtio-rng as well (D60, **rng-seed**)
 - [~] x2APIC IPIs, APIC ids > 254, > 8 CPUs, PSCI SMC on real firmware — implemented, untested
 - [~] Firecracker x86_64 + aarch64, KVM / Cloud Hypervisor: SMP and scheduler code written to the spec, never booted (needs a KVM host)
 
 ## Phase 3 — OS
 
-- [ ] VFS: initrd unpacked into a writable in-memory tree
-- [ ] devfs (`null zero full urandom random console stdin stdout stderr`), procfs-lite, `/sys/kernel/mm/transparent_hugepage/hpage_pmd_size`, `/tmp`
-- [x] Pipes, eventfd, epoll over a common `File` trait — landed in Phase 2 (**fdtest**, D46)
-- [ ] Tier-2 file syscalls (§7): `pread64 pwrite64 readv writev lseek newfstatat/fstat statx getdents64 mkdirat unlinkat renameat2 readlinkat symlinkat linkat ftruncate fchmod fchown utimensat fsync faccessat2 dup dup3 getcwd chdir getuid geteuid getgid getegid`
-- [ ] virtio-mmio discovery (DTB / `virtio_mmio.device=` / microvm probe)
-- [ ] Control channel: virtio-vsock port 4242 and the `patina.ctl` virtio-serial port; `ping`, `signal`, `stop`, `time`, `dump`; `ready`, `exit`, `panic`, `log` events
-- [ ] virtio-rng; QEMU scripts add the `patina.ctl` port and `virtio-rng-device`
-- [ ] `os` package tests pass
+Test names (aarch64 = QEMU `virt` HVF, x86_64 = QEMU `microvm` TCG with
+ACPI on, release profile, `PATINA_CPUS=1` unless noted). Decisions:
+D53–D57 (VFS, devfs/procfs, FIFOs, path conventions, Tier-3 stubs),
+D58–D64 (in-tree virtio, discovery and IRQ routing, RNG, console port and
+hvc0, vsock, control channel, x86_64 poweroff order), D65 (os test run),
+D66 (`patina run`).
+
+| Name | Command | Observed |
+|---|---|---|
+| **fileio** | `scripts/test-hello.sh --app fileio aarch64 x86_64` (also with `PATINA_CPUS=4`) | `PASS fileio aarch64`, `PASS fileio x86_64`; 48 `ok` lines per arch: write/read/append+seek/stat/rename/truncate/mkdir+readdir/symlink/large file (1 MiB)/not exist/O_EXCL/O_TRUNC/EISDIR/ENOTEMPTY/ENOTDIR/rename over + across dirs/link + nlink/chmod/chown/chtimes/`os.Executable()==/app`/getwd+chdir+relative open/ReadDir of `/ /dev /proc /etc`/`/etc/hosts`/`/proc/self/maps`/`/proc/cpuinfo`/`/dev/null` `/dev/zero` `/dev/urandom`/FIFO (`Mkfifo` + goroutine)/umask/offset shared by dup/O_APPEND from two fds/seek past EOF hole/truncate grow/CreateTemp/RemoveAll/WalkDir/`os.Root` (openat2 → ENOSYS fallback)/Fstat/Flock/io.Copy file→file (copy_file_range → ENOSYS fallback)/Statfs; no `ENOSYS`/`fatal` lines |
+| **go-startup-reads** | `PATINA_PARAMS=patina.strace=1 scripts/test-hello.sh --app fileio aarch64` | `openat path "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size"` → fd 3, `read(0x3, …) = 8`; `openat path "/proc/self/cgroup"` → `-ENOENT` (deliberate: Go assumes no cgroup CPU limit) |
+| **loader-errors-p3** | the four Phase 1 **loader-errors** cases re-run through the VFS | 127 `/app not found in the initrd`; 126 `/app: not an ELF file (bad magic)`; 126 wrong-arch message; 127 `initrd is not a valid newc cpio archive (cpio: BadMagic at offset 0)` |
+| **virtio-discovery** | boot logs of any run (`[patina] virtio:` lines) | aarch64 `virt`: `mmio @ 0xa003c00 irq 78 device-id 4 (rng) [dtb, virtio-mmio v1 (legacy), …, edge irq]`, `mmio @ 0xa003e00 irq 79 device-id 3 (console)`; x86_64 `microvm` ACPI on: `acpi: bios-area rsdp: 2 ioapic(s), …, dsdt 420 bytes, 2 virtio-mmio device(s), _S5 Some(5)`, `mmio @ 0xfeb02e00 irq 47 device-id 3 (console) [acpi dsdt, …, level irq]`, `mmio @ 0xfeb02c00 irq 46 device-id 4 (rng)`; `microvm` with `acpi=off`: `mmio @ 0xfeb00e00 irq 12 … (console) [cmdline, …, edge irq]`, `0xfeb00c00 irq 11 (rng)`; `pc`/`q35`: `virtio: no devices`, `ctl: no transport`, exit 0. Modern (v2) MMIO: aarch64 with `-global virtio-mmio.force-legacy=false` |
+| **rng-seed** | any boot log | `[patina] random: seeded from virtio-rng (+RNDR)` (TCG) / `(+boot counter)`; D60 |
+| **test-ctl** | `scripts/test-ctl.sh aarch64 x86_64` | 16/16 PASS (ready-ping, stop-handler, stop-nohandler, stop-forced, dump, usr1-time, hvc0, panic × 2 arches). Lines: `{"ev":"ready","go":"go1.27.1","cpus":2,"mem_mb":512}` (x86_64 reports 511: the e820 map), `{"ev":"pong","id":42,"uptime_ms":104}`, `{"ev":"exit","code":0,"forced":false}`, `{"ev":"exit","code":143,"signal":"SIGTERM","forced":false}`, `{"ev":"exit","code":137,"forced":true}` 1.01 s after `stop` with `grace_ms` 1000, `{"ev":"error","id":6,"msg":"signal not injectable","field":"sig"}`, `{"ev":"log","level":"warn","msg":"ENOSYS 9999 (?)"}`, `{"ev":"panic","msg":"selftest"}` then the dump and exit 255; `dump` → goroutine dump and exit 2; `time` to 2000-01-01 → `SIGUSR1 at 946684800`; the channel survives disconnect + reconnect and a late-connecting host still gets `ready` |
+| **hvc0** | `PATINA_CONSOLE=hvc0 scripts/run-qemu.sh <arch> …` (the `hvc0` case of **test-ctl**) | the whole boot log, the program output and `[patina] exit code N` on virtio-console port 0 while `patina.ctl` works on port 1, both arches |
+| **poweroff-order** | `PATINA_MACHINE=pc`/`microvm` without `isa-debug-exit` | `[patina] poweroff: acpi s5 via pm1a_cnt (io 0x604, SLP_TYP 0)` (pc), `acpi s5 via sleep control register (mem 0xfea00200, SLP_TYP 5)` (microvm); with the device, isa-debug-exit as before (D64) |
+| **selftests-p3** | `PATINA_CPUS=4 … patina.selftest=smp` / `timer`, both arches | `smp: ok (4 cpus, …)`, `timer: ok (5 ticks in 52 ms)` after the IOAPIC/IRQ changes |
+| **test-runtime-p3** | `PATINA_CPUS_LIST="1 2 4" scripts/test-runtime.sh aarch64 x86_64` on main 149968b (VFS + virtio + control channel + os harness merged) | 66/66 rows PASS, `test-runtime: all passed`; in the same session **test-ctl** 16/16, **fileio** at `PATINA_CPUS=4` on both arches and **test-os** at 1 and 4 vCPUs on both arches all passed |
+| **test-os** | `PATINA_CPUS=1 scripts/test-os.sh aarch64 x86_64` and `PATINA_CPUS=4 …` (Go 1.27.1 `go test -c os`, `-test.short`, `$GOROOT/src/os` packed at `/src/os` with `patina.cwd=/src/os`, skip list `testapps/skiplist/os.txt`) | `os aarch64 (cpus=1): 244 passed, 37 skipped (14 by our list), 0 failed, exit 0`; the same four numbers for x86_64 and at 4 vCPUs on both (aarch64 4-vCPU repeated 4×). The 23 self-skips: 6 need `go build`, 7 `-test.short`, 5 because we are root, `TestStatConsole` (Windows), `TestLargeWriteToConsole` (flag), `TestMkdirAllAtSlash` (builders only), `TestTTYClose` (`/dev/tty` ENXIO by design), `TestHostname` (execs `hostname`). Our 14: 4 "network: Phase 4" (`TestLargeCopyViaNetwork TestSpliceFile TestGetPollFDAndNetwork TestSendFile`), 10 "needs os/exec (no execve, D57)". Without `-test.short`: 249 passed, 32 skipped, 0 failed (x86_64 2 vCPUs, aarch64 4 vCPUs). ENOSYS lines seen: `socket` (skipped net tests), `pidfd_open` (Go falls back). ~25 s per run on HVF, ~30 s on TCG |
+| **test-cli** | `cd cli && PATINA_E2E=1 go test ./internal/run -run E2E -v` (builds the CLI and testapps, `patina build` → `patina run` on QEMU, `patina ctl` from a second process; `PATINA_E2E_ARCH` narrows it) on main fabbb22 | 20/20 PASS in 17 s: per arch hello-args (exit 3, `argv: ["/app" "3" "a" "b"]`, `-v` ready line), stop-handler (0, `PASS signals (handler)`, ctl prints the exit event), stop-nohandler (143, `"signal":"SIGTERM"`), stop-forced (`-mode ignore`, `--grace 1s` → 137 `forced:true` in ~1.3 s), ping (pong + uptime), dump (`SIGQUIT: quit`, goroutine dump, exit 2), signal-usr1, timeout (`--timeout 3s` → 124), interrupt-nohandler (SIGINT → 143), interrupt-twice (→ 137 < 3 s). `go test ./...` and `go vet ./...` in `cli/` green; `scripts/test-hello.sh` still passes with hello's new `env:` line. By hand: `--cpus 1/2`, `--mem 256`, `--strace` (231/237 `[strace]` lines), `--env FOO=bar`, `patina ps` |
+
+VFS and files (D53–D57):
+
+- [x] VFS: initrd unpacked into a writable in-memory tree (`patina-vfs` behind one IRQ-safe `SpinLock`, file pages borrowed from the initrd until written, `/app` opened through it) — **fileio**, **loader-errors-p3**, every Phase 2 suite
+- [x] Regular files with a per-description offset, `O_APPEND`/`O_TRUNC`/`O_EXCL`/`O_NONBLOCK`/`O_CLOEXEC`/`FD_CLOEXEC`/`O_DIRECTORY`/`O_NOFOLLOW`/`O_PATH`, directories with `getdents64`, cwd (`chdir`/`fchdir`/`getcwd`), umask — **fileio**
+- [x] devfs (`null zero full urandom random console stdin stdout stderr fd tty`), procfs-lite (`self/exe cwd maps status stat fd/`, `cpuinfo`, `meminfo`, `sys/kernel/*`, `mounts`, `uptime`, `version`), `/sys/kernel/mm/transparent_hugepage/hpage_pmd_size`, writable `/tmp`, generated `/etc/{resolv.conf,hosts,nsswitch.conf,passwd,group}` unless the initrd supplies them — **fileio**, **go-startup-reads**
+- [x] Pipes, eventfd, epoll over a common `File` trait — Phase 2 (**fdtest**, D46); named FIFOs (D55) — **fileio**
+- [x] Tier-2 file syscalls (§7): `pread64 pwrite64 readv writev lseek newfstatat/fstat statx getdents64 mkdirat unlinkat renameat2 readlinkat symlinkat linkat ftruncate fchmod fchown utimensat fsync faccessat2 dup dup3 getcwd chdir getuid geteuid getgid getegid`, plus `fchdir fstatfs statfs umask mknodat truncate fallocate flock fadvise64 close_range` and the x86_64 legacy entry points — **fileio**; `copy_file_range`/`sendfile`/`splice`/`openat2` are silent `ENOSYS` (Go falls back) — **fileio** (`io.Copy`, `os.Root`)
+- [x] Tier-3 stubs (D57): `wait4/waitid → ECHILD`, `execve/fork/vfork → ENOSYS`, `prctl`, `getpgrp/setpgid/getsid`, `set*id → 0`, `capget/capset`, `sched_*`, `sysinfo`, `getcpu`, `mlock*`, xattr → `EOPNOTSUPP` — implemented; exercised by **test-os** (see its row)
+- [~] Not exercised: FIFO opens interrupted by a signal, `O_NONBLOCK` FIFO opens, `RENAME_EXCHANGE` from the kernel side (host-tested only), `statx` on non-VFS files, device nodes from the initrd bound by `rdev`, `ip=`-derived `/etc/hosts`/`resolv.conf` contents
+
+Devices and control channel (D58–D64):
+
+- [x] virtio-mmio (legacy and modern) with an in-tree `Transport` trait + split virtqueues (D58); discovery from the DTB (aarch64), `virtio_mmio.device=` cmdline entries (Firecracker x86_64; microvm `acpi=off`), the ACPI DSDT `LNRO0005` scan (microvm with ACPI, Firecracker ≥ 1.8), and a `0xfeb00000` probe as the last resort (D59) — **virtio-discovery** (DTB, DSDT and cmdline paths; the probe path untested)
+- [x] IRQ routing: GIC SPIs on aarch64; x86_64 I/O APIC (MADT, level/edge from the DSDT) with LAPIC EOI, device IRQs on CPU 0 — **test-ctl** at `PATINA_CPUS=2`, **selftests-p3**
+- [x] virtio-rng feeding a ChaCha20 DRBG (BLAKE2s entropy pool, periodic reseed; `getrandom`, `AT_RANDOM`, `/dev/urandom`) — **rng-seed**, host tests (RFC 8439/7693 vectors)
+- [x] virtio-console multiport: `patina.ctl` found by name through the control-queue handshake, PORT_OPEN tracked; port 0 as `hvc0` console with an early ring flushed when the device comes up — **test-ctl**, **hvc0**
+- [~] virtio-vsock listener on port 4242 (D62): written to virtio 1.2 §5.10, builds on both arches, **never run** (no vhost-vsock on this host)
+- [x] Control channel (D63): one kernel thread; `ping`→`pong(uptime_ms)`, `signal` (SIGTERM INT HUP USR1 USR2 QUIT), `stop` (SIGTERM + grace → forced 137), `time` (steps `CLOCK_REALTIME`, VFS timestamps follow), `dump` (SIGQUIT); events `ready` (go version from `.go.buildinfo`, cpus, mem_mb), `exit` (code, signal, forced; flushed before poweroff), `panic`, `log` (ENOSYS); pending buffer until a host connects; one connection at a time — **test-ctl**
+- [x] x86_64 poweroff order isa-debug-exit → ACPI S5 (hardware-reduced sleep control register, else PM1a) → i8042 reset (D64) — **poweroff-order** (QEMU paths); Cloud Hypervisor S5 at port 0x600 and Firecracker i8042 untested
+- [~] Firecracker (cmdline discovery, 16550 MMIO, i8042), Cloud Hypervisor (virtio-pci: Phase 4), Apple VZ (`hvc0`, vsock): code written to the spec, no host to run them
+
+CLI and `os` tests:
+
+- [x] `patina run` / `patina ctl` end-to-end on QEMU, both arches (D66: chardev `wait=on`, exit-code precedence timeout 124 → `exit` event → `panic` 255 → sentinel → isa-debug-exit → killed 137) — **test-cli**
+- [~] `patina run` on Firecracker, Cloud Hypervisor and Apple VZ: CLI drivers exist (tested against fakes), the kernel side (vsock, hvc0, cmdline discovery, S5/i8042 poweroff) is unverified on this host
+- [x] `os` package tests pass with a 14-entry skip list (D65): kernel additions for it were `patina.cwd=<dir>` (start directory), `/proc/sys/fs/pipe-max-size`, `uname` nodename = hostname, and `mkinitrd.sh` directory mappings — **test-os**
 
 ## Phase 4 — Net
 
@@ -299,7 +346,7 @@ SMP and timers (arch layer, D47/D48):
 - [ ] Socket syscalls (Tier 2): `socket socketpair bind listen accept4 connect getsockname getpeername setsockopt getsockopt sendto recvfrom sendmsg recvmsg shutdown`
 - [ ] Loopback (127.0.0.1, ::1), `AF_UNIX` stream + datagram
 - [ ] `ip=` static and `dhcp`; generated `/etc/resolv.conf`, `/etc/hosts`
-- [ ] CLI `build` / `run` / `ctl` shipped
+- [~] CLI `build` / `run` / `ctl` shipped — working on QEMU since Phase 3 (**test-cli**); Firecracker/Cloud Hypervisor/VZ drivers exist, untested against the kernel
 - [ ] **Milestone A**: `net/http` hello + graceful `patina ctl stop` (Notify and exit-143 variants) on Firecracker, Cloud Hypervisor, QEMU, both arches (+ Apple VZ)
 
 ## Phase 5 — Hardening
