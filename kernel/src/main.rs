@@ -15,6 +15,7 @@ mod arch;
 mod bootinfo;
 mod cmdline;
 mod console;
+mod fs;
 mod loader;
 mod mm;
 mod panic;

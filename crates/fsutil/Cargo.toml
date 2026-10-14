@@ -1,0 +1,9 @@
+[package]
+name = "patina-fsutil"
+version = "0.1.0"
+edition.workspace = true
+description = "patina fd-table slot allocation, pipe ring buffer and eventfd counter (host-testable)"
+license.workspace = true
+publish = false
+
+[dependencies]

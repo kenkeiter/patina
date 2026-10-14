@@ -57,6 +57,8 @@ pub struct Process {
     pub strace: bool,
     /// `patina.epoch`: wall-clock time at boot (`CLOCK_REALTIME` offset).
     pub epoch_ns: u64,
+    /// File descriptors, shared by all threads (design §8).
+    pub files: SpinLock<crate::fs::FdTable>,
 }
 
 static PROCESS: OnceCell<Process> = OnceCell::new();
