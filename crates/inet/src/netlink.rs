@@ -100,7 +100,7 @@ impl Msg {
     }
 
     fn pad(&mut self) {
-        while self.0.len() % NLMSG_ALIGNTO != 0 {
+        while !self.0.len().is_multiple_of(NLMSG_ALIGNTO) {
             self.0.push(0);
         }
     }
