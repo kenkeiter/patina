@@ -115,6 +115,9 @@ fn meminfo() -> Vec<u8> {
     let _ = writeln!(s, "SwapTotal:      {:>8} kB", 0);
     let _ = writeln!(s, "SwapFree:       {:>8} kB", 0);
     let _ = writeln!(s, "Shmem:          {:>8} kB", 0);
+    // Frames the kernel heap holds (slab pages and page-path blocks, D87).
+    let (_, _, heap_total) = crate::mm::heap::stats();
+    let _ = writeln!(s, "Slab:           {:>8} kB", heap_total / 1024);
     let _ = writeln!(s, "Hugepagesize:   {:>8} kB", 2048);
     // D78 commit accounting (Linux reports these under any overcommit mode).
     if let Some(p) = task::try_process() {

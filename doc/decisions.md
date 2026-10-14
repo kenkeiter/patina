@@ -46,6 +46,12 @@ demand: on OOM it pulls at least 2 MiB (a power of two big enough for the
 request) from the frame allocator and retries once. Lock order is
 heap → frames; the frame allocator never allocates from the heap.
 
+*Superseded (Phase 5, D87):* the crate's heap never returned frames, so
+it was replaced by an in-tree slab + page allocator (`mm/heap.rs`, D87
+describes it). The IRQ-safe locking and the heap → frames lock order
+stay; there is no initial chunk any more, the heap takes frames on
+demand. `buddy_system_allocator` is no longer a dependency.
+
 ## D4: In-tree buddy frame allocator
 *2026-10-14 · Phase 0*
 

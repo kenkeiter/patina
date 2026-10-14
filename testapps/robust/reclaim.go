@@ -41,13 +41,18 @@ func procKB(path, key string) int {
 type memSample struct {
 	free   int // MemFree
 	kernel int // frames in use that are not user pages: MemTotal - MemFree - VmRSS
+	// kernel minus Slab (the frames the kernel heap holds): kernel stacks,
+	// page tables. The heap gives frames back as objects are freed (D87),
+	// so it moves with the kernel objects alive at the moment.
+	nonheap int
 }
 
 func sampleMem() memSample {
 	total := procKB("/proc/meminfo", "MemTotal:")
 	free := procKB("/proc/meminfo", "MemFree:")
 	rss := procKB("/proc/self/status", "VmRSS:")
-	return memSample{free: free, kernel: total - free - rss}
+	kernel := total - free - rss
+	return memSample{free: free, kernel: kernel, nonheap: kernel - procKB("/proc/meminfo", "Slab:")}
 }
 
 // settled samples after Go returned what it can to the OS.
@@ -84,20 +89,22 @@ func threadRound(n int) {
 func checkReclaim() {
 	// Kernel stacks: a warm-up round grows Go's heap and the kernel's
 	// pools to their peak, then 5 rounds of 2000 thread exits must leave
-	// the frames the kernel holds flat. (MemFree alone also moves with
-	// what Go's allocator keeps resident, which is not the kernel's.)
+	// the frames the kernel holds outside its heap flat. (MemFree alone
+	// also moves with what Go's allocator keeps resident, which is not the
+	// kernel's; the heap moves with the kernel objects alive, robust
+	// -mode kheap checks it.)
 	threadRound(reclaimThreads)
 	before := settled()
 	for r := 0; r < reclaimRounds; r++ {
 		threadRound(reclaimThreads)
 	}
 	after := settled()
-	if d := after.kernel - before.kernel; d < -maxFrameDelta || d > maxFrameDelta {
-		fail("kstack reclaim: kernel-held frames %d -> %d (delta %d) over %d x %d thread exits (free %d -> %d)",
-			before.kernel, after.kernel, d, reclaimRounds, reclaimThreads, before.free, after.free)
+	if d := after.nonheap - before.nonheap; d < -maxFrameDelta || d > maxFrameDelta {
+		fail("kstack reclaim: kernel-held frames outside the heap %d -> %d (delta %d) over %d x %d thread exits (all kernel %d -> %d, free %d -> %d)",
+			before.nonheap, after.nonheap, d, reclaimRounds, reclaimThreads, before.kernel, after.kernel, before.free, after.free)
 	}
-	ok("kstack reclaim: kernel-held frames %d -> %d (delta %d), free frames %d -> %d, over %d x %d thread exits",
-		before.kernel, after.kernel, after.kernel-before.kernel, before.free, after.free,
+	ok("kstack reclaim: kernel-held frames outside the heap %d -> %d (delta %d; all kernel %d -> %d), free frames %d -> %d, over %d x %d thread exits",
+		before.nonheap, after.nonheap, after.nonheap-before.nonheap, before.kernel, after.kernel, before.free, after.free,
 		reclaimRounds, reclaimThreads)
 
 	// User page tables: 1 GiB lazy mapping, one byte touched every 2 MiB

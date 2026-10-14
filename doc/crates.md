@@ -41,26 +41,13 @@ the manifest pins the major version.
   time on the host) and pulls in `syn`/`quote`/`proc-macro2`, which are
   build-only dependencies and are not linked into the kernel.
 
-## buddy_system_allocator
+## buddy_system_allocator (removed)
 
-- **Version:** 0.13.0 (`buddy_system_allocator = { version = "0.13", default-features = false }`)
-- **Used by:** `patina-kernel` (`kernel/src/mm/heap.rs`)
-- **Why:** the kernel heap (`#[global_allocator]`). Only `Heap<32>` is used,
-  wrapped in the in-tree IRQ-safe `SpinLock` (`kernel/src/sync.rs`). The
-  crate's `LockedHeap` is not used: it needs the `use_spin` feature and its
-  lock does not mask interrupts. The crate's `FrameAllocator` is not used
-  either (it needs a heap); physical frames come from the in-tree buddy
-  allocator in `kernel/src/mm/frame.rs`. The heap is seeded with 8 MiB from
-  the frame allocator and grows by at least 2 MiB on OOM. Design §4/§11 plan
-  to replace it with an in-tree slab later.
-- **no_std:** yes; with default features off it has no dependencies and does
-  not need `alloc`.
-- **Unsafe surface:** about 39 `unsafe` sites, mostly the intrusive free-list
-  linked lists that store `next` pointers inside free blocks.
-  `Heap::add_to_heap` and `Heap::dealloc` are `unsafe fn` (caller guarantees
-  the range is exclusively owned / the pointer came from this heap); the
-  kernel calls `add_to_heap` only on freshly allocated frames and `dealloc`
-  only from `GlobalAlloc::dealloc`.
+- **Was:** 0.13.0, the kernel heap's allocator (`Heap<32>` behind the
+  in-tree IRQ-safe `SpinLock`, D3) until Phase 5. Removed when D87 replaced
+  it with the in-tree slab + page allocator in `kernel/src/mm/heap.rs`,
+  which gives freed frames back to the frame allocator (the crate's heap
+  never did). No longer in `Cargo.lock`.
 
 ## fdt
 
