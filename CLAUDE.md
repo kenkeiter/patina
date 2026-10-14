@@ -4,8 +4,8 @@ Rust unikernel that runs unmodified static `GOOS=linux` Go binaries. The design 
 
 ## Toolchain
 
-- `source ./env.sh` before any cargo command (puts rustup ahead of Homebrew's rust). The toolchain is pinned in `rust-toolchain.toml` (stable, `x86_64-unknown-none` + `aarch64-unknown-none`). No nightly features.
-- Go 1.27 for the CLI and test programs. QEMU 11 from Homebrew (`qemu-system-aarch64` with `-accel hvf` works on this Apple Silicon host; x86_64 runs under TCG).
+- `source ./env.sh` before any cargo command (puts rustup ahead of Homebrew's rust). It hardcodes Homebrew's rustup (`/opt/homebrew/opt/rustup/bin`); with a rustup.rs install, put `~/.cargo/bin` first on `PATH` instead. The scripts source it themselves. The toolchain is pinned in `rust-toolchain.toml` (stable, `x86_64-unknown-none` + `aarch64-unknown-none`). No nightly features.
+- Go 1.27 for the CLI and test programs (Milestone B skip lists are tied to Go 1.27.1). Xcode command line tools (cgo + `codesign`) for `cli/scripts/build.sh`. `python3` and `curl` for `test-ctl.sh` / `test-net.sh`. QEMU 11 from Homebrew (`qemu-system-aarch64` with `-accel hvf` works on this Apple Silicon host; x86_64 runs under TCG).
 - Firecracker / Cloud Hypervisor cannot run on this host (no KVM). Write their code paths to the spec, mark them untested in `doc/status.md`.
 
 ## Layout
@@ -28,6 +28,7 @@ Put logic that does not touch hardware in a `crates/` crate so `cargo test` runs
 - Build kernel: `scripts/build-kernel.sh aarch64|x86_64` → `out/kernel-aarch64.Image`, `out/kernel-x86_64-pvh.elf`.
 - Host tests: `cargo test --workspace --exclude patina-kernel`.
 - Run under QEMU: `scripts/run-qemu.sh <arch> <initrd.cpio> [-- args]` (keep it working as features land).
+- Build the CLI: `cli/scripts/build.sh` → `cli/bin/patina` (ad-hoc signed for `--vmm vz`). `patina build` looks for kernels in `$PATINA_KERNEL_DIR`, then `<repo>/out/` found by walking up from the working directory or the binary's location; a copy outside the repo needs `PATINA_KERNEL_DIR` or `--kernel`.
 - End-to-end: `scripts/test-hello.sh [arch...]` (testapps/hello on both arches; `--threads` runs testapps/threads and shows its output).
 
 ## Rules
