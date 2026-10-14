@@ -212,6 +212,8 @@ for arch in "${arches[@]}"; do
       wait "$qpid" || rc=$?
       bgpids=()
       kill_ours
+      # (the log can lag the exit by a moment on a container bind mount)
+      for _ in $(seq 20); do has "$log" '^\[patina\] exit code' && break; sleep 0.1; done
       pairs=$(tr -d '\r' <"$log" | sed -nE 's/^\[patina\] virtio-net: .*, pairs ([0-9]+).*/\1/p' | head -n1)
       stats=$(tr -d '\r' <"$log" | grep -E '^\[patina\] stats net:' | head -n1 || true)
       rxf=$(sed -nE 's/.*rx frames ([0-9/]+),.*/\1/p' <<<"$stats")

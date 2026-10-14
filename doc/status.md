@@ -507,7 +507,25 @@ handshake was smoltcp arming a keep-alive probe at once when Go enables
 - [x] `fcntl` record locks (`F_GETLK`/`F_SETLK`/`F_SETLKW`, `F_OFD_*`): validated like Linux, granted — **test-gopkg** syscall `TestFcntlFlock` (parent half; the child half needs exec and the test is listed)
 - [x] `umount2` → `EINVAL`/`ENOENT` instead of `ENOSYS` — **test-gopkg** syscall (`TestUnshareMountNameSpace` cleanup; no `umount2` ENOSYS line any more)
 - [x] `AF_VSOCK` stream sockets for the program (D76): `socket/bind/listen/accept4/connect` (blocking and non-blocking + `SO_ERROR`), send/recv/shutdown/close with credit flow control, epoll readiness, loopback (`VMADDR_CID_LOCAL`, own CID), `ECONNRESET` for a refused connect, `/dev/vsock` `IOCTL_VM_SOCKETS_GET_LOCAL_CID`, port 4242 reserved for the control channel — **vz-vsock** (Apple VZ), **vsock-none** (`scripts/test-hello.sh --app vsockapp aarch64 x86_64` on QEMU, no vsock device: `ok socket(AF_VSOCK) without a device -> address family not supported by protocol`, `/dev/vsock` open → `no such device`, PASS both arches; QEMU **test-ctl** 16/16, `test-net.sh aarch64` 7/7, `test-runtime.sh aarch64` 33/33 unchanged), core host tests `cargo test -p patina-inet vsock` (28). Unverified: Firecracker/Cloud Hypervisor vsock, guest→host connections to a host listener (the CLI registers none), `SOCK_SEQPACKET`/`SOCK_DGRAM` (refused)
-- [ ] Still open in Phase 5: console-port control fallback, `--strace`, multi-queue net.
+- [x] Multi-queue virtio-net (D88): `VIRTIO_NET_F_MQ` + `CTRL_VQ`, min(vCPUs, offered) pairs via `VQ_PAIRS_SET`, an MSI-X vector per pair routed to its CPU (x86 MSI, GICv2m SPI, ITS LPI `MOVI`), one smoltcp interface — **netmq-user**, **netmq-tap**
+- [ ] Still open in Phase 5: console-port control fallback, `--strace`.
+
+### Multi-queue virtio-net
+
+Decision D88. `scripts/test-netmq.sh` (httphello behind a `mq=on` NIC:
+GET /, 20 concurrent GETs, /big ×5 and 4 × /big in parallel ×5 with
+sha256, ctl stop → 0; checks the `pairs P` boot line and the
+`patina.stats` net line). Numbers before/after are in D88.
+
+| Name | Command | Observed |
+|---|---|---|
+| **netmq-user** | `scripts/test-netmq.sh aarch64 x86_64` (QEMU 11.1.2 on macOS, `-netdev user`, mmio + pci, 1/2/4 vCPUs) | 12/12 PASS; `virtio-net: … pairs 1 of 1, link up (mmio @ 0xa003a00, hdr 10 B)` / `(pci 0000:00:03.0, hdr 12 B)`: MQ offered with `max_virtqueue_pairs` 1, `VQ_PAIRS_SET 1` answered OK; also `patina.selftest=net` with `mq=on` (aarch64 mmio, x86_64 q35) 64/64 replies |
+| **netmq-tap** | Linux QEMU 10.0 (Debian trixie) in a privileged Docker container on this Mac, TCG: `scripts/test-netmq.sh aarch64 x86_64 --no-build --backend tap` (`-netdev tap,queues=4`) | 12/12 PASS: `pairs 1`, `pairs 2`, `pairs 4 of 4, msi-x vector per pair` at 1/2/4 vCPUs; frames on every pair both ways (e.g. x86 q35 4 vCPUs: rx 5837/6946/7182/9067, tx 14916/17364/17384/22641); NIC interrupts per CPU 556/640/651/823 (x86 q35 MSI), 586/931/635/631 (aarch64 ITS `MOVI`), 131/41/202/154 (aarch64 `-M virt,gic-version=2`, GICv2m); virtio-mmio and GICv3 `its=off` (INTx) one shared line on CPU 0. Re-run on the tree merged with main (2/4 vCPUs): 8/8 |
+| **netmq-vz** | `scripts/test-vz.sh`, `cli/scripts/vztest.sh --e2e` | VZ offers no MQ: unchanged single pair, INTx; test-vz 13/13, e2e PASS, /big 14–19 ms |
+
+Unverified: GICv3 `GICD_IROUTER` routing of a GICv2m SPI with several
+pairs (QEMU hvf, where macOS has no multi-queue backend), Cloud Hypervisor
+`num_queues`, Linux vhost-net.
 
 ### vDSO
 

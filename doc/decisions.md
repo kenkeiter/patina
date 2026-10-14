@@ -3149,8 +3149,41 @@ Untested: GICv3 `GICD_IROUTER` routing of a GICv2m SPI (that is QEMU hvf,
 where no multi-queue backend exists), Cloud Hypervisor (`num_queues`),
 Firecracker (no MQ).
 
-**Measurements** (`scripts/test-netmq.sh`, median of 5; `scripts/bench.sh`'s
-`tcp-*` rows only use loopback and do not reach the NIC). MEASUREMENTS
+**Measurements** (`scripts/test-netmq.sh`, median of 5 per cell; "before"
+is main's kernel, "after" this one; `scripts/bench.sh`'s `tcp-*` rows only
+use loopback and never reach the NIC). GET /big (4 MiB, one flow) in ms,
+at 1 / 2 / 4 vCPUs:
+
+| Setup | before | after |
+|---|---|---|
+| QEMU hvf aarch64 user, mmio | 66 / 75 / 71 | 69 / 71 / 64 |
+| QEMU hvf aarch64 user, pci | 72 / 71 / 66 | 61 / 64 / 69 |
+| QEMU TCG x86_64 user, microvm mmio | 80 / 103 / 135 | 80 / 108 / 116 |
+| QEMU TCG x86_64 user, q35 pci | 80 / 107 / 118 | 86 / 103 / 126 |
+| Docker TCG aarch64 tap ×4, mmio | 106 / 111 / 994 | 105 / 106 / 127 |
+| Docker TCG aarch64 tap ×4, pci (ITS) | 105 / 99 / 105 | 113 / 112 / 166 |
+| Docker TCG x86_64 tap ×4, microvm mmio | 73 / 97 / 117 | 67 / 110 / 112 |
+| Docker TCG x86_64 tap ×4, q35 pci | 69 / 113 / 111 | 70 / 102 / 115 |
+
+Four parallel GET /big (4 flows, batch wall time, ms) on the tap: aarch64
+mmio 502 / 450 / 1341 → 452 / 439 / 492, aarch64 pci 434 / 428 / 435 →
+503 / 471 / 548, x86_64 mmio 306 / 440 / 585 → 295 / 427 / 581, x86_64
+pci 307 / 439 / 604 → 307 / 475 / 619. On QEMU's user network every
+configuration uses one pair before and after, and the numbers agree within
+the run-to-run noise; the 994 ms / 1341 ms "before" cell is the lost-edge
+bug above (the 1 s poll). With real queue pairs, under TCG, multi-queue
+buys nothing measurable: the guest's stack is one lock and one net task
+(D67), QEMU services every tap queue from its one main-loop thread, and
+TCG vCPUs are slow to wake. On aarch64 pci with 4 pairs (interrupts
+spread over 4 CPUs, each presumably waking the net task by IPI) the single flow
+gets ~30 % slower, the 4-flow batch ~20 % (x86 within noise).
+`patina.net.queues=1` restores one pair. Apple VZ (one pair either way,
+`cli/scripts/vztest.sh --e2e`, 2 vCPUs, interleaved A/B of 10 fetches
+each): /big 14–19 ms before, 14–18 ms after (one outlier each side at
+28 / 35 ms). Loopback `bench.sh` (unchanged code path): tcp-rtt aarch64
+4.47 / 4.43 / 4.47 → 4.33 / 4.44 / 4.41 µs, x86_64 79.8 / 89.1 / 87.4 →
+77.3 / 84.3 / 92.3 µs; tcp-throughput aarch64 697 / 735 / 733 → 705 / 750 /
+759 MB/s, x86_64 134 / 112 / 84 → 144 / 122 / 101 MB/s.
 
 **CLI.** Unchanged: the QEMU argv keeps `virtio-net-device,netdev=net0`
 without `mq=on`. With `-netdev user` the device can only offer one pair
