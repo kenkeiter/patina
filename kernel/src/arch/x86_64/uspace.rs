@@ -20,6 +20,22 @@ pub const USER_VA_END: usize = 0x0000_8000_0000_0000;
 
 const ENTRIES: usize = 512;
 
+/// Software bit (AVL, ignored by the MMU in a not-present entry) marking a
+/// PROT_NONE page: the entry is not present, so every access faults, but it
+/// still records the frame so `translate` reports it (with empty
+/// permissions) and `unmap` hands it back. Same contract as aarch64.
+const SW_PROT_NONE: u64 = 1 << 9;
+
+/// Leaf entry for a user page; PROT_NONE (none of READ/WRITE/EXEC) is a
+/// not-present entry carrying the frame.
+fn encode(pa: PhysAddr, flags: MapFlags) -> u64 {
+    let pa = pa.0 as u64 & ADDR_MASK;
+    if !flags.intersects(MapFlags::READ | MapFlags::WRITE | MapFlags::EXEC) {
+        return pa | SW_PROT_NONE;
+    }
+    pa | leaf_attrs(flags | MapFlags::USER) | PTE_P
+}
+
 #[derive(Debug)]
 pub struct UserTables {
     root: PhysAddr,
@@ -91,10 +107,10 @@ impl UserTables {
         let slot = self.pte(va, true)?.ok_or(MapError::NoMemory)?;
         // SAFETY: a PTE of this address space.
         let e = unsafe { slot.read_volatile() };
-        if e & PTE_P != 0 {
+        if e != 0 {
             return Err(MapError::AlreadyMapped(VirtAddr(va)));
         }
-        let desc = (pa.0 as u64 & ADDR_MASK) | leaf_attrs(flags | MapFlags::USER) | PTE_P;
+        let desc = encode(pa, flags);
         // SAFETY: as above; not-present entries are never cached by the TLB.
         unsafe { slot.write_volatile(desc) };
         Ok(())
@@ -106,12 +122,14 @@ impl UserTables {
         let slot = self.pte(va, false).ok()??;
         // SAFETY: a PTE of this address space.
         let e = unsafe { slot.read_volatile() };
-        if e & PTE_P == 0 {
+        if e == 0 {
             return None;
         }
         // SAFETY: as above.
         unsafe { slot.write_volatile(0) };
-        invlpg(va);
+        if e & PTE_P != 0 {
+            invlpg(va);
+        }
         Some(PhysAddr((e & ADDR_MASK) as usize))
     }
 
@@ -122,13 +140,15 @@ impl UserTables {
         };
         // SAFETY: a PTE of this address space.
         let e = unsafe { slot.read_volatile() };
-        if e & PTE_P == 0 {
+        if e == 0 {
             return false;
         }
-        let desc = (e & ADDR_MASK) | leaf_attrs(flags | MapFlags::USER) | PTE_P;
+        let desc = encode(PhysAddr((e & ADDR_MASK) as usize), flags);
         // SAFETY: as above.
         unsafe { slot.write_volatile(desc) };
-        invlpg(va);
+        if e & PTE_P != 0 {
+            invlpg(va);
+        }
         true
     }
 
@@ -137,8 +157,11 @@ impl UserTables {
         let slot = self.pte(va & !(PAGE_SIZE - 1), false).ok()??;
         // SAFETY: a PTE of this address space.
         let e = unsafe { slot.read_volatile() };
-        if e & PTE_P == 0 {
+        if e == 0 {
             return None;
+        }
+        if e & PTE_P == 0 {
+            return Some((PhysAddr((e & ADDR_MASK) as usize), MapFlags::USER));
         }
         let mut f = MapFlags::READ;
         if e & PTE_RW != 0 {
