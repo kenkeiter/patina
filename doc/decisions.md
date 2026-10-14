@@ -1818,3 +1818,89 @@ capabilities and the MSI-X table, the KVM ITS with 64 KiB table pages, the
 MSHV v2m DTB override, and `msi-map` offsets for segment > 0. Not done:
 x86 INTx (`_PRT`), bridge renumbering, the swizzle for INTx behind bridges,
 per-queue MSI-X vectors, and LPIs targeted at CPUs other than the boot CPU.
+
+## D71: AF_UNIX sockets: one table, names by id, fds in flight as `OpenFile`s
+*2026-10-14 · Phase 4*
+
+`kernel/src/net/unix/` implements `SOCK_STREAM`, `SOCK_DGRAM` and
+`SOCK_SEQPACKET` (`SOCK_RAW` is `SOCK_DGRAM`, as on Linux) as a second
+`SocketOps` implementor. Every socket is a `Sock` in one global table keyed by
+a never-reused id behind one leaf `SpinLock`; the fd-side `UnixSocket` holds
+the id. Peers, listeners' accept queues, filesystem nodes and the abstract
+namespace refer to sockets by id, so there are no reference cycles, a dead id
+reads as "gone", and every two-socket operation (send, connect, close) is one
+critical section with no per-socket lock order. Hooks are fired and passed
+files dropped only after the lock is released, and no FS or fd-table lock is
+taken under it (paths are resolved first, fds looked up before and installed
+after). Received data lives with the receiver: streams use
+`patina_inet::unix::StreamBuf` (a byte FIFO in which a send's ancillary data
+is a mark on its bytes; a read that reaches a mark takes it and stops at the
+end of that send, as Linux stops after the skb carrying fds), datagram and
+seqpacket sockets a queue of messages carrying the sender's name. Each socket
+receives into at most 212992 bytes (Linux's `wmem_default`; stream bytes, or
+datagrams with at most 64 queued), the largest datagram is 212960 bytes
+(`sk_sndbuf - 32`), and a stream writer is `EPOLLOUT` while a quarter of the
+peer's buffer is free (it may write whenever any space is free).
+`SO_SNDBUF`/`SO_RCVBUF` are stored doubled and reported but do not resize
+anything. A stream `connect` creates the server-side socket at once (Linux's
+embryo) and queues it on the listener, so it completes without
+`EINPROGRESS`; only a full backlog (queue longer than the backlog, which is
+clamped to `SOMAXCONN` 4096 and taken as 4096 when negative) gives `EAGAIN`, on
+which the generic `connect` now waits for `OUT` (the socket registers on the
+listener's `peer_wait` list) and retries unless non-blocking. The accepted
+socket's name is the listener's and inherits its `SO_PASSCRED`. Closing a
+socket shuts both directions of its peer (`EPOLLIN|RDHUP|HUP`, then EOF and
+`EPIPE`); unread data or an unaccepted connection gives the peer one
+`ECONNRESET` first. Closing a listener closes its unaccepted connections.
+Datagram semantics follow `unix_dgram_sendmsg`: a connected socket only
+accepts from its peer (`EPERM` otherwise), sending to a closed socket is
+`ECONNREFUSED` (and drops a dead default peer), a full receiver gives
+`EAGAIN` and the sender waits on that receiver's `peer_wait`. Seqpacket
+ignores a destination address and reports EOF on close.
+
+Names: a pathname `bind` creates an `S_IFSOCK` inode (mode 0777 & ~umask,
+`EADDRINUSE` if the name exists, `ENOENT` without a parent) whose special is
+a `SockSpecial(id)` (a plain `patina_vfs::Special`, not a `DevNode`, so
+`open()` of it is `ENXIO`). `connect`/`sendto` resolve the path with
+`namei::with_node`: a missing path is `ENOENT`; a non-socket inode or a socket
+inode whose id is gone is `ECONNREFUSED`, as in Linux `unix_find_bsd` (not
+`ENOTSOCK`); a type mismatch is `EPROTOTYPE`. `unlink` removes the node and
+the bound socket keeps working; closing the socket leaves the node behind
+(stale, `ECONNREFUSED`, and a later bind of it is `EADDRINUSE`), as on Linux.
+Abstract names (leading NUL, the rest of `addrlen`) live in an in-kernel table
+and are freed on close. Autobind (a five-hex-digit abstract name) happens for
+`bind` with `addrlen == 2` and for `connect`/`sendto` with `SO_PASSCRED` set.
+Unnamed sockets report `sun_family` only (`addrlen` 2). `mknodat(S_IFSOCK)`
+stays `EPERM`.
+
+Ancillary data: `sendmsg` parses `msg_control` like `__scm_send` (malformed
+record, unknown `SOL_SOCKET` type or more than `SCM_MAX_FD` (253) fds →
+`EINVAL`, bad fd → `EBADF`, `SCM_CREDENTIALS` accepted with any pid and
+`EINVAL` for uid/gid -1) and attaches the fds as `Arc<OpenFile>`s; a stream
+send passes the control data with its first chunk only. The receive side
+needs `msg_controllen`, so `SocketOps` grew `recv_msg(buf, flags, room)` (the
+default calls `recv`): the socket builds the control data with
+`patina_inet::unix::CmsgWriter`, which reproduces `put_cmsg` and
+`scm_detach_fds` byte for byte (credentials first when the receiver set
+`SO_PASSCRED`, pid 1/uid 0/gid 0 unless the sender gave some; then as many
+fds as `(room - 16) / 4` allows, installed with `FD_CLOEXEC` under
+`MSG_CMSG_CLOEXEC`; the rest are closed and `MSG_CTRUNC` is set). `MSG_PEEK`
+installs duplicates, as Linux does. `SO_PEERCRED` is {1, 0, 0} for connected
+stream/seqpacket sockets, socketpairs and listeners, {0, 65534, 65534}
+otherwise. Other generic changes: `SocketOps::max_dgram` (unix 212960)
+replaces the fixed 65507 bound, and `read`/`write` on a datagram socket move
+one whole message per call instead of 64 KiB chunks (`syscall/fs.rs`). A
+`MSG_WAITALL` stream receive stops after any control data. Deviations: a read
+on an unconnected stream socket is `EINVAL` (Linux blocks); fds in flight
+are not garbage-collected, so a socket sent over itself (a cycle) is never
+freed; `MSG_OOB` is `EOPNOTSUPP`; `SO_PEEK_OFF`, `SO_PASSSEC`,
+`SO_PASSPIDFD` and other levels than `SOL_SOCKET` are not supported
+(`ENOPROTOOPT` / `EOPNOTSUPP`); `recvfrom` on a stream reports no address
+(Linux gives the peer's); no permission checks (single root user).
+Verified by testapps/unixsock (36 `ok` checks: path and abstract listeners,
+error paths, unlink while listening, 50 concurrent connections, 8 MiB each
+way, half-close, deadlines, socketpair of every type, SCM_RIGHTS over a
+socketpair and a `net.UnixConn`, `MSG_CTRUNC`, `MSG_CMSG_CLOEXEC`,
+SCM_CREDENTIALS, `SO_PEERCRED`, unixgram with sender addresses, 64 KiB
+datagrams, backlog, autobind, HTTP) on both arches at 1, 2 and 4 vCPUs, and
+host tests of the stream buffer and the cmsg codec.
