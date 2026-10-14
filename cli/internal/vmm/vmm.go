@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/kenkeiter/patina/cli/internal/ctl"
-	"github.com/kenkeiter/patina/cli/internal/target"
 )
 
 // NetConfig selects guest networking.
