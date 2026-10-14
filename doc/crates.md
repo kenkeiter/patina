@@ -225,3 +225,19 @@ ephemeral ports 32768–60999), plus the `NETLINK_ROUTE` request parser and
 link/address dump encoder (`netlink`, D73). Depends on `patina-abi` and
 `zerocopy` (already audited above); no `unsafe`; host tests in the crate
 (`cargo test -p patina-inet`).
+
+## patina-vdso (in-tree, Phase 5)
+
+`crates/vdso` (D75): the vDSO image and everything about it. `build.rs`
+compiles `image/vdso.rs` (+ `image/chacha.rs`, `src/vvar.rs`) for both
+bare targets with the toolchain's own `rustc --emit=obj` and links it with
+the toolchain's `rust-lld` (`-shared`, `image/vdso.lds`, a per-arch version
+script) into `OUT_DIR/vdso-<arch>.so`; no system compiler or linker, no
+new dependency. The library embeds both images (`IMAGE` for the target
+arch), defines the vvar page layout and seqlock (`vvar`, shared verbatim
+with the image) and has a small no-alloc ELF64 reader (`elf`: layout,
+SysV-hash symbol lookup with versions as Go does it, relocation /
+writable-section checks). `unsafe` only in the image itself (inline asm
+for the counter, syscalls and the PC-relative vvar address; raw pointers
+into the caller's buffers and state). Host tests: `cargo test -p
+patina-vdso`; `patina-rand` is a dev-dependency (ChaCha20 cross-check).

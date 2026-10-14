@@ -29,6 +29,7 @@ mod sync;
 mod syscall;
 mod task;
 mod trap;
+mod vdso;
 mod wallclock;
 
 use alloc::format;

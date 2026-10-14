@@ -390,3 +390,23 @@ CLI and Milestone A:
 ## Phase 5 — Hardening
 
 - [ ] Runtime test-suite harness + skip list (**Milestone B**), Tier-3 syscalls, vDSO, console-port control fallback, `AF_VSOCK` for the program, `--strace`, multi-queue net, benchmarks.
+
+### vDSO
+
+Decision D75. `scripts/test-hello.sh --app vdsobench [arch...]` (add
+`PATINA_PARAMS="patina.novdso=1 patina.env=VDSOBENCH_EXPECT=novdso"` for the
+no-vDSO baseline, `PATINA_PARAMS=patina.strace=1` to check the timed loops
+for syscalls); `cargo test -p patina-vdso` for the image checks.
+
+| Name | Command | Observed |
+|---|---|---|
+| **vdsobench** | `scripts/test-hello.sh --app vdsobench aarch64 x86_64`, the same with `PATINA_PARAMS="patina.novdso=1 patina.env=VDSOBENCH_EXPECT=novdso"`, with `PATINA_CPUS=4`, and with `PATINA_PARAMS=patina.strace=1` | `PASS vdsobench` in all four configurations on both arches. ns per `time.Now()` (1e6 calls, 1 vCPU): **aarch64 63.4 with the vDSO / 333.5 without (5.3×)**, **x86_64 361.9 / 3004 (8.3×)**; `crypto/rand.Read` of 32 B: aarch64 120 / 569 ns, x86_64 1139 / 3837 ns; 4 vCPUs: 63.6 / 437.6 ns per `time.Now()`. `runtime.nanotime` lies within a `clock_gettime(CLOCK_MONOTONIC)` syscall bracket 1000/1000 times (exact math, same formula as the kernel), `time.Now()` within 1 ms of `CLOCK_REALTIME`, a 100 ms sleep measures 101–104 ms, `/proc/self/maps` shows `7ffff8000000-7ffff8001000 r-xp … [vdso]` and `7ffff8001000-7ffff8002000 r--p … [vvar]` (none with `patina.novdso=1`). strace: 0 `clock_gettime`/`gettimeofday`/`getrandom` syscalls inside the 1e6 `time.Now` loop and the 1e5 `rand.Read` loop; one 32-byte key fetch at the first `rand.Read` and one more after a forced kernel reseed |
+| **p5-vdso-regression** | on the vDSO tree: `scripts/test-hello.sh aarch64 x86_64`, `scripts/test-signals.sh aarch64 x86_64`, `scripts/test-hello.sh --app fileio aarch64 x86_64`, `PATINA_CPUS_LIST="1 4" scripts/test-runtime.sh aarch64 x86_64`, `scripts/test-os.sh aarch64`, `scripts/test-ctl.sh aarch64 x86_64`, host tests, clippy both targets | all PASS: hello, 12/12 signals cases, fileio, `test-runtime: all passed` (1/4 CPUs, both arches), `os aarch64 (cpus=1): 248 passed, 33 skipped (10 by our list), 0 failed`, test-ctl 16/16 (incl. `usr1-time`), `cargo test --workspace --exclude patina-kernel` 0 failures, clippy 0 warnings |
+| **vdso-image** | `cargo test -p patina-vdso` | 7 host tests: both images are clean `ET_DYN` objects (one R+X PT_LOAD at 0, PT_DYNAMIC, no relocations, no writable sections), Go's symbols resolve through `DT_HASH` with the version check of `runtime/vdso_linux.go`, Go's precomputed SysV hashes match, `__vvar_page` = the mapped vvar offset, the image's ChaCha20 = RFC 8439 |
+
+- [x] In-tree vDSO built with the pinned toolchain only (`crates/vdso/build.rs`: `rustc --emit=obj` + `rust-lld -shared`, both arches), embedded through the `patina-vdso` crate; `scripts/build-kernel.sh` unchanged — **vdso-image**, every QEMU run
+- [x] Mapped at `0x7fff_f800_0000` (`[vdso]`, R+X) + vvar page (`[vvar]`, R), `AT_SYSINFO_EHDR`; `patina.novdso=1` turns it off — **vdsobench**
+- [x] `clock_gettime` (REALTIME, MONOTONIC, MONOTONIC_RAW, BOOTTIME, *_COARSE, TAI; others → syscall from the vDSO), `gettimeofday`, `time`, `clock_getres`; Go's `nanotime`/`walltime` make no syscalls — **vdsobench** (strace)
+- [x] vvar seqlock; the control channel's `time` op updates the vvar realtime offset — **test-ctl** `usr1-time` (Go's `time.Now()` after the step goes through the vDSO)
+- [x] vDSO `getrandom` (Linux 6.11 contract: params query, per-thread opaque state, ChaCha20 with fast key erasure, key refill on kernel reseed via `rng_generation`) — **vdsobench** (output checks, strace shows the refill after a reseed)
+- [~] x86_64 TSC assumed synchronized/invariant across CPUs (true under TCG; not checked on KVM hosts); vDSO `getrandom` re-entry fallback (`in_use`), vvar refault after `madvise(DONTNEED)`/`munmap` of the vDSO: written, not exercised
