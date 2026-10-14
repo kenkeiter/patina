@@ -1,0 +1,9 @@
+[package]
+name = "patina-rand"
+version = "0.1.0"
+edition = "2024"
+description = "ChaCha20 DRBG with BLAKE2s entropy extraction for the patina kernel"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
