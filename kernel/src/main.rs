@@ -36,6 +36,9 @@ use alloc::format;
 
 use bootinfo::{BootInfo, PlatformInfo};
 
+/// `patina.stats=1`: print per-CPU scheduler/timer counters at exit.
+pub static STATS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Exit with `code`: see [`exit_with`].
 pub fn exit(code: i32) -> ! {
     exit_with(code, None, false)
@@ -64,6 +67,9 @@ pub fn exit_signal(sig: i32) -> ! {
 /// period ran out.
 pub fn exit_with(code: i32, signal: Option<&str>, forced: bool) -> ! {
     task::sched::stop_other_cpus();
+    if STATS.load(core::sync::atomic::Ordering::Relaxed) {
+        task::sched::print_stats();
+    }
     ctl::emit_exit(code, signal, forced);
     console::panic_write_fmt(format_args!("\n[patina] exit code {}\n", code));
     arch::power::poweroff(code)

@@ -13,7 +13,7 @@
 //! at least 3 tick preemptions, and both exited threads' stacks freed.
 //! Expected: `selftest sched: ok (...)`, exit 0.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use super::wait::{self, WaitQueue};
 use super::{WakeReason, kstack, sched};
@@ -26,6 +26,9 @@ static WOKEN: AtomicBool = AtomicBool::new(false);
 static TIMED_OUT: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
 static SLEEPS: AtomicU32 = AtomicU32::new(0);
+/// Stack slots in use before the test threads (background kernel threads
+/// such as the RNG reseeder may already hold some).
+static BASE_SLOTS: AtomicUsize = AtomicUsize::new(0);
 
 const MS: u64 = 1_000_000;
 
@@ -54,7 +57,7 @@ fn spinner() {
     }
     // The waiter exited right before switching back here; this thread's
     // `finish_switch` freed its stack (and the sleeper's earlier).
-    let (slots, free) = kstack::stats();
+    let (slots, free, _) = kstack::stats();
     let ms = (timer::now_ns() - t0) / MS;
     crate::kprintln!(
         "[patina] selftest sched: spinner preempted {} times, sleeps {}, woken {}, timed out {}, stacks {} allocated / {} free, {} ms",
@@ -73,7 +76,10 @@ fn spinner() {
         "timed wait did not time out"
     );
     assert!(preempted >= 3, "spinner was not preempted by the tick");
-    assert!(slots == 3 && free == 2, "exited threads' stacks not freed");
+    assert!(
+        slots - BASE_SLOTS.load(Ordering::Relaxed) == 3 && free == 2,
+        "exited threads' stacks not freed"
+    );
     crate::kprintln!("[patina] selftest sched: ok");
     crate::exit(0)
 }
@@ -145,6 +151,8 @@ pub fn run_overflow() -> ! {
 /// Run the test; never returns.
 pub fn run() -> ! {
     crate::kprintln!("[patina] selftest sched: starting 3 kernel threads");
+    let (slots, pooled, _) = kstack::stats();
+    BASE_SLOTS.store(slots - pooled, Ordering::Relaxed);
     super::spawn_kernel_thread(spinner);
     super::spawn_kernel_thread(sleeper);
     super::spawn_kernel_thread(waiter);

@@ -161,8 +161,30 @@ pub fn user_fault(frame: &mut TrapFrame, addr: usize, access: Access, kind: Faul
         frame.dump();
         crate::exit(128 + SIGSEGV)
     };
-    if kind != FaultKind::Alignment && p.space.lock().handle_fault(addr, access) {
-        return;
+    if kind != FaultKind::Alignment {
+        let r = p.space.lock().handle_fault(addr, access);
+        match r {
+            crate::mm::vm::Fault::Resolved => return,
+            crate::mm::vm::Fault::OutOfMemory => {
+                // D78 backstop: the commit limit let the mapping through
+                // but the kernel's own allocations used the frames. Kill
+                // the program as Linux's OOM killer would (SIGKILL, exit
+                // 137), saying why.
+                let (free, total) = crate::mm::frame::stats();
+                let (committed, limit) = p.space.lock().commit();
+                crate::kprintln!(
+                    "[patina] out of memory: no free frame for user page {:#x} ({} of {} frames free, {} of {} pages committed); killing the program (SIGKILL)",
+                    addr & !(crate::mm::PAGE_SIZE - 1),
+                    free,
+                    total,
+                    committed,
+                    limit
+                );
+                signal::force_sig(patina_abi::signal::SIGKILL);
+                return;
+            }
+            crate::mm::vm::Fault::Segv => {}
+        }
     }
     let (sig, code) = if kind == FaultKind::Alignment {
         (SIGBUS, BUS_ADRALN)

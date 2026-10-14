@@ -2,9 +2,10 @@
 //! non-global (nG) and PXN (see `paging::leaf_attrs`).
 //!
 //! Tables are frames from `mm::frame` (zeroed) and are always accessed
-//! through the direct map. Intermediate tables are never freed (one user
-//! address space per VM); `unmap` only clears the leaf and hands the frame
-//! back to the caller.
+//! through the direct map. `unmap` only clears the leaf and hands the
+//! frame back to the caller; [`UserTables::prune`] frees tables that no
+//! longer map anything (munmap / madvise, D80) after
+//! [`flush_table_walks`].
 //!
 //! TLB maintenance: every user mapping is tagged with ASID 0 for now.
 //! `unmap`/`protect` invalidate the page with `TLBI VALE1IS` (ASID 0, all
@@ -185,6 +186,44 @@ impl UserTables {
         Some((pa, f))
     }
 
+    /// Free the page tables on the path to `va` that no longer map
+    /// anything (bottom-up: the level-3 table, then its parents; never the
+    /// root), clearing their parent entries. The freed table frames are
+    /// pushed on `freed`; the caller must call [`flush_table_walks`] before
+    /// freeing them (walk caches may still hold the cleared entries).
+    pub fn prune(&mut self, va: usize, freed: &mut alloc::vec::Vec<PhysAddr>) {
+        if va >= USER_VA_END {
+            return;
+        }
+        // tables[l] = the level-l table on the path; slots[l] = its entry
+        // pointing to tables[l + 1].
+        let mut tables = [self.root.0 as u64, 0, 0, 0];
+        let mut slots = [core::ptr::null_mut::<u64>(); 3];
+        for level in 0..3 {
+            let idx = (va >> (39 - 9 * level)) & (ENTRIES - 1);
+            // SAFETY: `tables[level]` is a live table frame.
+            let slot = unsafe { table_ptr(tables[level]).add(idx) };
+            // SAFETY: as above.
+            let e = unsafe { slot.read_volatile() };
+            if e & DESC_VALID == 0 || e & DESC_TABLE == 0 {
+                return;
+            }
+            slots[level] = slot;
+            tables[level + 1] = e & ADDR_MASK;
+        }
+        for level in (1..4).rev() {
+            let t = table_ptr(tables[level]);
+            // SAFETY: a live table frame of this address space.
+            if (0..ENTRIES).any(|i| unsafe { t.add(i).read_volatile() } != 0) {
+                break;
+            }
+            // SAFETY: the parent entry; the walker may still cache it until
+            // `flush_table_walks`.
+            unsafe { slots[level - 1].write_volatile(0) };
+            freed.push(PhysAddr(tables[level] as usize));
+        }
+    }
+
     /// Make these the live user tables on this CPU.
     ///
     /// # Safety
@@ -252,6 +291,23 @@ fn encode(pa: PhysAddr, flags: MapFlags) -> u64 {
         return pa | SW_PROT_NONE;
     }
     pa | leaf_attrs(flags | MapFlags::USER) | DESC_VALID | DESC_TABLE
+}
+
+/// After [`UserTables::prune`] cleared table entries: invalidate every
+/// cached user (ASID 0, non-global) translation *and walk-cache entry* on
+/// all CPUs (`TLBI ASIDE1IS`, complete after `DSB ISH`), so the pruned
+/// table frames can be freed at once.
+pub fn flush_table_walks() {
+    // SAFETY: TLB maintenance only; ASID 0 in operand bits [63:48].
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi aside1is, xzr",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags)
+        )
+    };
 }
 
 /// Invalidate the stage-1 EL1 TLB entry for user `va` (ASID 0) on all CPUs.
