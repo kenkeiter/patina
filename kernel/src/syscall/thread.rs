@@ -5,7 +5,7 @@ use core::sync::atomic::Ordering;
 use patina_abi::errno::{EINVAL, ENOSYS, EPERM, Errno};
 use patina_abi::sched::{
     CLONE_THREAD_OPTIONAL, CloneFlags, FUTEX_BITSET_MATCH_ANY, FUTEX_CLOCK_REALTIME,
-    FUTEX_CMD_MASK, FUTEX_LOCK_PI2, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAIT_REQUEUE_PI,
+    FUTEX_CMD_MASK, FUTEX_LOCK_PI, FUTEX_LOCK_PI2, FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAIT_REQUEUE_PI,
     FUTEX_WAKE, FUTEX_WAKE_BITSET, GO_CLONE_FLAGS,
 };
 use patina_abi::time::Timespec;
@@ -101,9 +101,34 @@ pub fn exit(code: u64) -> ! {
 
 /// `futex(uaddr, op, val, timeout, uaddr2, val3)`: WAIT / WAKE and their
 /// BITSET forms (the whole of Go's usage). Other ops → `ENOSYS`.
+/// `futex(uaddr, op, val, timeout, uaddr2, val3)`: WAIT, WAKE and their
+/// BITSET forms. Checks in Linux's order (`kernel/futex/syscalls.c`
+/// `sys_futex`, `do_futex`, `futex_wait`/`futex_wake`, `get_futex_key`):
+/// the timeout of a command that takes one is copied and validated first
+/// (EFAULT, EINVAL), then `FUTEX_CLOCK_REALTIME` on a command that does
+/// not allow it (ENOSYS), a zero bitset (EINVAL), `uaddr` not 4-aligned
+/// (EINVAL).
 pub fn futex(uaddr: usize, op: i32, val: u32, timeout: usize, val3: u32) -> SysResult {
     let cmd = op & FUTEX_CMD_MASK;
     let realtime = op & FUTEX_CLOCK_REALTIME != 0;
+    let has_timeout = matches!(
+        cmd,
+        FUTEX_WAIT | FUTEX_WAIT_BITSET | FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_WAIT_REQUEUE_PI
+    );
+    let deadline = if timeout != 0 && has_timeout {
+        // futex_init_timeout: relative for FUTEX_WAIT, absolute otherwise.
+        let ts: Timespec = with_space(|s| s.read_val(timeout))?;
+        let ns = ts.to_nanos().ok_or(Errno(EINVAL))?;
+        Some(if cmd == FUTEX_WAIT {
+            timer::now_ns().saturating_add(ns)
+        } else if realtime {
+            ns.saturating_sub(crate::wallclock::epoch_ns())
+        } else {
+            ns
+        })
+    } else {
+        None
+    };
     if realtime
         && !matches!(
             cmd,
@@ -122,20 +147,6 @@ pub fn futex(uaddr: usize, op: i32, val: u32, timeout: usize, val3: u32) -> SysR
             if bits == 0 || !uaddr.is_multiple_of(4) {
                 return Err(Errno(EINVAL));
             }
-            let deadline = if timeout != 0 {
-                let ts: Timespec = with_space(|s| s.read_val(timeout))?;
-                let ns = ts.to_nanos().ok_or(Errno(EINVAL))?;
-                Some(if cmd == FUTEX_WAIT {
-                    // Relative, CLOCK_MONOTONIC.
-                    timer::now_ns().saturating_add(ns)
-                } else if realtime {
-                    ns.saturating_sub(crate::wallclock::epoch_ns())
-                } else {
-                    ns
-                })
-            } else {
-                None
-            };
             futex_wait(uaddr, val, bits, deadline)
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {

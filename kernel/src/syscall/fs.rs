@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 use patina_abi::current::O_DIRECT;
 use patina_abi::epoll::{EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE, EpollFlags};
-use patina_abi::errno::{EAGAIN, EBADF, EFAULT, EINVAL, EPIPE, Errno};
+use patina_abi::errno::{EAGAIN, EBADF, EFAULT, EINVAL, EPIPE, ESPIPE, Errno};
 use patina_abi::fs::{
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW,
     F_SETFD, F_SETFL, F_SETLK, F_SETLKW, FD_CLOEXEC, Iovec, O_CLOEXEC, O_NONBLOCK, O_RDONLY,
@@ -353,13 +353,20 @@ pub fn writev(fd: i32, iov: usize, cnt: usize) -> SysResult {
     Ok(done as isize)
 }
 
+/// `pread64`, in Linux's order (`fs/read_write.c ksys_pread64`): a
+/// negative offset → EINVAL before the fd is looked up (EBADF), then an
+/// unseekable file → ESPIPE (`FMODE_PREAD`), then `vfs_read` (not
+/// readable → EBADF, `access_ok` → EFAULT).
 pub fn pread64(fd: i32, buf: usize, len: usize, off: i64) -> SysResult {
-    let of = get(fd)?;
-    if !of.flags().readable() {
-        return Err(Errno(EBADF));
-    }
     if off < 0 {
         return Err(Errno(EINVAL));
+    }
+    let of = get(fd)?;
+    if of.file.pread(&mut [], off as u64) == Err(Errno(ESPIPE)) {
+        return Err(Errno(ESPIPE));
+    }
+    if !of.flags().readable() {
+        return Err(Errno(EBADF));
     }
     let room = out_room(buf, len)?;
     let mut k = vec![0u8; room.min(CHUNK)];
@@ -368,13 +375,15 @@ pub fn pread64(fd: i32, buf: usize, len: usize, off: i64) -> SysResult {
     Ok(n as isize)
 }
 
+/// `pwrite64`: as [`pread64`] (`ksys_pwrite64`: offset, fd, then the
+/// file).
 pub fn pwrite64(fd: i32, buf: usize, len: usize, off: i64) -> SysResult {
+    if off < 0 {
+        return Err(Errno(EINVAL));
+    }
     let of = get(fd)?;
     if !of.flags().writable() {
         return Err(Errno(EBADF));
-    }
-    if off < 0 {
-        return Err(Errno(EINVAL));
     }
     let mut k = vec![0u8; len.min(CHUNK)];
     with_space(|s| s.copy_from_user(buf, &mut k))?;

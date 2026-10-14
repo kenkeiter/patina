@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use patina_abi::current::EpollEvent;
 use patina_abi::epoll::{EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EpollFlags};
-use patina_abi::errno::{EBADF, EFAULT, EINTR, EINVAL, ENOMEM, Errno};
+use patina_abi::errno::{EBADF, EFAULT, EINTR, EINVAL, ENOMEM, EPERM, Errno};
 use patina_abi::fs::{O_RDWR, POLLNVAL, PollFd};
 use patina_abi::signal::{SIGSET_SIZE, SigSet};
 use patina_abi::time::{Timespec, Timeval};
@@ -112,36 +112,47 @@ pub fn epoll_create(size: i32) -> SysResult {
     epoll_create1(0)
 }
 
+/// `epoll_ctl`, in Linux's order (`fs/eventpoll.c`): the event is copied
+/// in first unless `op` is `EPOLL_CTL_DEL` (EFAULT, also for an unknown
+/// op), then `epfd` and `fd` (EBADF), a target that cannot be polled
+/// (EPERM), `epfd` not an epoll or the same file (EINVAL), the
+/// `EPOLLEXCLUSIVE` rules (EINVAL), and an unknown `op` last (EINVAL).
 pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: usize) -> SysResult {
+    let e: Option<EpollEvent> = if op != EPOLL_CTL_DEL {
+        Some(with_space(|s| s.read_val(event))?)
+    } else {
+        None
+    };
     let ep_of = get(epfd)?;
     let of = get(fd)?;
+    if !of.file.pollable() {
+        return Err(Errno(EPERM));
+    }
     let ep = ep_of.file.as_epoll().ok_or(Errno(EINVAL))?;
     if Arc::ptr_eq(&ep_of, &of) {
         return Err(Errno(EINVAL));
     }
-    match op {
-        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
-            let e: EpollEvent = with_space(|s| s.read_val(event))?;
-            let ev = e.flags();
-            if ev.contains(EpollFlags::EXCLUSIVE) {
-                let ok = EpollFlags::IN
-                    | EpollFlags::OUT
-                    | EpollFlags::ERR
-                    | EpollFlags::HUP
-                    | EpollFlags::WAKEUP
-                    | EpollFlags::ET
-                    | EpollFlags::EXCLUSIVE;
-                if op == EPOLL_CTL_MOD || !(ev - ok).is_empty() {
-                    return Err(Errno(EINVAL));
-                }
-            }
-            if op == EPOLL_CTL_ADD {
-                ep.add(fd, &of, ev, e.data())?;
-            } else {
-                ep.modify(fd, &of, ev, e.data())?;
+    if let Some(e) = &e {
+        let ev = e.flags();
+        if ev.contains(EpollFlags::EXCLUSIVE) {
+            let ok = EpollFlags::IN
+                | EpollFlags::OUT
+                | EpollFlags::ERR
+                | EpollFlags::HUP
+                | EpollFlags::WAKEUP
+                | EpollFlags::ET
+                | EpollFlags::EXCLUSIVE;
+            if op == EPOLL_CTL_MOD
+                || (op == EPOLL_CTL_ADD && (of.file.as_epoll().is_some() || !(ev - ok).is_empty()))
+            {
+                return Err(Errno(EINVAL));
             }
         }
-        EPOLL_CTL_DEL => ep.delete(fd, &of)?,
+    }
+    match (op, e) {
+        (EPOLL_CTL_ADD, Some(e)) => ep.add(fd, &of, e.flags(), e.data())?,
+        (EPOLL_CTL_MOD, Some(e)) => ep.modify(fd, &of, e.flags(), e.data())?,
+        (EPOLL_CTL_DEL, _) => ep.delete(fd, &of)?,
         _ => return Err(Errno(EINVAL)),
     }
     Ok(0)
@@ -248,42 +259,46 @@ fn poll_once(
     n
 }
 
+/// `ppoll`/`poll` after the timeout was read, in Linux's order
+/// (`fs/select.c`): the signal mask first (`set_user_sigmask`:
+/// `sigsetsize` → EINVAL, copy → EFAULT), then `do_sys_poll` (`nfds` over
+/// `RLIMIT_NOFILE` → EINVAL, the array → EFAULT).
 fn do_poll(fds: usize, nfds: usize, tmo: Timeout, sigmask: usize, sigsetsize: usize) -> SysResult {
-    if nfds > proc::nofile_limit() {
-        return Err(Errno(EINVAL));
-    }
-    let mut pfds: Vec<PollFd> = Vec::new();
-    pfds.resize(nfds, PollFd::new_zeroed());
-    if nfds > 0 {
-        with_space(|s| s.copy_from_user(fds, pfds.as_mut_slice().as_mut_bytes()))?;
-    }
-    let files: Vec<Option<Arc<OpenFile>>> = pfds
-        .iter()
-        .map(|p| if p.fd < 0 { None } else { get(p.fd).ok() })
-        .collect();
-    let n = with_sigmask(sigmask, sigsetsize, || {
+    with_sigmask(sigmask, sigsetsize, || {
+        if nfds > proc::nofile_limit() {
+            return Err(Errno(EINVAL));
+        }
+        let mut pfds: Vec<PollFd> = Vec::new();
+        pfds.resize(nfds, PollFd::new_zeroed());
+        if nfds > 0 {
+            with_space(|s| s.copy_from_user(fds, pfds.as_mut_slice().as_mut_bytes()))?;
+        }
+        let files: Vec<Option<Arc<OpenFile>>> = pfds
+            .iter()
+            .map(|p| if p.fd < 0 { None } else { get(p.fd).ok() })
+            .collect();
         let mut block = tmo.block;
-        loop {
+        let n = loop {
             if !block {
-                return Ok(poll_once(&mut pfds, &files, None));
+                break poll_once(&mut pfds, &files, None);
             }
             let w = PollWaiter::new();
             let hook: Arc<dyn PollHook> = w.clone();
             let n = poll_once(&mut pfds, &files, Some(&hook));
             if n > 0 {
-                return Ok(n);
+                break n;
             }
             match w.wait(tmo.deadline) {
                 WakeReason::TimedOut => block = false,
                 WakeReason::Interrupted => return Err(Errno(signal::ERESTARTNOHAND)),
                 WakeReason::Woken => {}
             }
+        };
+        if nfds > 0 {
+            with_space(|s| s.copy_to_user(fds, pfds.as_slice().as_bytes()))?;
         }
-    })?;
-    if nfds > 0 {
-        with_space(|s| s.copy_to_user(fds, pfds.as_slice().as_bytes()))?;
-    }
-    Ok(n as isize)
+        Ok(n as isize)
+    })
 }
 
 /// `ppoll(fds, nfds, tmo_p, sigmask, sigsetsize)`. The remaining time is
@@ -323,6 +338,11 @@ fn do_select(
     sigmask: usize,
     sigsetsize: usize,
 ) -> SysResult {
+    // Linux do_pselect: set_user_sigmask before core_sys_select.
+    with_sigmask(sigmask, sigsetsize, || select_inner(nfds, sets, tmo))
+}
+
+fn select_inner(nfds: i32, sets: [usize; 3], tmo: Timeout) -> SysResult {
     if nfds < 0 {
         return Err(Errno(EINVAL));
     }
@@ -366,26 +386,23 @@ fn do_select(
         }
         n
     };
-    let r = with_sigmask(sigmask, sigsetsize, || {
-        let mut block = tmo.block;
-        loop {
-            if !block {
-                return Ok(scan(&mut out, None));
-            }
-            let w = PollWaiter::new();
-            let hook: Arc<dyn PollHook> = w.clone();
-            let n = scan(&mut out, Some(&hook));
-            if n > 0 {
-                return Ok(n);
-            }
-            match w.wait(tmo.deadline) {
-                WakeReason::TimedOut => block = false,
-                WakeReason::Interrupted => return Err(Errno(signal::ERESTARTNOHAND)),
-                WakeReason::Woken => {}
-            }
+    let mut block = tmo.block;
+    let n = loop {
+        if !block {
+            break scan(&mut out, None);
         }
-    });
-    let n = r?;
+        let w = PollWaiter::new();
+        let hook: Arc<dyn PollHook> = w.clone();
+        let n = scan(&mut out, Some(&hook));
+        if n > 0 {
+            break n;
+        }
+        match w.wait(tmo.deadline) {
+            WakeReason::TimedOut => block = false,
+            WakeReason::Interrupted => return Err(Errno(signal::ERESTARTNOHAND)),
+            WakeReason::Woken => {}
+        }
+    };
     for (k, &p) in sets.iter().enumerate() {
         if p != 0 && nwords > 0 {
             with_space(|s| s.copy_to_user(p, out[k].as_slice().as_bytes()))?;
@@ -405,13 +422,14 @@ fn remaining_ns(tmo: &Timeout) -> u64 {
 /// time left is written back to a non-zero `*tmo_p`, so a restarted call
 /// waits only for the remainder.
 pub fn pselect6(nfds: i32, r: usize, w: usize, e: usize, tmo_p: usize, sig: usize) -> SysResult {
-    let tmo = Timeout::from_timespec(tmo_p)?;
+    // Linux: the sigset argpack (EFAULT), then the timeout, then the mask.
     let (mask, size) = if sig == 0 {
         (0, 0)
     } else {
         let v: [u64; 2] = with_space(|s| s.read_val(sig))?;
         (v[0] as usize, v[1] as usize)
     };
+    let tmo = Timeout::from_timespec(tmo_p)?;
     let res = do_select(nfds, [r, w, e], tmo, mask, size);
     if tmo_p != 0 && tmo.block && tmo.deadline.is_some() {
         let left = Timespec::from_nanos(remaining_ns(&tmo));

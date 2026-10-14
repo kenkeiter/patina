@@ -87,22 +87,27 @@ static RLIMITS: SpinLock<[Rlimit; RLIM_NLIMITS as usize]> = SpinLock::new({
 
 /// `prlimit64(pid, resource, new, old)` (also getrlimit/setrlimit).
 /// Limits are stored and reported, not enforced.
+///
+/// Checks in Linux's order (`kernel/sys.c` `prlimit64`, `do_prlimit`): the
+/// new limit is copied in first (EFAULT), then the pid (ESRCH), the
+/// resource (EINVAL), `rlim_cur > rlim_max` (EINVAL).
 pub fn prlimit64(pid: i32, res: u32, new: usize, old: usize) -> SysResult {
+    let newv: Option<Rlimit> = if new != 0 {
+        Some(with_space(|s| s.read_val(new))?)
+    } else {
+        None
+    };
     if !valid_pid(pid) {
         return Err(Errno(ESRCH));
     }
     if res >= RLIM_NLIMITS {
         return Err(Errno(EINVAL));
     }
-    let newv: Option<Rlimit> = if new != 0 {
-        let v: Rlimit = with_space(|s| s.read_val(new))?;
-        if v.rlim_cur > v.rlim_max {
-            return Err(Errno(EINVAL));
-        }
-        Some(v)
-    } else {
-        None
-    };
+    if let Some(v) = &newv
+        && v.rlim_cur > v.rlim_max
+    {
+        return Err(Errno(EINVAL));
+    }
     let prev = {
         let mut l = RLIMITS.lock();
         let prev = l[res as usize];

@@ -606,20 +606,53 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// `mprotect`, checking in Linux's order (`mm/mprotect.c
+    /// do_mprotect_pkey`): `PROT_GROWSDOWN|PROT_GROWSUP` together → EINVAL,
+    /// `addr` unaligned → EINVAL, `len` 0 → 0, overflow → ENOMEM, unknown
+    /// prot bits → EINVAL (`arch_validate_prot`), no VMA at `addr` →
+    /// ENOMEM; `PROT_GROWSDOWN` extends the range down to the start of
+    /// the VMA, which must be a grows-down one (EINVAL otherwise), and
+    /// `PROT_GROWSUP` is EINVAL (no VMA grows up on these arches); a hole
+    /// in the range → ENOMEM.
     pub fn mprotect(&mut self, addr: usize, len: usize, prot: u32) -> Result<()> {
-        if !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(Errno(EINVAL));
-        }
         let pflags = ProtFlags::from_bits_retain(prot);
-        let prot = parse_prot(prot & !(ProtFlags::GROWSDOWN | ProtFlags::GROWSUP).bits())?;
         if pflags.contains(ProtFlags::GROWSDOWN | ProtFlags::GROWSUP) {
             return Err(Errno(EINVAL));
         }
-        let len = page_len(addr, len).ok_or(Errno(ENOMEM))?;
+        if !addr.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno(EINVAL));
+        }
         if len == 0 {
             return Ok(());
         }
-        let end = addr + len;
+        let len = len.checked_add(PAGE_SIZE - 1).ok_or(Errno(ENOMEM))? & !(PAGE_SIZE - 1);
+        let end = addr.checked_add(len).ok_or(Errno(ENOMEM))?;
+        let prot = parse_prot(prot & !(ProtFlags::GROWSDOWN | ProtFlags::GROWSUP).bits())?;
+        let mut addr = addr;
+        if pflags.contains(ProtFlags::GROWSDOWN) {
+            // vma_find: the first VMA ending above addr.
+            let v = match self.find(addr) {
+                Some(v) => *v,
+                None => *self
+                    .vmas
+                    .range(addr..)
+                    .next()
+                    .map(|(_, v)| v)
+                    .ok_or(Errno(ENOMEM))?,
+            };
+            if v.start >= end {
+                return Err(Errno(ENOMEM));
+            }
+            if !v.flags.contains(MmapFlags::GROWSDOWN) && v.kind != VmaKind::Stack {
+                return Err(Errno(EINVAL));
+            }
+            addr = v.start;
+        } else {
+            self.find(addr).ok_or(Errno(ENOMEM))?;
+            if pflags.contains(ProtFlags::GROWSUP) {
+                return Err(Errno(EINVAL));
+            }
+        }
         if !self.is_covered(addr, end) {
             return Err(Errno(ENOMEM));
         }
@@ -674,22 +707,68 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// `madvise`, checking in Linux's order (`mm/madvise.c do_madvise`):
+    /// an unknown advice → EINVAL, `addr` unaligned → EINVAL, the rounded
+    /// length or the end overflowing → EINVAL, an empty range → 0; then a
+    /// range not fully mapped (including one beyond the user half) →
+    /// ENOMEM, after the mapped parts were advised.
     pub fn madvise(&mut self, addr: usize, len: usize, advice: i32) -> Result<()> {
+        let valid = matches!(
+            advice,
+            abimm::MADV_NORMAL
+                | abimm::MADV_RANDOM
+                | abimm::MADV_SEQUENTIAL
+                | abimm::MADV_WILLNEED
+                | abimm::MADV_DONTNEED
+                | abimm::MADV_DONTNEED_LOCKED
+                | abimm::MADV_FREE
+                | abimm::MADV_REMOVE
+                | abimm::MADV_DONTFORK
+                | abimm::MADV_DOFORK
+                | abimm::MADV_MERGEABLE
+                | abimm::MADV_UNMERGEABLE
+                | abimm::MADV_HUGEPAGE
+                | abimm::MADV_NOHUGEPAGE
+                | abimm::MADV_DONTDUMP
+                | abimm::MADV_DODUMP
+                | abimm::MADV_WIPEONFORK
+                | abimm::MADV_KEEPONFORK
+                | abimm::MADV_COLD
+                | abimm::MADV_PAGEOUT
+                | abimm::MADV_POPULATE_READ
+                | abimm::MADV_POPULATE_WRITE
+                | abimm::MADV_COLLAPSE
+        );
+        if !valid {
+            return Err(Errno(EINVAL));
+        }
         if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(Errno(EINVAL));
         }
-        let len = page_len(addr, len).ok_or(Errno(EINVAL))?;
-        let end = addr + len;
+        let rounded = len.checked_add(PAGE_SIZE - 1).map(|l| l & !(PAGE_SIZE - 1));
+        let len = match rounded {
+            Some(l) => l,
+            None => return Err(Errno(EINVAL)),
+        };
+        let end = addr.checked_add(len).ok_or(Errno(EINVAL))?;
+        if len == 0 {
+            return Ok(());
+        }
         match advice {
-            abimm::MADV_DONTNEED | abimm::MADV_FREE => {
-                if len == 0 {
-                    return Ok(());
-                }
+            abimm::MADV_DONTNEED | abimm::MADV_DONTNEED_LOCKED | abimm::MADV_FREE => {
                 self.release_frames(addr, end, &mut Shootdown::new());
                 if !self.is_covered(addr, end) {
                     return Err(Errno(ENOMEM));
                 }
                 Ok(())
+            }
+            // Linux madvise_remove: only shared file mappings.
+            abimm::MADV_REMOVE => {
+                if self.is_free(addr, end) {
+                    Err(Errno(ENOMEM))
+                } else {
+                    Err(Errno(EINVAL))
+                }
             }
             abimm::MADV_NORMAL
             | abimm::MADV_RANDOM
@@ -705,8 +784,12 @@ impl AddressSpace {
             | abimm::MADV_MERGEABLE
             | abimm::MADV_UNMERGEABLE
             | abimm::MADV_COLD
-            | abimm::MADV_PAGEOUT => {
-                if len != 0 && !self.is_covered(addr, end) {
+            | abimm::MADV_PAGEOUT
+            | abimm::MADV_WIPEONFORK
+            | abimm::MADV_KEEPONFORK
+            | abimm::MADV_POPULATE_READ
+            | abimm::MADV_POPULATE_WRITE => {
+                if !self.is_covered(addr, end) {
                     return Err(Errno(ENOMEM));
                 }
                 Ok(())
