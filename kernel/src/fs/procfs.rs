@@ -360,6 +360,11 @@ pub fn populate(fs: &mut Fs) {
             gen_file(fs, r, b"uuid", || format!("{}\n", uuid()).into_bytes());
         }
     }
+    if let Ok(n) = fs.mkdir_all(proc, b"net", 0o555) {
+        // Interface multicast memberships (Go's Interface.MulticastAddrs).
+        gen_file(fs, n, b"igmp", crate::net::netlink::proc_igmp);
+        gen_file(fs, n, b"igmp6", crate::net::netlink::proc_igmp6);
+    }
     if let Ok(n) = fs.mkdir_all(proc, b"sys/net/core", 0o555) {
         gen_file(fs, n, b"somaxconn", text("4096\n"));
     }

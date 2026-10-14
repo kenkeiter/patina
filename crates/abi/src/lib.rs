@@ -40,6 +40,7 @@ pub mod fs;
 pub mod misc;
 pub mod mm;
 pub mod net;
+pub mod netlink;
 pub mod sched;
 pub mod signal;
 pub mod time;
