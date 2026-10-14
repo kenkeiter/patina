@@ -283,6 +283,20 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
         if strace { ", strace on" } else { "" }
     );
 
+    // Commit limit (D78): the frames the program can still get (free now
+    // plus the image pages it already holds) minus a kernel reserve of
+    // 1/16 of RAM, at least 4 MiB and at most 64 MiB (page tables, kernel
+    // stacks, pipe/socket buffers, heap growth).
+    let (free, total) = frame::stats();
+    let reserve = (total / 16).clamp(1024, 16384);
+    let limit = (free + space.resident_pages()).saturating_sub(reserve);
+    space.set_commit_limit(limit);
+    crate::kprintln!(
+        "[patina] memory: commit limit {} MiB ({} MiB kernel reserve)",
+        limit * PAGE_SIZE >> 20,
+        reserve * PAGE_SIZE >> 20
+    );
+
     let frame = ctx::TrapFrame::new_user(img.entry, image.sp);
     task::set_process(Process {
         pid: 1,

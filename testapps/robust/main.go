@@ -65,6 +65,8 @@ func main() {
 		crashAccerr()
 	case "oom":
 		runOOM()
+	case "oomfault":
+		runOOMFault()
 	case "sigkill":
 		selfKill(9)
 	case "sigpipe":

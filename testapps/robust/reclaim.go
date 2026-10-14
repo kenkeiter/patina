@@ -105,8 +105,10 @@ func checkReclaim() {
 	const size = 1 << 30
 	const stride = 2 << 20
 	pt0 := sampleMem()
+	// MAP_NORESERVE: 1 GiB is more than the VM's RAM, so it must not be
+	// charged against the commit limit (D78).
 	b, err := syscall.Mmap(-1, 0, size, syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_PRIVATE|syscall.MAP_ANON)
+		syscall.MAP_PRIVATE|syscall.MAP_ANON|syscall.MAP_NORESERVE)
 	if err != nil {
 		fail("mmap 1 GiB: %v", err)
 	}

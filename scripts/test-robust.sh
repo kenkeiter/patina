@@ -19,8 +19,12 @@
 #   accerr    exit 2    [signal SIGSEGV: ... code=0x2 addr=<page+8> ...]
 #   sigkill   exit 137  [patina] exit signal SIGKILL
 #   sigpipe   exit 141  [patina] exit signal SIGPIPE
-#   oom       exit 2    PATINA_MEM=256: Go's "fatal error: runtime: out of
-#                       memory", no kernel panic / [patina] fatal
+#   oom       exit 2    PATINA_MEM=256: the commit limit refuses Go's heap
+#                       growth (D78) and Go prints "fatal error: runtime: out
+#                       of memory"; no kernel panic / [patina] fatal
+#   oomfault  exit 137  PATINA_MEM=256: touching a MAP_NORESERVE mapping
+#                       past RAM: "[patina] out of memory: no free frame
+#                       ..." and SIGKILL (the fault-time backstop)
 #
 # Program flags use the "-flag value" form. Honors PATINA_PROFILE and the
 # run-qemu.sh environment. Logs go to out/test/robust/.
@@ -125,7 +129,8 @@ for arch in "${arches[@]}"; do
     "accerr|$base_cpus|512|2|re:\[signal SIGSEGV: segmentation violation code=0x2 addr=0x[0-9a-f]+ $pcre\]|[patina] exit code 2|--|-mode|accerr"
     "sigkill|$base_cpus|512|137|[patina] exit signal SIGKILL|[patina] exit code 137|--|-mode|sigkill"
     "sigpipe|$base_cpus|512|141|[patina] exit signal SIGPIPE|[patina] exit code 141|--|-mode|sigpipe"
-    "oom|$base_cpus|256|2|re:fatal error: (runtime: )?out of memory|re:ok oom: .*|$nofatal|--|-mode|oom"
+    "oom|$base_cpus|256|2|re:fatal error: (runtime: )?out of memory|re:ok oom: .*|re:\[patina\] mmap: .* refused, commit limit reached .*|$nofatal|--|-mode|oom"
+    "oomfault|$base_cpus|256|137|re:\[patina\] out of memory: no free frame for user page .*|[patina] exit signal SIGKILL|!re:panicked at|--|-mode|oomfault"
   )
   if [[ $arch == aarch64 ]]; then
     cases+=("sigbus|$base_cpus|512|2|re:\[signal SIGBUS: bus error code=0x1 addr=0x[0-9a-f]+ $pcre\]|[patina] exit code 2|--|-mode|sigbus")

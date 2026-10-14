@@ -116,6 +116,12 @@ fn meminfo() -> Vec<u8> {
     let _ = writeln!(s, "SwapFree:       {:>8} kB", 0);
     let _ = writeln!(s, "Shmem:          {:>8} kB", 0);
     let _ = writeln!(s, "Hugepagesize:   {:>8} kB", 2048);
+    // D78 commit accounting (Linux reports these under any overcommit mode).
+    if let Some(p) = task::try_process() {
+        let (committed, limit) = p.space.lock().commit();
+        let _ = writeln!(s, "CommitLimit:    {:>8} kB", kb(limit.min(total)));
+        let _ = writeln!(s, "Committed_AS:   {:>8} kB", kb(committed));
+    }
     s.into_bytes()
 }
 
