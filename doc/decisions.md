@@ -2412,3 +2412,109 @@ wrappers; `os.Chtimes` uses `utimensat`); privileged or exec-only calls
 ENOSYS by design and handled by Go: `pidfd_open`, `pidfd_send_signal`,
 `clone3`, `openat2`, `copy_file_range`, `execve`, `rseq`, `membarrier`,
 `set_robust_list` (D57).
+
+## D80: Apple VZ drops the first console tx buffer available at device start; VZ virtio-net needs F_MTU
+*2026-10-14 · Phase 5 (Milestone A on VZ)*
+
+`drivers/virtio/console.rs`, `virtio/pci.rs`, `virtio/net.rs`. The first
+real runs of the Phase 3/4 drivers on Apple Virtualization.framework
+(`patina run --vmm vz`, macOS 26) booted, printed on `hvc0`, attached the
+vsock control channel and reported exit codes — except that ~15% of boots
+printed nothing at all although the program ran. Diagnostics sent over the
+(working) vsock channel showed the hvc0 transmit queue with `avail_idx` 1,
+`used_idx` 0 forever, device status 0xf and a correctly configured queue;
+re-notifying every 1 ms did nothing, but a second buffer posted later was
+returned (only it) and output resumed behind the lost one. Measured with a
+probe posting 1-byte buffers: VZ starts its console device model
+asynchronously after `DRIVER_OK` (normally 10–50 µs later, up to ~12 ms
+with every host CPU busy) and at that moment consumes exactly one buffer —
+the first available on the queue — without writing or returning it; buffers
+published afterwards, and all later ones, are handled normally. Drop rates
+for a single buffer published x after `DRIVER_OK` (30 boots each, idle host,
+1/2/4 vCPUs): before `DRIVER_OK` 60/60 (so it is the start, not queue
+enable); 0 µs 30/30; 10 µs 11–14/30; 20 µs 5–9/30; 30 µs 3–5/30; ≥ 50 µs
+0/30; with the host saturated still 4–17/30 between 30 µs and 1 ms, which
+rules out a fixed delay. VZ's rng (requests before and right after
+`DRIVER_OK` answered in 8–47 µs), vsock (tx at t=0 returned; rx buffers
+posted before or 30 ms after `DRIVER_OK` both used) and net (nothing
+dropped; first completion 27–300+ ms after `DRIVER_OK`) drop nothing. Our
+first hvc0 transmit is the early-ring replay of `console::switch_to`, a few
+microseconds after `DRIVER_OK`, and once a buffer is in flight every later
+write is dropped behind it (D61), so one lost buffer silenced the console.
+
+Fix: the transport flags VZ devices (`Transport::apple_vz()`: function 0 of
+the host's first bus has Apple's vendor id 0x106b — VZ's host bridge is
+0x106b:0x1a05; the discovery line says `apple host`). On VZ every console
+transmit queue (port tx and control tx) gets one sacrificial 1-byte buffer
+(`\n`) before `DRIVER_OK`, which is therefore the one VZ drops. Its
+descriptor is never reused and `TxQ::reap` ignores a completion for it, so
+a future VZ that returns it costs the host one newline. No delay, no
+timeout. Verified: 200 consecutive hello runs at 2 vCPUs, 20 each at 1 and
+4 vCPUs and 80 with the host saturated, 0 silent runs, exit codes right;
+another 40/40 on the merged tree; QEMU `test-ctl` (mmio and `PATINA_VIRTIO=pci`),
+`test-hello` with `hvc0`, `test-net` and `patina.selftest=net` unchanged.
+The temporary diagnostics (boot delay / settle knobs, a re-kick helper that
+alone still failed 7/60) were removed. Console rx on VZ is unverified (VZ
+attaches no guest input).
+
+Separately, VZ's virtio-net (00:01.0, modern 0x1041) offers features
+0x5300119ab and fails `FEATURES_OK` unless `VIRTIO_NET_F_MTU` (bit 3) is
+accepted; with D69's MAC + STATUS + VERSION_1 set the driver logged `device
+rejected the feature set` and the guest had loopback only. The driver now
+also accepts `F_MTU` (amending D69), reads the device MTU at config offset
+10 and logs it (`link up, mtu 1500 (pci 0000:00:01.0, hdr 12 B)`), warning
+when it is below the stack's 1500. QEMU's devices do not offer it. On VZ
+NAT, DHCP leases arrive in 0.2–0.5 s.
+
+## D81: `PATINA_VMM=vz` for the test scripts, `patina image pack`, the VZ timing check
+*2026-10-14 · Phase 5 (Milestone A on VZ)*
+
+Every suite script goes through `scripts/run-qemu.sh`, so the VMM switch
+lives there: `PATINA_VMM=vz` (default `qemu`) execs the new
+`scripts/run-vz.sh` with the same arguments, which packs the kernel and
+initrd into a temporary image with the hidden CLI subcommand `patina image
+pack --kernel K --initrd I --target vz-aarch64 -o X` (no Go build; an empty
+newc archive when there is no initrd) and runs `patina run --vmm vz --cpus
+$PATINA_CPUS --mem $PATINA_MEM --timeout ${PATINA_TIMEOUT}s --grace 5s -v`
+under an outer `timeout` 30 s longer. Kernel params travel as
+`PATINA_PARAMS` (which `patina run` reads; raw `k=v` words among the args
+are moved there, since the CLI percent-encodes `=` in real args), the exit
+status is the guest's code / 124 on timeout / 125 without a code, the
+console goes to stdout and `PATINA_LOG`. Mapped: `PATINA_NET=user` →
+`--net user` with the caller's `ip=` dropped (VZ NAT is DHCP, not slirp's
+10.0.2.x); `PATINA_CTL_SOCK` → a symlink to the run's `ctl.sock` proxy (raw
+NDJSON like QEMU's chardev socket, replaying `ready` to late clients;
+`test-ctl.sh` therefore checks early `log` events on serial only and runs
+the panic case without a client, since nothing holds the VM until a client
+attaches); `PATINA_VZ_PARAMS` adds params on the VZ path only. Not
+mappable, warned about and ignored: `PATINA_NET=user:H-G` (no port
+forwarding on VZ: the host reaches the guest at its leased address — an
+error), `PATINA_CONSOLE` (always `hvc0`), `PATINA_CTL_WAIT`, `PATINA_ACCEL`,
+`PATINA_MACHINE`, `PATINA_VIRTIO`, `PATINA_QEMU_EXTRA`. `test-net.sh` stays
+QEMU-only (`--publish`, socket netdevs); `scripts/test-vz.sh` is the VZ
+milestone script (D82). Results on VZ: see doc/status.md (test-runtime
+33/33 at 1/2/4 vCPUs, fileio/sockets/unixsock, test-ctl 8/8, os 248/33/0,
+net 254/55/0 — the same counts as QEMU).
+
+The timing oddity recorded in doc/cli-contract.md (a 0 s sleep taking 2.4 s
+at 2 vCPUs, 1 s taking 3.4 s at 1 vCPU) was measured with the driverless
+kernel and does not exist with the drivers: `testapps/sleeper` (Sleep(N),
+200 × Sleep(500 µs), ticker, cross-thread ping-pong, raw `nanosleep`/
+`epoll_pwait` timing, `-spin` for a CPU-bound competitor) at 1/2/4 vCPUs on
+VZ and QEMU hvf, 3 runs each: kernel time to `main` 3–4 ms on VZ (29 ms on
+QEMU), `Sleep(1s)` = 1000.3–1001.0 ms everywhere, vCPU counts within 1 ms
+of each other; `patina.selftest=smp`: secondaries start in 75–95 µs (2
+vCPUs) / 236–257 µs (4) on VZ vs 99–109 / 386–390 µs on QEMU, a +2 ms
+deadline fires at 2003–2005 µs, past deadlines at 3 µs, every IPI
+delivered; `selftest=timer` 5 ticks in 51–52 ms on both; the 100 Hz tick
+costs no wall time; the virtual timer (PPI 11, INTID 27) is used. What
+remains is host-side and identical on both VMMs: a vCPU woken from WFI by
+its own timer wakes ~20–25% late below 2 ms (nanosleep 500 µs → 0.60 ms,
+1 ms → 1.2 ms, 2 ms → 2.3–2.5 ms; 10 ms → 10.1–10.9 ms), exact when another
+vCPU is busy (its deadline fires on time and IPIs the sleeper) — macOS
+timer coalescing on the idle vCPU's wake, not patina; spinning instead of
+WFI under 2 ms would cost host CPU and is not done. Go's `Sleep(500µs)`
+lands at ~1.2 ms because the netpoller rounds up to `epoll_pwait(1 ms)`.
+Noted for the scheduler (not VZ-specific, identical on QEMU): at 1 vCPU a
+thread woken from `nanosleep` while a CPU-bound thread runs is late by up
+to a quantum (500 µs → 1.1 ms avg, 12 ms worst; 10 ms → 16.5 ms avg).
