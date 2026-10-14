@@ -26,9 +26,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use patina_abi::current::{O_DIRECT, O_DIRECTORY, O_NOFOLLOW, Stat};
-use patina_abi::errno::{
-    EBADF, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ENXIO, EOPNOTSUPP, Errno,
-};
+use patina_abi::errno::{EBADF, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ENXIO, EOPNOTSUPP, Errno};
 use patina_abi::fs::{
     AT_FDCWD, O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_NONBLOCK, O_PATH, O_RDONLY, O_RDWR,
     O_TMPFILE_BIT, O_TRUNC, O_WRONLY,
@@ -314,6 +312,9 @@ fn info(fs: &mut Fs, ino: Ino) -> Result<Info, Errno> {
 fn build(h: VHandle, inf: Info, flags: u32, name: Vec<u8>) -> Result<Arc<OpenFile>, Errno> {
     let path_only = flags & O_PATH != 0;
     let ino = h.ino();
+    if ino == procfs::task_dir() && !path_only {
+        vfs::with(procfs::sync_tasks);
+    }
     let file: Arc<dyn File> = if path_only {
         Arc::new(PathFile::new(h, name))
     } else {

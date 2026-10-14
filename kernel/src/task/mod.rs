@@ -30,6 +30,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use patina_abi::cred::Cred;
 use patina_abi::errno::{EAGAIN, ENOMEM, Errno};
 use patina_abi::signal::{SS_DISABLE, SigAction, SigSet, StackT};
 
@@ -200,6 +201,10 @@ pub struct Thread {
     pub kstack: KernelStack,
     /// `PR_SET_NAME` (comm), NUL-padded.
     pub name: SpinLock<[u8; 16]>,
+    /// Credentials (per thread, as on Linux; `clone` copies the parent's).
+    pub cred: SpinLock<Cred>,
+    /// Supplementary groups (`setgroups`), shared until changed.
+    pub groups: SpinLock<Arc<Vec<u32>>>,
     /// Packed state / wake reason / block sequence (see `ST_*`).
     sched_word: AtomicU64,
     /// SMP: the CPU this thread runs on / last ran on (`sched::kick_remote`,
@@ -249,6 +254,7 @@ impl Thread {
         fp: Box<ctx::FpState>,
         sig: SigState,
         blocked: SigSet,
+        cred: (Cred, Arc<Vec<u32>>),
     ) -> Thread {
         let kctx = match kind {
             ThreadKind::User => {
@@ -267,6 +273,8 @@ impl Thread {
             start: SpinLock::new(start),
             kstack,
             name: SpinLock::new(*b"app\0\0\0\0\0\0\0\0\0\0\0\0\0"),
+            cred: SpinLock::new(cred.0),
+            groups: SpinLock::new(cred.1),
             sched_word: AtomicU64::new(ST_RUNNABLE),
             cpu: AtomicUsize::new(0),
             on_cpu: AtomicBool::new(false),
@@ -458,6 +466,31 @@ fn default_sig() -> SigState {
     }
 }
 
+fn root_cred() -> (Cred, Arc<Vec<u32>>) {
+    (Cred::root(), Arc::new(Vec::new()))
+}
+
+/// The calling thread's credentials and groups (what `clone` copies).
+pub fn current_cred() -> (Cred, Arc<Vec<u32>>) {
+    let t = current();
+    let c = *t.cred.lock();
+    let g = t.groups.lock().clone();
+    (c, g)
+}
+
+/// The process's credentials as `/proc/<pid>/status` shows them: the
+/// main thread's (tid 1), or the caller's once it has exited.
+pub fn process_cred() -> (Cred, Arc<Vec<u32>>) {
+    match thread_by_tid(1) {
+        Some(t) => {
+            let c = *t.cred.lock();
+            let g = t.groups.lock().clone();
+            (c, g)
+        }
+        None => current_cred(),
+    }
+}
+
 fn register(t: Thread) -> Arc<Thread> {
     let t = Arc::new(t);
     if let ThreadKind::User = t.kind {
@@ -481,6 +514,7 @@ pub fn create_thread0(frame: ctx::TrapFrame) -> Arc<Thread> {
         Box::default(),
         default_sig(),
         0,
+        root_cred(),
     );
     register(t)
 }
@@ -514,6 +548,7 @@ pub fn spawn_user_thread(
         fp,
         default_sig(),
         mask,
+        current_cred(),
     );
     t.clear_child_tid.store(clear_child_tid, Ordering::Relaxed);
     Ok(register(t))
@@ -532,6 +567,7 @@ pub fn spawn_kernel_thread(f: fn()) -> Arc<Thread> {
         Box::default(),
         default_sig(),
         0,
+        root_cred(),
     ));
     sched::make_runnable(t.clone());
     t

@@ -140,14 +140,36 @@ fn trace(n: usize, a: &[u64; 6], ret: Option<isize>) {
 /// Index of the path argument of a path syscall (for strace).
 fn path_arg(n: usize) -> Option<usize> {
     match n {
-        nr::OPENAT | nr::MKDIRAT | nr::MKNODAT | nr::UNLINKAT | nr::READLINKAT
-        | nr::NEWFSTATAT | nr::STATX | nr::FACCESSAT | nr::FACCESSAT2 | nr::FCHMODAT
-        | nr::FCHOWNAT | nr::UTIMENSAT | nr::RENAMEAT | nr::RENAMEAT2 | nr::LINKAT => Some(1),
+        nr::OPENAT
+        | nr::MKDIRAT
+        | nr::MKNODAT
+        | nr::UNLINKAT
+        | nr::READLINKAT
+        | nr::NEWFSTATAT
+        | nr::STATX
+        | nr::FACCESSAT
+        | nr::FACCESSAT2
+        | nr::FCHMODAT
+        | nr::FCHOWNAT
+        | nr::UTIMENSAT
+        | nr::RENAMEAT
+        | nr::RENAMEAT2
+        | nr::LINKAT => Some(1),
         nr::SYMLINKAT => Some(2),
         nr::CHDIR | nr::TRUNCATE | nr::STATFS => Some(0),
         #[cfg(target_arch = "x86_64")]
-        nr::OPEN | nr::STAT | nr::LSTAT | nr::ACCESS | nr::READLINK | nr::MKDIR | nr::RMDIR
-        | nr::UNLINK | nr::RENAME | nr::CREAT | nr::CHMOD | nr::UTIMES => Some(0),
+        nr::OPEN
+        | nr::STAT
+        | nr::LSTAT
+        | nr::ACCESS
+        | nr::READLINK
+        | nr::MKDIR
+        | nr::RMDIR
+        | nr::UNLINK
+        | nr::RENAME
+        | nr::CREAT
+        | nr::CHMOD
+        | nr::UTIMES => Some(0),
         _ => None,
     }
 }
@@ -295,9 +317,18 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::STATFS => path::statfs(u(0), u(1)),
         nr::FSTATFS => path::fstatfs(i(0), u(1)),
         nr::CHROOT => Err(Errno(EPERM)),
-        nr::SETXATTR | nr::LSETXATTR | nr::FSETXATTR | nr::GETXATTR | nr::LGETXATTR
-        | nr::FGETXATTR | nr::LISTXATTR | nr::LLISTXATTR | nr::FLISTXATTR | nr::REMOVEXATTR
-        | nr::LREMOVEXATTR | nr::FREMOVEXATTR => Err(Errno(EOPNOTSUPP)),
+        nr::SETXATTR
+        | nr::LSETXATTR
+        | nr::FSETXATTR
+        | nr::GETXATTR
+        | nr::LGETXATTR
+        | nr::FGETXATTR
+        | nr::LISTXATTR
+        | nr::LLISTXATTR
+        | nr::FLISTXATTR
+        | nr::REMOVEXATTR
+        | nr::LREMOVEXATTR
+        | nr::FREMOVEXATTR => Err(Errno(EOPNOTSUPP)),
         #[cfg(target_arch = "x86_64")]
         nr::OPEN => path::openat(AT_FDCWD, u(0), a[1] as u32, a[2] as u32),
         #[cfg(target_arch = "x86_64")]
@@ -403,7 +434,7 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::GETPID => Ok(task::process().pid as isize),
         nr::GETTID => Ok(task::current().tid as isize),
         nr::GETPPID => Ok(0),
-        nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
+        nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(proc::get_id(n) as isize),
         nr::SET_TID_ADDRESS => proc::set_tid_address(a[0]),
         nr::UNAME => proc::uname(u(0)),
         nr::SCHED_GETAFFINITY => proc::sched_getaffinity(i(0), u(1), u(2)),
@@ -422,10 +453,17 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::GETPGRP => Ok(1),
         nr::SETPGID => Ok(0),
         nr::SETSID => Err(Errno(EPERM)),
-        nr::GETGROUPS => Ok(0),
-        nr::SETGROUPS | nr::SETUID | nr::SETGID | nr::SETREUID | nr::SETREGID
-        | nr::SETRESUID | nr::SETRESGID | nr::SETFSUID | nr::SETFSGID => Ok(0),
-        nr::GETRESUID | nr::GETRESGID => proc::getres(u(0), u(1), u(2)),
+        nr::GETGROUPS => proc::getgroups(i(0), u(1)),
+        nr::SETGROUPS => proc::setgroups(u(0), u(1)),
+        nr::SETUID
+        | nr::SETGID
+        | nr::SETREUID
+        | nr::SETREGID
+        | nr::SETRESUID
+        | nr::SETRESGID
+        | nr::SETFSUID
+        | nr::SETFSGID => proc::set_id(n, a[0] as u32, a[1] as u32, a[2] as u32),
+        nr::GETRESUID | nr::GETRESGID => proc::getres(n == nr::GETRESGID, u(0), u(1), u(2)),
         nr::CAPGET => proc::capget(u(0), u(1)),
         nr::CAPSET => Err(Errno(EPERM)),
         nr::SCHED_GETSCHEDULER => proc::own_id(i(0)).map(|_| 0),
@@ -438,9 +476,7 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::PERSONALITY => Ok(0),
         nr::SYSINFO => proc::sysinfo(u(0)),
         nr::GETCPU => proc::getcpu(u(0), u(1)),
-        nr::MLOCK | nr::MUNLOCK | nr::MLOCKALL | nr::MUNLOCKALL | nr::MSYNC | nr::MLOCK2 => {
-            Ok(0)
-        }
+        nr::MLOCK | nr::MUNLOCK | nr::MLOCKALL | nr::MUNLOCKALL | nr::MSYNC | nr::MLOCK2 => Ok(0),
         nr::WAIT4 | nr::WAITID => Err(Errno(ECHILD)),
         // Logged once (enosys): a program that needs these cannot work.
         nr::EXECVE | nr::EXECVEAT => enosys(n),

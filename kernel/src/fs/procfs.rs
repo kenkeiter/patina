@@ -143,7 +143,10 @@ fn cpuinfo() -> Vec<u8> {
             let _ = writeln!(s, "siblings\t: {}", n);
             let _ = writeln!(s, "core id\t\t: {}", cpu);
             let _ = writeln!(s, "cpu cores\t: {}", n);
-            let _ = writeln!(s, "flags\t\t: fpu tsc cx8 cmov sse sse2 sse3 ssse3 sse4_1 sse4_2 popcnt");
+            let _ = writeln!(
+                s,
+                "flags\t\t: fpu tsc cx8 cmov sse sse2 sse3 ssse3 sse4_1 sse4_2 popcnt"
+            );
             let _ = writeln!(s, "bogomips\t: 2000.00");
             let _ = writeln!(s);
         }
@@ -159,7 +162,14 @@ fn uptime() -> Vec<u8> {
     let ns = uptime_ns();
     let cs = ns / 10_000_000;
     let idle = cs * task::sched::online_cpus() as u64 / 2;
-    format!("{}.{:02} {}.{:02}\n", cs / 100, cs % 100, idle / 100, idle % 100).into_bytes()
+    format!(
+        "{}.{:02} {}.{:02}\n",
+        cs / 100,
+        cs % 100,
+        idle / 100,
+        idle % 100
+    )
+    .into_bytes()
 }
 
 fn joined_nul(v: &[Vec<u8>]) -> Vec<u8> {
@@ -230,8 +240,20 @@ fn sig_masks() -> (u64, u64, u64, u64) {
     (0, blocked, ign, cgt)
 }
 
-fn status() -> Vec<u8> {
+/// `/proc/1/status` (`tid` None: the process, shown with the main
+/// thread's credentials) or `/proc/1/task/<tid>/status`.
+fn status(tid: Option<u32>) -> Vec<u8> {
     let p = task::process();
+    let th = tid.and_then(task::thread_by_tid);
+    let (cred, groups) = match &th {
+        Some(t) => (*t.cred.lock(), t.groups.lock().clone()),
+        None => task::process_cred(),
+    };
+    let (u, g) = (cred.uid, cred.gid);
+    let mut gl = String::new();
+    for (i, x) in groups.iter().enumerate() {
+        let _ = write!(gl, "{}{}", if i > 0 { " " } else { "" }, x);
+    }
     let threads = task::live_threads();
     let (vsz, rss) = vm_kb();
     let (pnd, blk, ign, cgt) = sig_masks();
@@ -242,13 +264,13 @@ fn status() -> Vec<u8> {
     let _ = writeln!(s, "State:\tR (running)");
     let _ = writeln!(s, "Tgid:\t{}", p.pid);
     let _ = writeln!(s, "Ngid:\t0");
-    let _ = writeln!(s, "Pid:\t{}", p.pid);
+    let _ = writeln!(s, "Pid:\t{}", tid.unwrap_or(p.pid));
     let _ = writeln!(s, "PPid:\t0");
     let _ = writeln!(s, "TracerPid:\t0");
-    let _ = writeln!(s, "Uid:\t0\t0\t0\t0");
-    let _ = writeln!(s, "Gid:\t0\t0\t0\t0");
+    let _ = writeln!(s, "Uid:\t{}\t{}\t{}\t{}", u.r, u.e, u.s, u.fs);
+    let _ = writeln!(s, "Gid:\t{}\t{}\t{}\t{}", g.r, g.e, g.s, g.fs);
     let _ = writeln!(s, "FDSize:\t{}", 64);
-    let _ = writeln!(s, "Groups:\t");
+    let _ = writeln!(s, "Groups:\t{}", gl);
     let _ = writeln!(s, "VmPeak:\t{:>8} kB", vsz);
     let _ = writeln!(s, "VmSize:\t{:>8} kB", vsz);
     let _ = writeln!(s, "VmHWM:\t{:>8} kB", rss);
@@ -261,8 +283,8 @@ fn status() -> Vec<u8> {
     let _ = writeln!(s, "SigIgn:\t{:016x}", ign);
     let _ = writeln!(s, "SigCgt:\t{:016x}", cgt);
     let _ = writeln!(s, "CapInh:\t0000000000000000");
-    let _ = writeln!(s, "CapPrm:\t000001ffffffffff");
-    let _ = writeln!(s, "CapEff:\t000001ffffffffff");
+    let _ = writeln!(s, "CapPrm:\t{:016x}", cred.cap_prm);
+    let _ = writeln!(s, "CapEff:\t{:016x}", cred.cap_eff);
     let _ = writeln!(s, "CapBnd:\t000001ffffffffff");
     let _ = writeln!(s, "CapAmb:\t0000000000000000");
     let _ = writeln!(s, "NoNewPrivs:\t0");
@@ -285,10 +307,20 @@ fn stat() -> Vec<u8> {
     let (pnd, blk, ign, cgt) = sig_masks();
     let threads = task::live_threads();
     let f = [
-        format!("{} (app) R 0 {} {} 0 -1 4194560 0 0 0 0", p.pid, p.pid, p.pid),
+        format!(
+            "{} (app) R 0 {} {} 0 -1 4194560 0 0 0 0",
+            p.pid, p.pid, p.pid
+        ),
         format!("{} 0 0 0 20 0 {} 0 0", ticks(cpu), threads),
         format!("{} {} 18446744073709551615 0 0 0 0 0", vsz * 1024, rss / 4),
-        format!("{} {} {} {} 0 0 0 17 {} 0 0 0 0 0", pnd, blk, ign, cgt, crate::arch::cpu::id()),
+        format!(
+            "{} {} {} {} 0 0 0 17 {} 0 0 0 0 0",
+            pnd,
+            blk,
+            ign,
+            cgt,
+            crate::arch::cpu::id()
+        ),
         String::from("0 0 0 0 0 0 0 0"),
     ];
     let mut s = f.join(" ");
@@ -303,6 +335,64 @@ fn mounts() -> Vec<u8> {
 
 fn hostname() -> Vec<u8> {
     format!("{}\n", super::rootfs::hostname()).into_bytes()
+}
+
+/// Inode of `/proc/1/task`.
+static TASK_DIR: AtomicU64 = AtomicU64::new(0);
+
+pub fn task_dir() -> Ino {
+    TASK_DIR.load(Ordering::Relaxed)
+}
+
+/// Make `/proc/1/task` list the live threads (filesystem locked): add a
+/// `<tid>` directory (`status`, `stat`, `comm`) for each new thread and
+/// remove those of exited ones. Called when the directory is opened, so
+/// a listing is current; a lookup of `/proc/1/task/<tid>` for a thread
+/// created since the last listing fails.
+pub fn sync_tasks(fs: &mut Fs) {
+    let dir = task_dir();
+    if dir == 0 {
+        return;
+    }
+    let mut live: Vec<u32> = task::threads()
+        .iter()
+        .filter(|t| matches!(t.kind, task::ThreadKind::User))
+        .map(|t| t.tid)
+        .collect();
+    live.sort_unstable();
+    let have = fs.read_dir(dir).unwrap_or_default();
+    for (name, ino, _) in &have {
+        let tid = core::str::from_utf8(name)
+            .ok()
+            .and_then(|n| n.parse::<u32>().ok());
+        if tid.is_some_and(|t| live.binary_search(&t).is_ok()) {
+            continue;
+        }
+        for f in [&b"status"[..], b"stat", b"comm"] {
+            let _ = fs.unlink(*ino, f);
+        }
+        let _ = fs.rmdir(dir, name);
+    }
+    for tid in live {
+        let name = format!("{}", tid);
+        if have.iter().any(|(n, _, _)| n.as_slice() == name.as_bytes()) {
+            continue;
+        }
+        let Ok(d) = fs.mkdir(dir, name.as_bytes(), 0o555) else {
+            continue;
+        };
+        gen_file(fs, d, b"status", move || status(Some(tid)));
+        gen_file(fs, d, b"stat", stat);
+        gen_file(fs, d, b"comm", move || {
+            let n = task::thread_by_tid(tid)
+                .map(|t| *t.name.lock())
+                .unwrap_or_default();
+            let len = n.iter().position(|&b| b == 0).unwrap_or(n.len());
+            let mut v = n[..len].to_vec();
+            v.push(b'\n');
+            v
+        });
+    }
 }
 
 /// Create `/proc` and `/sys` (filesystem locked, after population).
@@ -322,7 +412,10 @@ pub fn populate(fs: &mut Fs) {
             FD_DIR.store(fd, Ordering::Relaxed);
         }
         gen_file(fs, pid, b"maps", maps);
-        gen_file(fs, pid, b"status", status);
+        gen_file(fs, pid, b"status", || status(None));
+        if let Ok(t) = fs.mkdir_all(pid, b"task", 0o555) {
+            TASK_DIR.store(t, Ordering::Relaxed);
+        }
         gen_file(fs, pid, b"stat", stat);
         gen_file(fs, pid, b"comm", text("app\n"));
         gen_file(fs, pid, b"cmdline", || joined_nul(&task::process().argv));
@@ -384,8 +477,12 @@ pub fn populate(fs: &mut Fs) {
         gen_file(fs, t, b"enabled", text("always [madvise] never\n"));
     }
     if let Ok(c) = fs.mkdir_all(sys, b"devices/system/cpu", 0o755) {
-        gen_file(fs, c, b"online", || format!("{}\n", cpu_list()).into_bytes());
-        gen_file(fs, c, b"possible", || format!("{}\n", cpu_list()).into_bytes());
+        gen_file(fs, c, b"online", || {
+            format!("{}\n", cpu_list()).into_bytes()
+        });
+        gen_file(fs, c, b"possible", || {
+            format!("{}\n", cpu_list()).into_bytes()
+        });
     }
 }
 
@@ -473,7 +570,13 @@ impl File for FdDirFile {
                     continue;
                 }
                 let name = format!("{}", fd);
-                if !emit(&mut pos, FD_LINK_INO_BASE + fd as u64, p + 1, DT_LNK, name.as_bytes()) {
+                if !emit(
+                    &mut pos,
+                    FD_LINK_INO_BASE + fd as u64,
+                    p + 1,
+                    DT_LNK,
+                    name.as_bytes(),
+                ) {
                     full = true;
                     break;
                 }
