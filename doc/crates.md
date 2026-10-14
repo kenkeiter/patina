@@ -124,3 +124,40 @@ have empty or path-only `[dependencies]` (checked in their `Cargo.toml`):
   depends only on the in-tree `patina-abi` and `patina-cpio` (whose
   third-party dependencies, `bitflags` and `zerocopy`, are audited above).
   It is not linked into the kernel yet (Phase 3).
+
+## Phase 3 note: virtio, RNG, control channel (no third-party crate)
+
+The device/control-channel half of Phase 3 added no third-party dependency.
+New kernel dependencies are in-tree only: `patina-ctlproto` (already
+host-tested, `#![forbid(unsafe_code)]`, no dependencies) and the new
+`crates/rand` (`patina-rand`: `#![no_std]`, `#![forbid(unsafe_code)]`, no
+dependencies; ChaCha20 per RFC 8439 and BLAKE2s per RFC 7693, checked
+against the RFC test vectors). `patina-loader` gained `buildinfo.rs`
+(still `#![deny(unsafe_code)]`).
+
+### virtio-drivers (considered, not used)
+
+- **Version audited:** 0.13.0 (2026-03-03), the newest on crates.io,
+  downloaded and read (about 13 kLoC, ~145 `unsafe` sites).
+- **What it would have given:** `MmioTransport` (legacy + modern) and the
+  `Transport` trait, `VirtQueue`, and device drivers.
+- **Why not:** (1) dependency weight: `safe-mmio`, `zerocopy` +
+  `zerocopy-derive`, `thiserror` (+ derive), `enumn`, `log`,
+  `embedded-io` (default feature), i.e. three proc-macro crates and their
+  `syn`/`quote` build chains for code the kernel needs about 600 lines of;
+  (2) its `VirtIOConsole` is single-port, and `patina.ctl` needs the
+  multiport control queue (DEVICE_READY / DEVICE_ADD / PORT_READY /
+  PORT_NAME / PORT_OPEN), so the console and vsock logic would be in-tree
+  anyway; (3) the transmit paths must work with IRQs masked, from the panic
+  / exit path with force-broken locks and bounded polling, which is easier
+  to guarantee in code we own. The crate's `Hal` + `Transport` split was
+  kept as the model: `drivers::virtio::Transport` is a trait (mmio now,
+  virtio-pci in Phase 4/5) and drivers only see it and `VirtQueue`.
+- **In-tree unsafe surface instead** (`kernel/src/drivers/virtio/`):
+  volatile MMIO register access in `mmio.rs` (mapped uncached with
+  `paging::map_device`), volatile ring accesses in `queue.rs` (descriptor
+  table / avail / used ring in frames owned by the queue, reached through
+  the direct map; release fence before publishing `avail.idx`, acquire
+  fence after reading `used.idx`, `arch::cpu::io_barrier` before notify),
+  `DmaBuf` copies, and `SpinLock::force_unlock` on the no-return exit/panic
+  path. DMA addresses are physical addresses (no IOMMU on any target VMM).
