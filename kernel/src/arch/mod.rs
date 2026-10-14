@@ -21,6 +21,7 @@
 //!     pub fn save_disable() -> Flags;   // mask local IRQs, return previous state
 //!     pub fn restore(f: Flags);         // restore state returned by save_disable
 //!     pub fn enabled() -> bool;
+//!     pub fn enable();                  // unmask local IRQs (kernel threads)
 //! }
 //! pub mod paging {
 //!     bitflags! { pub struct MapFlags: u32 { READ, WRITE, EXEC, DEVICE, USER } }
@@ -125,6 +126,12 @@
 //!     /// SP_EL1 is whatever the kernel left it at). Called by the scheduler
 //!     /// before `switch`/`enter_user`.
 //!     pub fn set_kernel_stack(top: usize);
+//!     /// Idle: called with IRQs masked; waits for an interrupt, lets it
+//!     /// run, returns with IRQs masked again. An IRQ that became pending
+//!     /// after the caller's last check is never lost (x86 `sti; hlt`;
+//!     /// aarch64 WFI wakes on a masked pending IRQ). The scheduler's idle
+//!     /// loop uses it.
+//!     pub fn idle_wait();
 //!     /// (AT_HWCAP, AT_HWCAP2) for auxv.
 //!     pub fn hwcap() -> (u64, u64);
 //! }

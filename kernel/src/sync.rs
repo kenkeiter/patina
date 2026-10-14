@@ -91,6 +91,20 @@ impl<T: ?Sized> SpinLock<T> {
     }
 }
 
+impl<'a, T: ?Sized> SpinLockGuard<'a, T> {
+    /// Release the lock but leave local interrupts masked; returns the lock
+    /// and the interrupt state saved when it was taken, which the caller
+    /// must eventually pass to `irq::restore`. Used by the scheduler's
+    /// blocking path (`task::wait`): the thread is queued under the lock and
+    /// must not take an interrupt between unlocking and switching away.
+    pub fn unlock_irqs_masked(mut self) -> (&'a SpinLock<T>, irq::Flags) {
+        let flags = self.irq.take().expect("guard without saved irq state");
+        let lock = self.lock;
+        drop(self); // releases the lock; `irq` is None, so IRQs stay masked
+        (lock, flags)
+    }
+}
+
 impl<T: ?Sized> Deref for SpinLockGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {

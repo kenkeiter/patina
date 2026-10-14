@@ -26,6 +26,29 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Idle until an interrupt and let it run: called with IRQs masked,
+/// returns with IRQs masked after any pending interrupt was handled.
+///
+/// No lost wake-up: `WFI` with PSTATE.I set still completes when an IRQ
+/// becomes pending (WFI wake-up events are not gated by PSTATE masking;
+/// Linux's `cpu_do_idle` relies on the same), so a wake-up that raced
+/// with the caller's "nothing to run" check is pending and is taken as
+/// soon as IRQs are unmasked below. The unmask is a self-synchronising
+/// PSTATE write; the `isb` makes the window explicit.
+#[inline]
+pub fn idle_wait() {
+    // SAFETY: WFI and DAIF changes only; IRQs end masked as on entry.
+    unsafe {
+        asm!(
+            "wfi",
+            "msr daifclr, #2",
+            "isb",
+            "msr daifset, #3",
+            options(nostack, preserves_flags)
+        )
+    };
+}
+
 /// Read MPIDR_EL1 (hardware affinity of this CPU).
 #[inline]
 pub fn mpidr() -> u64 {

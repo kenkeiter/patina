@@ -27,6 +27,19 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Idle until an interrupt and let it run: called with IRQs masked,
+/// returns with IRQs masked after the interrupt was handled.
+///
+/// No lost wake-up: `sti` keeps interrupts blocked for one more
+/// instruction, so `sti; hlt` enters the halt state before any pending
+/// interrupt is taken and the interrupt then ends the halt.
+#[inline]
+pub fn idle_wait() {
+    // SAFETY: sti/hlt/cli are always permitted in ring 0; IRQs end masked
+    // as on entry. Not `nomem`: interrupt handlers run in between.
+    unsafe { asm!("sti", "hlt", "cli", options(nostack)) };
+}
+
 #[inline]
 pub fn read_cr2() -> u64 {
     let v: u64;

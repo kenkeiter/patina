@@ -1,5 +1,6 @@
 //! Self-tests for the Phase 1 arch contract (`arch/mod.rs`, `trap.rs`):
-//! `patina.selftest=user|userfault|timer|switch`.
+//! `patina.selftest=user|userfault|timer|switch` (and `sched` / `kstack`,
+//! which live in `task::selftest`).
 //!
 //! These run before the loader/scheduler exist and exercise the arch layer
 //! alone: user page tables, entry to user mode, the syscall and fault paths,
@@ -37,6 +38,8 @@ pub fn run(which: &str) -> bool {
         "userfault" => user(false),
         "timer" => timer_test(),
         "switch" => switch_test(),
+        "sched" => crate::task::selftest::run(),
+        "kstack" => crate::task::selftest::run_overflow(),
         _ => false,
     }
 }

@@ -28,6 +28,7 @@ Put logic that does not touch hardware in a `crates/` crate so `cargo test` runs
 - Build kernel: `scripts/build-kernel.sh aarch64|x86_64` → `out/kernel-aarch64.Image`, `out/kernel-x86_64-pvh.elf`.
 - Host tests: `cargo test --workspace --exclude patina-kernel`.
 - Run under QEMU: `scripts/run-qemu.sh <arch> <initrd.cpio> [-- args]` (keep it working as features land).
+- End-to-end: `scripts/test-hello.sh [arch...]` (testapps/hello on both arches; `--threads` runs testapps/threads and shows its output).
 
 ## Rules
 

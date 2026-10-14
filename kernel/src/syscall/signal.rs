@@ -152,12 +152,14 @@ pub fn kill(pid: i32, sig: i32) -> SysResult {
 }
 
 /// `tgkill(tgid, tid, sig)` (and `tkill` with tgid = pid).
-/// W2b: look the tid up in the thread table.
+/// The target must be a live thread of the process. Nothing is delivered
+/// before Phase 2 (Go's async preemption SIGURG is simply dropped; Go
+/// falls back to cooperative preemption).
 pub fn tgkill(tgid: i32, tid: i32, sig: i32) -> SysResult {
     if tgid <= 0 || tid <= 0 {
         return Err(Errno(EINVAL));
     }
-    if tgid != task::process().pid as i32 || tid != task::current().tid as i32 {
+    if tgid != task::process().pid as i32 || task::thread_by_tid(tid as u32).is_none() {
         return Err(Errno(ESRCH));
     }
     queue(sig, tid)
