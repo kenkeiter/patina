@@ -28,9 +28,10 @@ use patina_abi::net::*;
 use patina_abi::signal::{SI_USER, SIGPIPE, SigInfo};
 use patina_inet::{AddrError, SOCKADDR_MAX, SockAddr};
 
-use super::fs::{MAX_RW, clamp_iov_out, get, install, out_room, read_iov};
+use super::fs::{MAX_RW, OBJ_RESERVE, clamp_iov_out, get, install, out_room, read_iov};
 use super::{SysResult, with_space};
 use crate::fs::file::{OpenFile, wait_ready};
+use crate::mm::heap;
 use crate::mm::vm::access_ok;
 use crate::net::socket::SocketOps;
 use crate::task::signal::ERESTARTSYS;
@@ -203,6 +204,7 @@ fn split_type(ty: i32) -> Result<(u32, u32), Errno> {
 
 pub fn socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
     let (ty, flags) = split_type(ty)?;
+    heap::reserve(OBJ_RESERVE)?;
     let file: Arc<dyn crate::fs::file::File> = match u16::try_from(domain) {
         Ok(AF_INET | AF_INET6) => crate::net::inet::create(domain as u16, ty, protocol)?,
         Ok(AF_UNIX) => crate::net::unix::create(ty, protocol)?,
@@ -218,6 +220,7 @@ pub fn socket(domain: i32, ty: i32, protocol: i32) -> SysResult {
 
 pub fn socketpair(domain: i32, ty: i32, protocol: i32, sv: usize) -> SysResult {
     let (ty, flags) = split_type(ty)?;
+    heap::reserve(OBJ_RESERVE)?;
     let (a, b) = match u16::try_from(domain) {
         Ok(AF_INET | AF_INET6) => return Err(Errno(EOPNOTSUPP)),
         Ok(AF_UNIX) => crate::net::unix::pair(ty, protocol)?,
@@ -267,6 +270,7 @@ pub fn accept4(fd: i32, addr: usize, alenp: usize, flags: u32) -> SysResult {
         return Err(Errno(EINVAL));
     }
     let of = sock(fd)?;
+    heap::reserve(OBJ_RESERVE)?;
     let o = ops(&of);
     let until = deadline(o.timeouts().0);
     let (file, peer) = loop {
@@ -401,7 +405,7 @@ fn send_common(
         if total > o.max_dgram() {
             return Err(Errno(EMSGSIZE));
         }
-        let mut k = vec![0u8; total];
+        let mut k = heap::try_zeroed(total)?;
         iov.gather(&mut k)?;
         loop {
             match o.send(&k, to.as_ref(), flags, control) {
@@ -412,7 +416,7 @@ fn send_common(
             }
         }
     }
-    let mut k = vec![0u8; total.clamp(1, CHUNK)];
+    let mut k = heap::try_zeroed(total.clamp(1, CHUNK))?;
     let mut done = 0;
     // Ancillary data goes with the first bytes sent only.
     let mut control = control;
@@ -464,7 +468,7 @@ fn recv_common(
     let want = EpollFlags::IN | EpollFlags::RDNORM;
     let total = iov.total();
     if !o.is_stream() {
-        let mut k = vec![0u8; total.min(o.max_dgram() + 1)];
+        let mut k = heap::try_zeroed(total.min(o.max_dgram() + 1))?;
         loop {
             match o.recv_msg(&mut k, flags, room) {
                 Err(Errno(EAGAIN)) if !nonblock => wait(of, want, until)?,
@@ -493,7 +497,7 @@ fn recv_common(
         }
     }
     let waitall = flags.contains(MsgFlags::WAITALL) && !flags.contains(MsgFlags::PEEK);
-    let mut k = vec![0u8; total.clamp(1, CHUNK)];
+    let mut k = heap::try_zeroed(total.clamp(1, CHUNK))?;
     let mut got = 0;
     let mut control = Vec::new();
     let mut out = MsgFlags::empty();

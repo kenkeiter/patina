@@ -89,6 +89,10 @@ pub fn init(epoch_ns: u64) {
     // tmpfs default: file data may use half of RAM.
     let (_, total) = crate::mm::frame::stats();
     fs.set_page_limit(Some(total as u64 / 2));
+    // File data is charged to the program like its mappings (D87): a write
+    // that would take the heap past the commit limit is ENOSPC, not a
+    // kernel panic.
+    fs.set_page_hook(Some(crate::mm::heap::charge_pages));
     if FS.set(SpinLock::new(fs)).is_err() {
         panic!("vfs: initialised twice");
     }

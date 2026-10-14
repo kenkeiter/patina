@@ -144,6 +144,10 @@ pub struct Fs {
     pub(crate) dev: u64,
     pub(crate) pages_used: u64,
     page_limit: Option<u64>,
+    /// Called with `+pages` before file data takes new heap pages (`false`
+    /// refuses them: `ENOSPC`) and with `-pages` when pages are freed: the
+    /// kernel charges tmpfs data to its memory accounting.
+    page_hook: Option<fn(i64) -> bool>,
     /// Owner given to new inodes.
     pub(crate) cred: (u32, u32),
 }
@@ -170,6 +174,7 @@ impl Fs {
             dev: abi::makedev(0, 1),
             pages_used: 0,
             page_limit: None,
+            page_hook: None,
             cred: (0, 0),
         };
         let now = fs.now();
@@ -202,6 +207,11 @@ impl Fs {
     /// borrowed from a `'static` backing (initrd) do not count until written.
     pub fn set_page_limit(&mut self, pages: Option<u64>) {
         self.page_limit = pages;
+    }
+
+    /// Install the page-accounting hook (see the `page_hook` field).
+    pub fn set_page_hook(&mut self, hook: Option<fn(i64) -> bool>) {
+        self.page_hook = hook;
     }
 
     /// Heap pages currently used by file data.
@@ -281,7 +291,7 @@ impl Fs {
         if free {
             if let Some(n) = self.inodes.remove(&ino) {
                 if let Kind::File(d) = &n.kind {
-                    self.pages_used -= d.owned_pages();
+                    self.release(d.owned_pages());
                 }
             }
         }
@@ -412,8 +422,23 @@ impl Fs {
                 return Err(e::ENOSPC);
             }
         }
+        if let Some(hook) = self.page_hook {
+            if pages > 0 && !hook(pages as i64) {
+                return Err(e::ENOSPC);
+            }
+        }
         self.pages_used = total;
         Ok(())
+    }
+
+    /// `pages` heap pages of file data were freed.
+    pub(crate) fn release(&mut self, pages: u64) {
+        self.pages_used -= pages;
+        if let Some(hook) = self.page_hook {
+            if pages > 0 {
+                hook(-(pages as i64));
+            }
+        }
     }
 
     /// Update atime with relatime rules: only if it is not newer than

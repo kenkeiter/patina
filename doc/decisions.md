@@ -2795,3 +2795,50 @@ arrives (and for epoll requeue the event); the errno is the same, the
 blocking is not. The check walks VMAs only (no faults, no allocation), so a
 page that is mapped but cannot be filled (out of memory, D78) can still
 fail the copy after consumption; that returns ENOMEM/EFAULT as before.
+
+## D87: Kernel heap exhaustion: charged buffers, a low watermark, fallible allocation
+*2026-10-14 · Phase 5*
+
+The kernel heap (`mm/heap.rs`, a buddy allocator) has no cap of its own:
+it grows from the frame allocator, in the same frames user pages come
+from, and never gives them back. Its allocations were infallible, so a
+program that raised `RLIMIT_NOFILE` to 2^20 and opened UDP sockets (64 KiB
+each), listening TCP sockets (4 × 128 KiB pool), written pipes (64 KiB
+ring), epolls, or wrote tmpfs files after committing most of RAM, panicked
+the kernel (`memory allocation of N bytes failed`). Now, in three layers:
+(1) long-lived memory held for the program — TCP/UDP socket buffers, pipe
+rings, queued AF_UNIX data (stream storage and datagrams, `heap::KBuf`),
+queued netlink replies, tmpfs file pages (a page hook in `patina-vfs`) —
+is charged (`heap::charge`/`uncharge`, buddy-rounded sizes) against the
+program's D78 commit limit, next to its writable mappings: `mmap` sees the
+charge and kernel buffers see the mappings, so the D78 kernel reserve
+stays for page tables, kernel stacks and kernel objects. A refused charge
+is ENOBUFS for sockets (`socket`, `connect`, sends; a listener's pool just
+stays short), ENOMEM for a pipe write, ENOSPC for tmpfs. `/proc/meminfo`
+`Committed_AS` includes the charge. (2) Syscalls that create kernel
+objects — `pipe2`, `eventfd2`, `socket`, `socketpair`, `accept4`,
+`epoll_create1`, `EPOLL_CTL_ADD`, `openat`, file creation (ENOSPC),
+`clone`, fd-table growth (up to 16 MiB), `ppoll`'s arrays — first call
+`heap::reserve`, which fails (ENOMEM) unless free frames plus free heap
+bytes stay above a low watermark of half the D78 reserve (RAM/32, 2–32
+MiB); the few hundred bytes they then allocate infallibly cannot run the
+kernel dry. (3) Buffers sized by user input (read/write/recv/send bounce
+buffers, `sendmsg` control data, socket buffers, pipe rings, fd table,
+VMA map) are allocated with `try_reserve*` (`heap::try_zeroed`): ENOMEM,
+never a panic. The heap now also grows by smaller blocks (down to the
+request's order) when RAM is too fragmented for a 2 MiB block. Bounded
+too: at most `MAX_MAP_COUNT` (65530, Linux `max_map_count`) VMAs (`mmap`
+and splitting `munmap`/`mprotect` → ENOMEM), and `munmap`/`madvise`/
+`mprotect` no longer collect every resident page of a range into a Vec.
+
+The fd table now remembers its lowest free slot, so filling it to 2^20
+is linear (it was quadratic: minutes). Known limits: freed heap memory is
+not returned to the frame allocator, so after a program frees many kernel
+buffers its own page faults can still hit the D78 backstop (SIGKILL); the
+x86_64 SMP shootdown list and the epoll ready snapshot stay infallible
+(bounded by RAM/512 and by registered items, which are gated). Verified
+with a throwaway program at `PATINA_MEM=256` on aarch64, which panicked
+the kernel before in every case: pipes until `write` ENOMEM (2875), UDP
+sockets until ENOBUFS (2787), 4096 listening sockets (then ENFILE), epolls
+until ENOMEM (734186), and tmpfs writes after committing all memory
+(ENOSPC); each exits 0.

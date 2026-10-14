@@ -14,12 +14,13 @@ use alloc::vec::Vec;
 
 use patina_abi::current::Stat;
 use patina_abi::epoll::EpollFlags;
-use patina_abi::errno::{EAGAIN, ENXIO, EPIPE, Errno};
+use patina_abi::errno::{EAGAIN, ENOMEM, ENXIO, EPIPE, Errno};
 use patina_abi::fs::S_IFIFO;
 use patina_abi::misc::FIONREAD;
 use patina_fsutil::ByteRing;
 
 use super::file::{File, FileFlags, Notify, PollHook, PollList, PollWaiter, alloc_ino, anon_stat};
+use crate::mm::heap;
 use crate::sync::SpinLock;
 use crate::task::WakeReason;
 use crate::task::signal::ERESTARTSYS;
@@ -39,6 +40,14 @@ struct PipeState {
 struct Pipe {
     st: SpinLock<PipeState>,
     ino: u64,
+}
+
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        if self.st.lock().ring.allocated() {
+            heap::uncharge(PIPE_SIZE);
+        }
+    }
 }
 
 pub struct PipeReader(Arc<Pipe>);
@@ -335,6 +344,18 @@ impl File for PipeWriter {
             let space = s.ring.space();
             if space == 0 || (buf.len() <= PIPE_BUF && space < buf.len()) {
                 return Err(Errno(EAGAIN));
+            }
+            // The 64 KiB ring is allocated on the first write, charged to
+            // the program (D87): ENOMEM (Linux pipe_write when no page can
+            // be had) instead of a kernel panic when memory runs out.
+            if !s.ring.allocated() {
+                if !heap::charge(PIPE_SIZE) {
+                    return Err(Errno(ENOMEM));
+                }
+                if s.ring.try_alloc().is_err() {
+                    heap::uncharge(PIPE_SIZE);
+                    return Err(Errno(ENOMEM));
+                }
             }
             let n = s.ring.push(buf);
             // Every write notifies readers, not only empty → non-empty

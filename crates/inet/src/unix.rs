@@ -63,6 +63,37 @@ impl<T> StreamBuf<T> {
         self.cap - self.data.len()
     }
 
+    /// Bytes of storage currently allocated for the data (for the
+    /// kernel's memory accounting; changes on [`StreamBuf::try_grow`],
+    /// [`StreamBuf::shrink_to`], and when a pop or clear empties it).
+    pub fn alloc_bytes(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// Make room for `n` more bytes now, fallibly (`Err`: out of memory),
+    /// so a following [`StreamBuf::push`] of at most `n` bytes does not
+    /// allocate. Returns how many bytes of storage were added.
+    #[allow(clippy::result_unit_err)]
+    pub fn try_grow(&mut self, n: usize) -> Result<usize, ()> {
+        let before = self.data.capacity();
+        self.data.try_reserve(n.min(self.space())).map_err(|_| ())?;
+        Ok(self.data.capacity() - before)
+    }
+
+    /// Give back storage beyond `cap` bytes (never below the data held):
+    /// undoes a [`StreamBuf::try_grow`] whose bytes could not be accounted
+    /// for.
+    pub fn shrink_to(&mut self, cap: usize) {
+        self.data.shrink_to(cap);
+    }
+
+    /// Free the storage once the buffer is empty.
+    fn release_if_empty(&mut self) {
+        if self.data.is_empty() && self.data.capacity() > 0 {
+            self.data = VecDeque::new();
+        }
+    }
+
     /// Append as much of `data` as fits. `val` is attached to the bytes
     /// taken; it is handed back when nothing could be taken.
     pub fn push(&mut self, data: &[u8], val: Option<T>) -> (usize, Option<T>) {
@@ -110,6 +141,7 @@ impl<T> StreamBuf<T> {
         self.copy_out(&mut out[..n]);
         self.data.drain(..n);
         self.head += n as u64;
+        self.release_if_empty();
         let val = if hit {
             self.marks.pop_front().map(|m| m.val)
         } else {
@@ -135,6 +167,7 @@ impl<T> StreamBuf<T> {
     pub fn clear(&mut self) -> Vec<T> {
         self.head += self.data.len() as u64;
         self.data.clear();
+        self.release_if_empty();
         self.marks.drain(..).map(|m| m.val).collect()
     }
 }
@@ -263,6 +296,32 @@ impl CmsgWriter {
 mod tests {
     use super::*;
     use patina_abi::net::{SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET};
+
+    #[test]
+    fn stream_storage_accounting() {
+        let mut b: StreamBuf<u32> = StreamBuf::new(64);
+        assert_eq!(b.alloc_bytes(), 0);
+        let g = b.try_grow(10).unwrap();
+        assert!(g >= 10 && g == b.alloc_bytes());
+        // Growth is capped by the free space.
+        assert_eq!(b.push(b"0123456789", None), (10, None));
+        assert_eq!(b.alloc_bytes(), g);
+        let before = b.alloc_bytes();
+        let g2 = b.try_grow(40).unwrap();
+        assert_eq!(b.alloc_bytes(), before + g2);
+        b.shrink_to(before);
+        assert_eq!(b.alloc_bytes(), before);
+        let mut out = [0u8; 4];
+        assert_eq!(b.pop(&mut out).0, 4);
+        assert!(b.alloc_bytes() > 0);
+        let mut out = [0u8; 16];
+        assert_eq!(b.pop(&mut out).0, 6);
+        assert_eq!(b.alloc_bytes(), 0, "an emptied buffer frees its storage");
+        b.try_grow(5).unwrap();
+        b.push(b"abcde", Some(1));
+        assert_eq!(b.clear(), alloc::vec![1]);
+        assert_eq!(b.alloc_bytes(), 0);
+    }
 
     #[test]
     fn stream_plain() {

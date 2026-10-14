@@ -101,6 +101,7 @@ pub fn epoll_create1(flags: u32) -> SysResult {
     if flags & !EPOLL_CLOEXEC != 0 {
         return Err(Errno(EINVAL));
     }
+    crate::mm::heap::reserve(super::fs::OBJ_RESERVE)?;
     install(OpenFile::new(Epoll::new(), O_RDWR), flags != 0)
 }
 
@@ -150,7 +151,11 @@ pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: usize) -> SysResult {
         }
     }
     match (op, e) {
-        (EPOLL_CTL_ADD, Some(e)) => ep.add(fd, &of, e.flags(), e.data())?,
+        (EPOLL_CTL_ADD, Some(e)) => {
+            // An item and its hook (D87: only above the heap watermark).
+            crate::mm::heap::reserve(super::fs::OBJ_RESERVE)?;
+            ep.add(fd, &of, e.flags(), e.data())?
+        }
         (EPOLL_CTL_MOD, Some(e)) => ep.modify(fd, &of, e.flags(), e.data())?,
         (EPOLL_CTL_DEL, _) => ep.delete(fd, &of)?,
         _ => return Err(Errno(EINVAL)),
@@ -268,15 +273,22 @@ fn do_poll(fds: usize, nfds: usize, tmo: Timeout, sigmask: usize, sigsetsize: us
         if nfds > proc::nofile_limit() {
             return Err(Errno(EINVAL));
         }
+        // Up to RLIMIT_NOFILE (2^20) entries: allocated fallibly and
+        // only above the heap watermark (D87).
+        let bytes = nfds * (size_of::<PollFd>() + size_of::<Option<Arc<OpenFile>>>());
+        crate::mm::heap::reserve(bytes)?;
         let mut pfds: Vec<PollFd> = Vec::new();
+        pfds.try_reserve_exact(nfds).map_err(|_| Errno(ENOMEM))?;
         pfds.resize(nfds, PollFd::new_zeroed());
         if nfds > 0 {
             with_space(|s| s.copy_from_user(fds, pfds.as_mut_slice().as_mut_bytes()))?;
         }
-        let files: Vec<Option<Arc<OpenFile>>> = pfds
-            .iter()
-            .map(|p| if p.fd < 0 { None } else { get(p.fd).ok() })
-            .collect();
+        let mut files: Vec<Option<Arc<OpenFile>>> = Vec::new();
+        files.try_reserve_exact(nfds).map_err(|_| Errno(ENOMEM))?;
+        files.extend(
+            pfds.iter()
+                .map(|p| if p.fd < 0 { None } else { get(p.fd).ok() }),
+        );
         let mut block = tmo.block;
         let n = loop {
             if !block {

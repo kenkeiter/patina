@@ -482,7 +482,7 @@ impl Fs {
         };
         n.mtime = now;
         n.ctime = now;
-        self.pages_used -= freed;
+        self.release(freed);
         Ok(())
     }
 

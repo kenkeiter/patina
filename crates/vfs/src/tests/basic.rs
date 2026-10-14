@@ -175,6 +175,32 @@ fn page_limit_enospc() {
 }
 
 #[test]
+fn page_hook_charges_and_refuses() {
+    use core::sync::atomic::{AtomicI64, Ordering};
+    static HELD: AtomicI64 = AtomicI64::new(0);
+    fn hook(d: i64) -> bool {
+        if d > 0 && HELD.load(Ordering::SeqCst) + d > 3 {
+            return false;
+        }
+        HELD.fetch_add(d, Ordering::SeqCst);
+        true
+    }
+    let mut fs = new_fs();
+    fs.set_page_hook(Some(hook));
+    let ino = put(&mut fs, "/f", &[1; 8192]);
+    assert_eq!(HELD.load(Ordering::SeqCst), 2);
+    // Two more pages would pass the hook's limit of 3: all or nothing.
+    assert_eq!(fs.write_at(ino, 8192, &[2; 8192]), Err(err(ENOSPC)));
+    assert_eq!(HELD.load(Ordering::SeqCst), 2);
+    fs.write_at(ino, 8192, b"x").unwrap();
+    assert_eq!(HELD.load(Ordering::SeqCst), 3);
+    fs.truncate(ino, 4096).unwrap();
+    assert_eq!(HELD.load(Ordering::SeqCst), 1);
+    fs.unlink(R, b"/f").unwrap();
+    assert_eq!(HELD.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn read_write_on_non_files() {
     let mut fs = new_fs();
     let mut b = [0u8; 4];

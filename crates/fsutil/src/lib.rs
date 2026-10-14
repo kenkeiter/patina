@@ -16,11 +16,24 @@ use alloc::vec::Vec;
 // ---------------------------------------------------------------------------
 // Fd slots.
 
+/// Why [`FdSlots::alloc`] / [`FdSlots::try_install`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotError {
+    /// No free fd below the limit (`EMFILE`).
+    Full,
+    /// The table could not grow (allocation failed: `ENOMEM`).
+    NoMemory,
+}
+
 /// A sparse array of `T` indexed by fd number.
 #[derive(Debug)]
 pub struct FdSlots<T> {
     slots: Vec<Option<T>>,
     used: usize,
+    /// Every slot below this one is occupied (a search for the lowest
+    /// free fd starts here, so filling a table densely is O(n), not
+    /// O(n^2)).
+    hint: usize,
 }
 
 impl<T> Default for FdSlots<T> {
@@ -34,6 +47,7 @@ impl<T> FdSlots<T> {
         FdSlots {
             slots: Vec::new(),
             used: 0,
+            hint: 0,
         }
     }
 
@@ -54,9 +68,14 @@ impl<T> FdSlots<T> {
         self.slots.get_mut(fd).and_then(Option::as_mut)
     }
 
+    /// Slots the table has room for without growing.
+    pub fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
     /// Lowest free fd `>= min` and `< limit`, if any.
     pub fn lowest_free(&self, min: usize, limit: usize) -> Option<usize> {
-        let mut fd = min;
+        let mut fd = min.max(self.hint);
         while fd < limit {
             match self.slots.get(fd) {
                 Some(Some(_)) => fd += 1,
@@ -67,29 +86,50 @@ impl<T> FdSlots<T> {
     }
 
     /// Put `v` at the lowest free fd `>= min` and `< limit`. Gives `v`
-    /// back if there is none (`EMFILE`).
-    pub fn alloc(&mut self, v: T, min: usize, limit: usize) -> Result<usize, T> {
+    /// back if there is none (`EMFILE`) or the table cannot grow.
+    pub fn alloc(&mut self, v: T, min: usize, limit: usize) -> Result<usize, (T, SlotError)> {
         match self.lowest_free(min, limit) {
-            Some(fd) => {
-                let old = self.install(fd, v);
-                debug_assert!(old.is_none());
-                Ok(fd)
-            }
-            None => Err(v),
+            Some(fd) => match self.try_install(fd, v) {
+                Ok(old) => {
+                    debug_assert!(old.is_none());
+                    Ok(fd)
+                }
+                Err(v) => Err((v, SlotError::NoMemory)),
+            },
+            None => Err((v, SlotError::Full)),
         }
     }
 
     /// Put `v` at `fd` (growing the table), returning what was there
-    /// (`dup2`/`dup3`). The caller checks `fd` against the limit.
+    /// (`dup2`/`dup3`). The caller checks `fd` against the limit. Panics
+    /// if the table cannot grow; see [`FdSlots::try_install`].
     pub fn install(&mut self, fd: usize, v: T) -> Option<T> {
+        match self.try_install(fd, v) {
+            Ok(old) => old,
+            Err(_) => panic!("fd table: out of memory"),
+        }
+    }
+
+    /// [`FdSlots::install`], but growing the table fallibly: `v` comes
+    /// back if the allocation fails.
+    pub fn try_install(&mut self, fd: usize, v: T) -> Result<Option<T>, T> {
         if fd >= self.slots.len() {
+            let more = fd + 1 - self.slots.len();
+            if self.slots.try_reserve(more).is_err() {
+                return Err(v);
+            }
             self.slots.resize_with(fd + 1, || None);
         }
         let old = self.slots[fd].replace(v);
         if old.is_none() {
             self.used += 1;
         }
-        old
+        if fd == self.hint {
+            while self.slots.get(self.hint).is_some_and(Option::is_some) {
+                self.hint += 1;
+            }
+        }
+        Ok(old)
     }
 
     /// Empty slot `fd`, returning its value.
@@ -97,6 +137,7 @@ impl<T> FdSlots<T> {
         let v = self.slots.get_mut(fd)?.take();
         if v.is_some() {
             self.used -= 1;
+            self.hint = self.hint.min(fd);
             while self.slots.last().is_some_and(Option::is_none) {
                 self.slots.pop();
             }
@@ -165,6 +206,23 @@ impl ByteRing {
     /// Free space in bytes.
     pub fn space(&self) -> usize {
         self.cap - self.len
+    }
+
+    /// Whether the storage has been allocated (by [`ByteRing::try_alloc`]
+    /// or the first [`ByteRing::push`]).
+    pub fn allocated(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
+    /// Allocate the storage now, fallibly (`Err`: out of memory). Callers
+    /// that must not panic call this before the first push.
+    #[allow(clippy::result_unit_err)]
+    pub fn try_alloc(&mut self) -> Result<(), ()> {
+        if self.buf.is_empty() {
+            self.buf.try_reserve_exact(self.cap).map_err(|_| ())?;
+            self.buf.resize(self.cap, 0);
+        }
+        Ok(())
     }
 
     /// Append as much of `data` as fits; returns the number of bytes taken.
@@ -332,7 +390,7 @@ mod tests {
         assert_eq!(t.take(1), Some('b'));
         assert_eq!(t.alloc('d', 0, 4), Ok(1));
         assert_eq!(t.alloc('e', 0, 4), Ok(3));
-        assert_eq!(t.alloc('f', 0, 4), Err('f'));
+        assert_eq!(t.alloc('f', 0, 4), Err(('f', SlotError::Full)));
         assert_eq!(t.len(), 4);
         assert_eq!(t.take(3), Some('e'));
         assert_eq!(t.take(3), None);
@@ -340,7 +398,26 @@ mod tests {
         assert_eq!(t.alloc('h', 2, 20), Ok(3));
         assert_eq!(t.get(10), Some(&'g'));
         assert_eq!(t.get(11), None);
-        assert_eq!(t.alloc('i', 30, 20), Err('i'));
+        assert_eq!(t.alloc('i', 30, 20), Err(('i', SlotError::Full)));
+    }
+
+    #[test]
+    fn fd_dense_fill_uses_hint() {
+        let mut t = FdSlots::new();
+        for i in 0..1000 {
+            assert_eq!(t.alloc(i, 0, 2000), Ok(i));
+        }
+        assert_eq!(t.take(500), Some(500));
+        assert_eq!(t.take(10), Some(10));
+        assert_eq!(t.alloc(0, 0, 2000), Ok(10));
+        assert_eq!(t.alloc(0, 0, 2000), Ok(500));
+        assert_eq!(t.alloc(0, 0, 2000), Ok(1000));
+        // dup2 far out leaves a gap that is found again.
+        assert_eq!(t.try_install(1500, 7), Ok(None));
+        assert_eq!(t.alloc(0, 1001, 2000), Ok(1001));
+        assert_eq!(t.alloc(0, 1499, 2000), Ok(1499));
+        assert_eq!(t.alloc(0, 1499, 2000), Ok(1501));
+        assert!(t.capacity() >= 1502);
     }
 
     #[test]
@@ -374,6 +451,19 @@ mod tests {
         assert_eq!(&out[..8], b"ef123456");
         assert!(r.is_empty());
         assert_eq!(r.pop(&mut out), 0);
+    }
+
+    #[test]
+    fn ring_try_alloc() {
+        let mut r = ByteRing::new(16);
+        assert!(!r.allocated());
+        r.try_alloc().unwrap();
+        assert!(r.allocated());
+        assert_eq!(r.push(b"abc"), 3);
+        r.try_alloc().unwrap();
+        let mut out = [0u8; 3];
+        assert_eq!(r.pop(&mut out), 3);
+        assert_eq!(&out, b"abc");
     }
 
     #[test]

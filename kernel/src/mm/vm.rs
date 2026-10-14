@@ -59,6 +59,10 @@ use crate::trap::Access;
 pub const MMAP_MIN_ADDR: usize = 0x1_0000;
 /// Top-down `mmap` allocation starts below this (under the stack).
 pub const MMAP_BASE: usize = 0x7f00_0000_0000;
+/// Most VMAs an address space may have (Linux `sysctl_max_map_count`
+/// default): `mmap`, and `munmap`/`mprotect` that would split a VMA, fail
+/// with ENOMEM beyond it, which bounds the kernel memory the VMA map uses.
+pub const MAX_MAP_COUNT: usize = 65530;
 
 pub type Result<T> = core::result::Result<T, Errno>;
 
@@ -206,14 +210,37 @@ impl AddressSpace {
         })
     }
 
-    /// (committed pages, commit limit in pages) — `/proc/meminfo`.
+    /// (committed pages, commit limit in pages) — `/proc/meminfo`. The
+    /// committed pages include kernel memory charged to the program
+    /// (`heap::charge`, D87).
     pub fn commit(&self) -> (usize, usize) {
-        (self.committed, self.commit_limit)
+        (
+            self.committed + crate::mm::heap::charged_pages(),
+            self.commit_limit,
+        )
     }
 
     /// Set the commit limit (loader, once the image is mapped).
     pub fn set_commit_limit(&mut self, pages: usize) {
         self.commit_limit = pages;
+        self.publish();
+    }
+
+    /// Tell the heap's accounting the commit numbers (D87): kernel memory
+    /// charged to the program shares the limit. Only the program's space
+    /// has a limit; scratch spaces (self-tests) publish nothing.
+    fn publish(&self) {
+        if self.commit_limit != usize::MAX {
+            crate::mm::heap::publish_commit(self.committed, self.commit_limit);
+        }
+    }
+
+    /// ENOMEM if `extra` more VMAs would pass [`MAX_MAP_COUNT`].
+    fn map_count_check(&self, extra: usize) -> Result<()> {
+        if self.vmas.len() + extra > MAX_MAP_COUNT {
+            return Err(Errno(ENOMEM));
+        }
+        Ok(())
     }
 
     /// Charged pages of the VMAs overlapping `[start, end)`.
@@ -232,7 +259,11 @@ impl AddressSpace {
     /// ENOMEM unless `add` more charged pages (after releasing `release`)
     /// stay within the commit limit.
     fn commit_check(&self, add: usize, release: usize, what: &str) -> Result<()> {
-        let after = self.committed.saturating_sub(release).saturating_add(add);
+        let after = self
+            .committed
+            .saturating_sub(release)
+            .saturating_add(add)
+            .saturating_add(crate::mm::heap::charged_pages());
         if add > release && after > self.commit_limit {
             crate::kprintln!(
                 "[patina] {}: {} KiB refused, commit limit reached ({} of {} KiB committed, D78)",
@@ -326,6 +357,7 @@ impl AddressSpace {
         debug_assert!(self.is_free(vma.start, vma.end));
         if charged(&vma) {
             self.committed += (vma.end - vma.start) / PAGE_SIZE;
+            self.publish();
         }
         self.vmas.insert(vma.start, vma);
         self.merge_around(vma.start);
@@ -334,28 +366,33 @@ impl AddressSpace {
     /// Unmap every resident frame in `[start, end)`, handing the frames to
     /// `sd` to free once no CPU can reach them.
     fn release_frames(&mut self, start: usize, end: usize, sd: &mut Shootdown) {
-        let pages: Vec<usize> = self.resident.range(start..end).copied().collect();
+        // Page by page without collecting them first: a Vec of every
+        // resident page in a big range would be a kernel allocation sized
+        // by the program's memory, made while memory may be short.
         let mut last_region = usize::MAX;
-        let mut regions = Vec::new();
-        for va in pages {
+        let mut tables = Vec::new();
+        let mut cur = start;
+        while let Some(&va) = self.resident.range(cur..end).next() {
             self.resident.remove(&va);
             if let Some(pa) = self.tables.unmap(va) {
                 sd.free_frame(pa);
             }
             if va >> 21 != last_region {
+                // Free the page tables of the previous 2 MiB region that
+                // became empty (D80): all its pages in range are gone.
+                if last_region != usize::MAX {
+                    self.tables.prune(last_region << 21, &mut tables);
+                }
                 last_region = va >> 21;
-                regions.push(va);
             }
+            cur = va + PAGE_SIZE;
         }
-        // Free the page tables that became empty (D80): one walk per
-        // 2 MiB region that had resident pages. Their frames are freed
-        // only after the walk caches were invalidated (aarch64: broadcast,
-        // complete on return; x86_64: local here, other CPUs through the
-        // shootdown).
-        let mut tables = Vec::new();
-        for va in regions {
-            self.tables.prune(va, &mut tables);
+        if last_region != usize::MAX {
+            self.tables.prune(last_region << 21, &mut tables);
         }
+        // The table frames are freed only after the walk caches were
+        // invalidated (aarch64: broadcast, complete on return; x86_64:
+        // local here, other CPUs through the shootdown).
         if !tables.is_empty() {
             crate::arch::uspace::flush_table_walks();
             for pa in tables {
@@ -371,6 +408,7 @@ impl AddressSpace {
         self.committed = self
             .committed
             .saturating_sub(self.charged_pages(start, end));
+        self.publish();
         let keys: Vec<usize> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
         for k in keys {
             self.vmas.remove(&k);
@@ -550,6 +588,8 @@ impl AddressSpace {
         if len == 0 || !off.is_multiple_of(PAGE_SIZE as u64) {
             return Err(Errno(EINVAL));
         }
+        // Linux do_mmap: `mm->map_count > sysctl_max_map_count` → ENOMEM.
+        self.map_count_check(1)?;
         let fixed = mf.contains(MmapFlags::FIXED);
         let noreplace = mf.contains(MmapFlags::FIXED_NOREPLACE);
         let len = len.checked_add(PAGE_SIZE - 1).ok_or(Errno(ENOMEM))? & !(PAGE_SIZE - 1);
@@ -610,6 +650,10 @@ impl AddressSpace {
             return Err(Errno(EINVAL));
         }
         let len = page_len(addr, len).ok_or(Errno(EINVAL))?;
+        // Punching a hole splits a VMA in two (Linux __split_vma).
+        if self.find(addr).is_some_and(|v| v.start < addr && v.end > addr + len) {
+            self.map_count_check(1)?;
+        }
         self.remove_range(addr, addr + len, &mut Shootdown::new());
         Ok(())
     }
@@ -664,6 +708,7 @@ impl AddressSpace {
         if !self.is_covered(addr, end) {
             return Err(Errno(ENOMEM));
         }
+        self.map_count_check(2)?;
         self.split_at(addr);
         self.split_at(end);
         let keys: Vec<usize> = self.vmas.range(addr..end).map(|(k, _)| *k).collect();
@@ -686,6 +731,7 @@ impl AddressSpace {
             return Err(e);
         }
         self.committed = self.committed - before + after;
+        self.publish();
         // Whether some permission is revoked (other CPUs must then drop
         // their cached translations; adding permissions needs nothing).
         let mut reduced = false;
@@ -694,13 +740,12 @@ impl AddressSpace {
             reduced |= !prot.contains(v.prot);
             v.prot = prot;
         }
-        let pages: Vec<usize> = self.resident.range(addr..end).copied().collect();
         let mut sd = Shootdown::new();
-        if reduced && !pages.is_empty() {
+        if reduced && self.resident.range(addr..end).next().is_some() {
             sd.flush();
         }
         let f = pte_flags(prot);
-        for va in pages {
+        for &va in self.resident.range(addr..end) {
             self.tables.protect(va, f);
         }
         drop(sd);

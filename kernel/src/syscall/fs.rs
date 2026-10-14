@@ -7,7 +7,6 @@
 //! `fs/file.rs`).
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use patina_abi::current::O_DIRECT;
@@ -24,12 +23,17 @@ use super::{SysResult, proc, with_space};
 use crate::mm::vm::access_ok;
 use crate::fs::file::{OpenFile, wait_ready};
 use crate::fs::{eventfd, pipe};
+use crate::mm::heap;
 use crate::task::signal::{self, ERESTARTSYS};
 use crate::task::{self, WakeReason};
 use patina_abi::signal::{SI_USER, SIGPIPE, SigInfo};
 
 /// Kernel bounce buffer per read/write step.
 const CHUNK: usize = 64 * 1024;
+/// Heap a syscall that creates kernel objects (a pipe, socket, epoll,
+/// eventfd, file) checks for with `heap::reserve` before it allocates them
+/// infallibly (D87): generous for the few hundred bytes they take.
+pub(super) const OBJ_RESERVE: usize = 4096;
 /// Linux `MAX_RW_COUNT` (`INT_MAX & PAGE_MASK`).
 pub(super) const MAX_RW: usize = 0x7fff_f000;
 
@@ -169,7 +173,7 @@ fn write_from(of: &OpenFile, ubuf: usize, len: usize) -> SysResult {
         return Err(Errno(patina_abi::errno::EMSGSIZE));
     }
     let chunk = dmax.unwrap_or(CHUNK);
-    let mut k = vec![0u8; len.min(chunk)];
+    let mut k = heap::try_zeroed(len.min(chunk))?;
     let mut done = 0;
     while done < len {
         let n = (len - done).min(chunk);
@@ -208,7 +212,7 @@ pub fn sendfile(out_fd: i32, in_fd: i32, offp: usize, count: usize) -> SysResult
             .map_err(|_| Errno(EINVAL))?
     };
     let count = count.min(MAX_RW);
-    let mut k = vec![0u8; count.clamp(1, CHUNK)];
+    let mut k = heap::try_zeroed(count.clamp(1, CHUNK))?;
     let mut done = 0usize;
     let mut err = None;
     while done < count {
@@ -252,7 +256,7 @@ pub fn read(fd: i32, buf: usize, len: usize) -> SysResult {
     // Linux vfs_read: access_ok on the whole count, then clamp.
     let room = out_room(buf, len)?;
     let chunk = dgram_max(&of).map_or(CHUNK, |m| m + 1);
-    let mut k = vec![0u8; room.min(MAX_RW).min(chunk)];
+    let mut k = heap::try_zeroed(room.min(MAX_RW).min(chunk))?;
     let n = read_into(&of, &mut k)?;
     with_space(|s| s.copy_to_user(buf, &k[..n]))?;
     Ok(n as isize)
@@ -315,7 +319,7 @@ pub fn readv(fd: i32, iov: usize, cnt: usize) -> SysResult {
     let mut iovs = read_iov(iov, cnt)?;
     clamp_iov_out(&mut iovs)?;
     let total: usize = iovs.iter().map(|v| v.1).sum();
-    let mut k = vec![0u8; total.min(CHUNK)];
+    let mut k = heap::try_zeroed(total.min(CHUNK))?;
     let n = read_into(&of, &mut k)?;
     let mut off = 0;
     for (base, len) in iovs {
@@ -369,7 +373,7 @@ pub fn pread64(fd: i32, buf: usize, len: usize, off: i64) -> SysResult {
         return Err(Errno(EBADF));
     }
     let room = out_room(buf, len)?;
-    let mut k = vec![0u8; room.min(CHUNK)];
+    let mut k = heap::try_zeroed(room.min(CHUNK))?;
     let n = of.file.pread(&mut k, off as u64)?;
     with_space(|s| s.copy_to_user(buf, &k[..n]))?;
     Ok(n as isize)
@@ -385,7 +389,7 @@ pub fn pwrite64(fd: i32, buf: usize, len: usize, off: i64) -> SysResult {
     if !of.flags().writable() {
         return Err(Errno(EBADF));
     }
-    let mut k = vec![0u8; len.min(CHUNK)];
+    let mut k = heap::try_zeroed(len.min(CHUNK))?;
     with_space(|s| s.copy_from_user(buf, &mut k))?;
     Ok(of.file.pwrite(&k, off as u64)? as isize)
 }
@@ -413,7 +417,7 @@ pub fn getdents64(fd: i32, buf: usize, len: u32) -> SysResult {
     } else {
         len as usize
     };
-    let mut k = vec![0u8; room.min(CHUNK)];
+    let mut k = heap::try_zeroed(room.min(CHUNK))?;
     let n = of.file.getdents64(&mut k)?;
     with_space(|s| s.copy_to_user(buf, &k[..n]))?;
     Ok(n as isize)
@@ -529,7 +533,7 @@ pub fn dup3(old: i32, new: i32, flags: u32) -> SysResult {
     let replaced = {
         let mut t = task::process().files.lock();
         let of = t.get(old)?;
-        t.install(new as usize, of, flags & O_CLOEXEC != 0)
+        t.install(new as usize, of, flags & O_CLOEXEC != 0)?
     };
     drop(replaced);
     Ok(new as isize)
@@ -649,6 +653,8 @@ pub fn pipe2(fds: usize, flags: u32) -> SysResult {
         // O_DIRECT (packet mode) is not implemented.
         return Err(Errno(EINVAL));
     }
+    // New kernel objects only while the heap's watermark holds (D87).
+    heap::reserve(OBJ_RESERVE)?;
     let cloexec = flags & O_CLOEXEC != 0;
     let st = flags & O_NONBLOCK;
     let (r, w) = pipe::new();
@@ -683,6 +689,7 @@ pub fn eventfd2(init: u32, flags: u32) -> SysResult {
     if flags & !(EFD_SEMAPHORE | EFD_CLOEXEC | EFD_NONBLOCK) != 0 {
         return Err(Errno(EINVAL));
     }
+    heap::reserve(OBJ_RESERVE)?;
     let ev = eventfd::EventFd::new(init, flags & EFD_SEMAPHORE != 0);
     install(
         OpenFile::new(ev, O_RDWR | (flags & EFD_NONBLOCK)),

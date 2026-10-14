@@ -11,9 +11,9 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use patina_abi::errno::{EBADF, EMFILE, Errno};
+use patina_abi::errno::{EBADF, EMFILE, ENOMEM, Errno};
 use patina_abi::fs::{O_RDONLY, O_RDWR};
-use patina_fsutil::FdSlots;
+use patina_fsutil::{FdSlots, SlotError};
 
 use super::console::Console;
 use super::file::OpenFile;
@@ -84,8 +84,20 @@ impl FdTable {
         self.slots.get_mut(idx(fd)?).ok_or(Errno(EBADF))
     }
 
+    /// Before the table grows to hold `fd`: the slot array (up to 16 MiB
+    /// at `RLIMIT_NOFILE`'s maximum) is a user-driven allocation, so it
+    /// must leave the heap's low watermark intact (D87) → ENOMEM.
+    fn grow_check(&self, fd: usize) -> Result<(), Errno> {
+        let cap = self.slots.capacity();
+        if fd >= cap {
+            let slots = (fd + 1).max(cap * 2);
+            crate::mm::heap::reserve(slots * size_of::<Option<FdEntry>>())?;
+        }
+        Ok(())
+    }
+
     /// Install `file` at the lowest free fd `>= min` (`EMFILE` if none
-    /// below `limit`).
+    /// below `limit`, `ENOMEM` if the table cannot grow).
     pub fn alloc(
         &mut self,
         file: Arc<OpenFile>,
@@ -93,16 +105,31 @@ impl FdTable {
         min: usize,
         limit: usize,
     ) -> Result<i32, Errno> {
+        if let Some(fd) = self.slots.lowest_free(min, limit) {
+            self.grow_check(fd)?;
+        }
         self.slots
             .alloc(FdEntry { file, cloexec }, min, limit)
             .map(|fd| fd as i32)
-            .map_err(|_| Errno(EMFILE))
+            .map_err(|(_, e)| match e {
+                SlotError::Full => Errno(EMFILE),
+                SlotError::NoMemory => Errno(ENOMEM),
+            })
     }
 
     /// Install at exactly `fd` (`dup2`/`dup3`; the caller checked `fd`
-    /// against the limit). Returns the entry that was there.
-    pub fn install(&mut self, fd: usize, file: Arc<OpenFile>, cloexec: bool) -> Option<FdEntry> {
-        self.slots.install(fd, FdEntry { file, cloexec })
+    /// against the limit). Returns the entry that was there; `ENOMEM` if
+    /// the table cannot grow.
+    pub fn install(
+        &mut self,
+        fd: usize,
+        file: Arc<OpenFile>,
+        cloexec: bool,
+    ) -> Result<Option<FdEntry>, Errno> {
+        self.grow_check(fd)?;
+        self.slots
+            .try_install(fd, FdEntry { file, cloexec })
+            .map_err(|_| Errno(ENOMEM))
     }
 
     /// Remove `fd` (`EBADF` if not open). Drop the result after unlocking.
