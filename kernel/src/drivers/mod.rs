@@ -35,25 +35,6 @@ pub struct MmioDesc {
 
 /// Discover devices and start the drivers.
 pub fn init(cmdline: &patina_cmdline::Cmdline) {
-    // TEMP diagnostic: patina.boot.delay=<ms> spins before touching devices.
-    if let Some(Some(ms)) = cmdline.get("patina.boot.delay") {
-        if let Ok(ms) = ms.parse::<u64>() {
-            let until = crate::arch::timer::now_ns() + ms * 1_000_000;
-            while crate::arch::timer::now_ns() < until {
-                core::hint::spin_loop();
-            }
-        }
-    }
-    for (key, slot) in [
-        ("patina.virtio.reset_settle", &virtio::RESET_SETTLE_NS),
-        ("patina.virtio.ok_settle", &virtio::OK_SETTLE_NS),
-    ] {
-        if let Some(Some(ms)) = cmdline.get(key)
-            && let Ok(ms) = ms.parse::<u64>()
-        {
-            slot.store(ms * 1_000_000, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
     let found = crate::arch::devices::virtio_mmio(cmdline);
     let mut n = 0;
     for d in &found {
@@ -80,9 +61,6 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     }
     virtio::rng::init();
     virtio::console::init(cmdline);
-    if cmdline.get("patina.hvc.diag").is_some() {
-        spawn(virtio::console::diag_thread);
-    }
     virtio::vsock::init();
     // virtio-net registers itself with `net::device` for the stack.
     virtio::net::init();
