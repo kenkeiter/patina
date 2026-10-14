@@ -313,6 +313,15 @@ pub fn tick() {
     }
 }
 
+/// A `Reschedule` IPI arrived on this CPU (IRQs masked). Phase 2 SMP: mark
+/// `need_resched` so the return-to-user path re-checks the runqueue; an
+/// idle CPU re-checks it after `cpu::idle_wait` returns anyway.
+pub fn ipi_reschedule() {
+    if is_running() {
+        this_cpu().set_need_resched();
+    }
+}
+
 /// Hook for `trap::before_return_to_user` (IRQs masked): run a pending
 /// reschedule. Phase 2: signal delivery follows here.
 pub fn before_return_to_user() {

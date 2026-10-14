@@ -137,6 +137,56 @@
 //! }
 //! ```
 //!
+//! Phase 2 additions (SMP, IPIs, one-shot timer deadlines, hardware
+//! randomness). The arch layer implements these; `task/sched.rs` and
+//! `task/sleep.rs` use them. Every per-CPU facility must work on the
+//! secondary CPUs exactly as on the boot CPU (`cpu::id()`, `irq::*`,
+//! `cpu::set_kernel_stack`, `cpu::idle_wait`, `timer::now_ns`, the user
+//! page tables: `UserTables::activate` is called once per CPU).
+//!
+//! ```text
+//! pub mod smp {
+//!     /// CPUs the platform reports (DTB /cpus; ACPI MADT via the PVH
+//!     /// start_info RSDP, else the MP table, else 1). >= 1, valid once
+//!     /// the boot CPU reached kernel_main. Capped at cpu::MAX_CPUS.
+//!     pub fn cpu_count() -> usize;
+//!     /// Start every secondary CPU (PSCI CPU_ON / INIT-SIPI-SIPI). Each
+//!     /// one gets its own kernel stack, GDT/TSS/IST or vector table,
+//!     /// per-CPU block, interrupt controller + timer (`timer::init_cpu`)
+//!     /// and runs `entry(cpu_id)` with IRQs masked and the kernel page
+//!     /// tables live; `entry` never returns. The boot CPU waits until
+//!     /// every started CPU has reached `entry`. Returns how many started.
+//!     pub fn start_secondaries(entry: fn(usize) -> !) -> usize;
+//!     /// Send an IPI to `cpu`; the target runs `trap::ipi(frame, kind)`
+//!     /// with IRQs masked after the arch acknowledged/EOI'd it. May be
+//!     /// called with IRQs masked and with spinlocks held; never blocks.
+//!     pub fn send_ipi(cpu: usize, kind: trap::IpiKind);
+//!     /// `send_ipi` to every other online CPU.
+//!     pub fn send_ipi_others(kind: trap::IpiKind);
+//! }
+//! pub mod timer {
+//!     /// Secondary CPU: start this CPU's periodic tick (the boot CPU uses
+//!     /// `init`). Does not unmask IRQs.
+//!     pub fn init_cpu();
+//!     /// Per-CPU one-shot deadline (absolute monotonic ns as `now_ns`):
+//!     /// in addition to the periodic tick, raise the timer interrupt
+//!     /// (→ `trap::timer_tick`) at or just after `ns`; `None` cancels.
+//!     /// Replaces the previous deadline. A deadline in the past fires
+//!     /// immediately. Lets `task/sleep.rs` honour sub-tick timeouts.
+//!     pub fn set_deadline(ns: Option<u64>);
+//! }
+//! pub mod cpu {
+//!     pub const MAX_CPUS: usize;        // per-CPU static slots (>= 8)
+//!     /// A 64-bit value from the hardware RNG, if any (RNDR / RDSEED /
+//!     /// RDRAND); None when the CPU has none. Used to seed `random.rs`.
+//!     pub fn hw_random() -> Option<u64>;
+//! }
+//! ```
+//!
+//! `trap::timer_tick` keeps its contract (periodic rearm is the arch's
+//! job); the deadline interrupt simply calls the same hook. IPIs are
+//! `trap::IpiKind::{Reschedule, Stop}` → `trap::ipi`.
+//!
 //! Entry paths the arch must provide (all end by restoring `frame`):
 //! * syscall (`SVC #0` / `SYSCALL`+`SYSRET` with `swapgs` and the per-CPU
 //!   kernel stack) → `trap::syscall(&mut frame)`;

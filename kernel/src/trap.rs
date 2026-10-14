@@ -78,6 +78,33 @@ pub enum Exception {
 /// Number of timer ticks seen (diagnostics / self-tests).
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Inter-processor interrupt kinds (Phase 2 SMP contract, see
+/// `arch/mod.rs` `smp`). The arch delivers them to [`ipi`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpiKind {
+    /// Re-check the runqueue / pending signals: the target CPU runs the
+    /// normal `before_return_to_user` path (or leaves its idle wait).
+    Reschedule,
+    /// Stop this CPU for good (exit_group / panic): mask IRQs and halt.
+    Stop,
+}
+
+/// Number of IPIs received on all CPUs (diagnostics / self-tests).
+pub static IPIS: AtomicU64 = AtomicU64::new(0);
+
+/// An IPI arrived on this CPU (IRQs masked, EOI already sent by the arch,
+/// `frame` is the interrupted context — user or kernel). For
+/// `Reschedule` nothing needs to happen here beyond returning: a CPU that
+/// was idle re-checks its runqueue, a CPU that was in user mode runs
+/// [`before_return_to_user`] on the way back. `Stop` never returns.
+pub fn ipi(_frame: &mut TrapFrame, kind: IpiKind) {
+    IPIS.fetch_add(1, Ordering::Relaxed);
+    match kind {
+        IpiKind::Reschedule => crate::task::sched::ipi_reschedule(),
+        IpiKind::Stop => crate::arch::cpu::halt(),
+    }
+}
+
 /// A syscall from user mode. `frame.syscall_nr()` / `frame.syscall_args()`
 /// give the request; the result goes back with `frame.set_syscall_ret()`.
 pub fn syscall(frame: &mut TrapFrame) {
