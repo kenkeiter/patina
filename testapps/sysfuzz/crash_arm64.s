@@ -13,13 +13,18 @@ TEXT ·exit42(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD $42, R0
 	MOVD $94, R8 // exit_group
 	SVC
-	B ·exit42(SB)
+spin:
+	B spin
 
 // getpid, then exit_group(42).
 TEXT ·getpidExit42(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD $172, R8 // getpid
 	SVC
-	B ·exit42(SB)
+	MOVD $42, R0
+	MOVD $94, R8 // exit_group
+	SVC
+spin2:
+	B spin2
 
 // func exit42Addr() uintptr
 TEXT ·exit42Addr(SB),NOSPLIT,$0-8

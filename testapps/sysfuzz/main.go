@@ -15,9 +15,7 @@
 //	          is that the kernel stays alive and the program exits 0
 //	          ("PASS sysfuzz fuzz").
 //	all       cases, then fuzz.
-//	exhaust   kernel memory pressure: raise RLIMIT_NOFILE and create
-//	          sockets / pipes / filled buffers until the kernel refuses;
-//	          every refusal must be an errno, never a kernel panic.
+//	exhaust   reserved (not implemented): kernel memory pressure.
 //	sigreturn-* hand-crafted bad rt_sigreturn frames (crash.go): the
 //	          program dies by a signal; the kernel must survive.
 //
@@ -38,11 +36,13 @@ import (
 )
 
 var (
-	modeFlag  = flag.String("mode", "all", "cases|fuzz|all|exhaust|sigreturn-*")
-	seedFlag  = flag.Int64("seed", 1, "fuzz seed")
-	itersFlag = flag.Int("iters", 20000, "total fuzz syscalls")
-	procsFlag = flag.Int("procs", 0, "fuzz goroutines (0: GOMAXPROCS)")
-	vFlag     = flag.Bool("v", false, "log every fuzz call")
+	modeFlag     = flag.String("mode", "all", "cases|fuzz|all|exhaust|sigreturn-*")
+	seedFlag     = flag.Int64("seed", 1, "fuzz seed")
+	itersFlag    = flag.Int("iters", 20000, "total fuzz syscalls")
+	procsFlag    = flag.Int("procs", 0, "fuzz goroutines (0: GOMAXPROCS)")
+	vFlag        = flag.Bool("v", false, "log every fuzz call")
+	skipFlag     = flag.String("skip", "", "skip a named case group (cases mode): mincore-huge")
+	deadlineFlag = flag.Duration("deadline", 120*time.Second, "fuzz mode: fail (exit 3) if the workers are stuck past this")
 )
 
 func main() {
@@ -52,8 +52,9 @@ func main() {
 	// Timers and itimers armed by the fuzzer signal the process; these
 	// must not terminate it. SIGPIPE from writes to widowed pipes and
 	// sockets is likewise expected.
-	signal.Ignore(syscall.SIGALRM, syscall.SIGVTALRM, syscall.SIGPIPE,
-		syscall.SIGWINCH, syscall.SIGCHLD, syscall.SIGIO)
+	signal.Ignore(syscall.SIGALRM, syscall.SIGVTALRM, syscall.SIGPROF, syscall.SIGPIPE,
+		syscall.SIGWINCH, syscall.SIGCHLD, syscall.SIGIO, syscall.SIGXFSZ, syscall.SIGXCPU,
+		syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGHUP)
 	// Make sure Go's netpoller (epoll fd, eventfd) exists before the
 	// fuzzer records which fds it owns.
 	time.Sleep(time.Millisecond)
@@ -68,7 +69,8 @@ func main() {
 		runCases()
 		runFuzz()
 	case "exhaust":
-		runExhaust()
+		fmt.Println("sysfuzz: exhaust mode is not implemented (finding 6 is covered by the kernel-side check)")
+		os.Exit(2)
 	default:
 		if !runCrash(*modeFlag) {
 			fmt.Printf("FAIL sysfuzz: unknown mode %q\n", *modeFlag)

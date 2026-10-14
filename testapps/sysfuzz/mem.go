@@ -15,7 +15,11 @@ const (
 	junkSize   = 2 << 20 // shared scratch: any syscall may write here
 	consSize   = 64 << 10
 	maxWorkers = 32
-	rwSize     = junkSize + maxWorkers*consSize
+	// A PROT_NONE page between the junk area and the cons areas: a kernel
+	// write through a junk pointer with a huge length stops there (EFAULT
+	// after a partial copy) instead of overwriting constructed inputs.
+	consBase = junkSize + pageSize
+	rwSize   = consBase + maxWorkers*consSize
 	// The mm arena: the only range the fuzzer maps, unmaps, protects,
 	// advises and remaps.
 	mmArenaSize = 64 << 20
@@ -56,9 +60,13 @@ func setupArena() {
 	guardPage = rwEnd
 	roPage = rwEnd + pageSize
 	holePage = roPage + pageSize
-	// [guard][RW ...][guard][RO][hole][guard]
+	// [guard][junk][guard][cons...][guard][RO][hole][guard]
 	if _, e := scr(SYS_MPROTECT, rwBase, rwSize, syscall.PROT_READ|syscall.PROT_WRITE); e != 0 {
 		fmt.Printf("FAIL sysfuzz: arena mprotect rw: %v\n", e)
+		os.Exit(1)
+	}
+	if _, e := scr(SYS_MPROTECT, rwBase+junkSize, pageSize, syscall.PROT_NONE); e != 0 {
+		fmt.Printf("FAIL sysfuzz: arena mprotect cons guard: %v\n", e)
 		os.Exit(1)
 	}
 	if _, e := scr(SYS_MPROTECT, roPage, pageSize, syscall.PROT_READ); e != 0 {
@@ -76,6 +84,8 @@ func setupArena() {
 		os.Exit(1)
 	}
 	mmBase = mm
+	fmt.Printf("sysfuzz: arena rw %#x-%#x (cons at +%#x) ro %#x hole %#x mm %#x-%#x\n",
+		rwBase, rwEnd, consBase, roPage, holePage, mmBase, mmBase+mmArenaSize)
 }
 
 // mem views arena memory as a byte slice.
@@ -98,7 +108,7 @@ type cons struct {
 }
 
 func newCons(worker int) *cons {
-	return &cons{base: rwBase + junkSize + uintptr(worker)*consSize}
+	return &cons{base: rwBase + consBase + uintptr(worker)*consSize}
 }
 
 func (c *cons) reset() { c.off = 0 }

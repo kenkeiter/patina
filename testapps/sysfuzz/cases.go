@@ -89,7 +89,7 @@ func pipe(t *tcase) (uintptr, uintptr) {
 }
 
 func openPath(t *tcase, path string, flags int) uintptr {
-	return must("open "+path)(scr(SYS_OPENAT, u(-100), t.c.cstr(path), uintptr(flags|syscall.O_CLOEXEC), 0o644))
+	return must("open " + path)(scr(SYS_OPENAT, u(-100), t.c.cstr(path), uintptr(flags|syscall.O_CLOEXEC), 0o644))
 }
 
 func runCases() {
@@ -239,8 +239,10 @@ func casesMM(t *tcase) {
 	// whole 4 Gi-entry vector at once.
 	big, e := scr(SYS_MMAP, 0, 16<<40, syscall.PROT_NONE, anon|noRes, allOnes, 0)
 	if e == 0 {
-		r, e = scr(SYS_MINCORE, big, 16<<40, rwBase)
-		t.want("mincore 16 TiB into 2 MiB", r, e, syscall.EFAULT)
+		if *skipFlag != "mincore-huge" { // -skip mincore-huge: a kernel that panics here
+			r, e = scr(SYS_MINCORE, big, 16<<40, rwBase)
+			t.want("mincore 16 TiB into 2 MiB", r, e, syscall.EFAULT)
+		}
 		r, e = scr(SYS_MADVISE, big, 16<<40, syscall.MADV_DONTNEED)
 		t.want("madvise 16 TiB reservation", r, e, 0)
 		r, e = scr(SYS_MPROTECT, big, 16<<40, syscall.PROT_NONE)
@@ -436,6 +438,13 @@ func casesRW(t *tcase) {
 	t.want("write kernel buffer", r, e, syscall.EFAULT)
 	r, e = scr(SYS_WRITE, pw, buf, 1<<62)
 	t.want("write huge count", r, e, syscall.EFAULT)
+	// Drain first: a kernel that wrote before checking the huge count
+	// above has filled the ring (the case fails; the setup must not).
+	for {
+		if _, e := scr(SYS_READ, pr, junk(randFor(3), 4096), 4096); e != 0 {
+			break
+		}
+	}
 	must("write x")(scr(SYS_WRITE, pw, t.c.cstr("xy"), 2))
 	r, e = scr(SYS_READ, pr, kernHalf, 1)
 	t.want("read kernel buffer", r, e, syscall.EFAULT)

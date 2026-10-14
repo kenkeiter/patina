@@ -13,13 +13,18 @@ TEXT ·exit42(SB),NOSPLIT|NOFRAME,$0-0
 	MOVQ $42, DI
 	MOVQ $231, AX // exit_group
 	SYSCALL
-	JMP ·exit42(SB)
+spin:
+	JMP spin
 
 // getpid, then exit_group(42).
 TEXT ·getpidExit42(SB),NOSPLIT|NOFRAME,$0-0
 	MOVQ $39, AX // getpid
 	SYSCALL
-	JMP ·exit42(SB)
+	MOVQ $42, DI
+	MOVQ $231, AX // exit_group
+	SYSCALL
+spin2:
+	JMP spin2
 
 // func exit42Addr() uintptr
 TEXT ·exit42Addr(SB),NOSPLIT,$0-8
