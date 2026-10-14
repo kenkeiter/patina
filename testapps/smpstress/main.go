@@ -224,13 +224,11 @@ func parallelPhase() {
 	const nb = int(window / bucket)
 	var ready sync.WaitGroup
 	var done sync.WaitGroup
-	var go_ atomic.Bool
+	goCh := make(chan struct{})
 	var marks [2][nb]bool
 	var tids [2]int
 	var iters [2]uint64
 	var start time.Time
-	var startMu sync.RWMutex
-	startMu.Lock()
 	for w := 0; w < 2; w++ {
 		ready.Add(1)
 		done.Add(1)
@@ -240,11 +238,10 @@ func parallelPhase() {
 			defer runtime.UnlockOSThread()
 			tids[w] = syscall.Gettid()
 			ready.Done()
-			for !go_.Load() {
-			}
-			startMu.RLock()
+			// Block (not spin) until the window opens: spinning here would
+			// hold both Ps at GOMAXPROCS=2 and starve main.
+			<-goCh
 			s := start
-			startMu.RUnlock()
 			for {
 				el := time.Since(s)
 				if el >= window {
@@ -257,8 +254,7 @@ func parallelPhase() {
 	}
 	ready.Wait()
 	start = time.Now()
-	startMu.Unlock()
-	go_.Store(true)
+	close(goCh)
 	done.Wait()
 	if tids[0] == tids[1] {
 		fail("locked goroutines share tid %d", tids[0])
