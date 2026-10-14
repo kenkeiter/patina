@@ -10,7 +10,7 @@ The per-phase checklist is in [doc/status.md](doc/status.md). Items are marked v
 |---|---|---|
 | QEMU aarch64 (`virt`, HVF) | Verified: `scripts/test-net.sh` | Verified: 13 packages, 0 failures at 1, 4 and 8 vCPUs |
 | QEMU x86_64 (`microvm`/`q35`, TCG) | Verified: `scripts/test-net.sh` | Verified: 13 packages, 0 failures at 1 vCPU, 5 packages at 4 vCPUs |
-| Apple VZ (aarch64) | In progress. The CLI driver exists; the kernel's virtio-pci/`hvc0`/vsock path has not booted under VZ yet. | Not run |
+| Apple VZ (aarch64) | Verified: `scripts/test-vz.sh` (console on `hvc0`, vsock control channel, NAT networking, `AF_VSOCK` for the program) | Verified: `os` and `net` packages, 0 failures (`PATINA_VMM=vz scripts/test-gopkg.sh`) |
 | Firecracker (both arches) | Written to the spec, unverified (no KVM host). The CLI driver is tested only against fakes. | Not run |
 | Cloud Hypervisor (both arches) | Written to the spec, unverified (no KVM host). The CLI driver is tested only against fakes. | Not run |
 
@@ -63,7 +63,7 @@ patina ps
 patina version
 ```
 
-The available targets are `qemu`, `firecracker`, `cloud-hypervisor` and `vz`, each on `x86_64` or `aarch64`. `vz` is aarch64 only. `--net user` and `--publish` are QEMU-only.
+The available targets are `qemu`, `firecracker`, `cloud-hypervisor` and `vz`, each on `x86_64` or `aarch64`. `vz` is aarch64 only. `--net user` works on QEMU (slirp, with `--publish host:guest`) and on `vz` (macOS NAT; the guest address is printed and reachable from the host directly, so `--publish` is QEMU-only).
 
 `patina run` exits with the guest program's exit code. A program with no `SIGTERM` handler that gets stopped exits with 143. A forced stop exits with 137, and `--timeout` exits with 124. The full kernel/CLI contract, including the cmdline, devices, exit codes and run state, is in [doc/cli-contract.md](doc/cli-contract.md).
 
@@ -97,6 +97,7 @@ The scripts work from any directory. Each one takes `aarch64` and/or `x86_64` an
 | `scripts/test-ctl.sh` | The control channel over the QEMU `patina.ctl` port: ready/ping, stop, signal, dump, malformed input. |
 | `scripts/test-os.sh` | Go's `os` package tests under patina (a wrapper around `test-gopkg.sh`). |
 | `scripts/test-net.sh` | Milestone A on QEMU: httphello via `patina run --net user --publish`, curl, `ctl stop`, DHCP, virtio-pci. |
+| `scripts/test-vz.sh` | Milestone A on Apple VZ (build and sign the CLI with `cli/scripts/build.sh` first): console, `ctl` ops, stop modes, httphello over NAT, threads/signals/sockets, `AF_VSOCK` echo. `cli/scripts/vztest.sh --e2e` runs the Go end-to-end variant. |
 | `scripts/test-gonet.sh` | Go's `net` (or `--pkg net/http`) package tests (a wrapper around `test-gopkg.sh`). |
 | `scripts/test-robust.sh` | Phase 5 robustness: tickless idle, sub-tick timers, fault to signal, stack/page-table reclaim, OOM, signal/fd edge cases. |
 | `scripts/test-gopkg.sh <pkg>... [--arch a] [--cpus N]` | Milestone B: any Go std package's tests, packed as `/app`, with `testapps/skiplist/<pkg>.txt`. |
