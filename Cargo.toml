@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+# `crates/*` holds host-testable, arch-neutral crates. Note: cargo rejects a
+# glob that matches nothing, so the workspace needs at least one crate under
+# crates/ to load.
+members = ["kernel", "crates/*"]
+# A bare `cargo build` / `cargo test` at the root builds only the host-testable
+# crates; the kernel is built explicitly with
+# `cargo build -p patina-kernel --target <arch>-unknown-none` (see
+# scripts/build-kernel.sh).
+default-members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+debug = true
+lto = "thin"
+codegen-units = 1
