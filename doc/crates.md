@@ -161,3 +161,64 @@ against the RFC test vectors). `patina-loader` gained `buildinfo.rs`
   fence after reading `used.idx`, `arch::cpu::io_barrier` before notify),
   `DmaBuf` copies, and `SpinLock::force_unlock` on the no-return exit/panic
   path. DMA addresses are physical addresses (no IOMMU on any target VMM).
+
+## smoltcp (Phase 4)
+
+- **Version:** 0.14.0, pinned exactly (`smoltcp = { version = "=0.14.0",
+  default-features = false, features = [...] }` in `kernel/Cargo.toml`;
+  released 2026-08-17).
+- **Used by:** `patina-kernel` (`kernel/src/net/`: `mux.rs` implements
+  `phy::Device`, `stack.rs` owns the `Interface` and `SocketSet`, `inet.rs`
+  wraps `socket::tcp` and `socket::udp`). Nothing outside `net/` sees it;
+  drivers only implement `net::device::NetDevice`.
+- **Why:** the TCP/IP stack (design §9): Ethernet + ARP + IPv4 + IPv6/NDP +
+  ICMP echo, TCP (window scaling, retransmission, keep-alive, Nagle), UDP and
+  a DHCPv4 client, `no_std` + `alloc`, no global state, driven by explicit
+  `poll` calls — which is what lets one stack lock and one kernel thread own
+  it. Writing a TCP from scratch is out of scope.
+- **Features enabled:** `alloc`, `medium-ethernet`, `proto-ipv4`,
+  `proto-ipv6`, `proto-dhcpv4`, `socket-tcp`, `socket-udp`,
+  `socket-dhcpv4` (for the `ip=dhcp` follow-up; not instantiated yet),
+  `auto-icmp-echo-reply` (answer pings), `iface-max-addr-count-8` (127.0.0.1,
+  ::1, the `ip=` address, the link-local address, room for DHCP/SLAAC),
+  `iface-max-route-count-4`, `iface-neighbor-cache-count-32`. Not enabled:
+  `std`, `log`, `defmt`, `phy-*` (host TAP/raw sockets), `async`, fragmentation,
+  `multicast`, `socket-raw`/`-icmp`/`-dns`/`-mdns`, `medium-ip`/`-ieee802154`.
+- **no_std:** yes with `default-features = false`; needs `alloc` (the
+  `SocketSet` and socket buffers are `Vec`s, `managed::ManagedSlice` owned).
+- **Unsafe surface:** `#![deny(unsafe_code)]` at the crate root. The only
+  `unsafe` (18 sites, `src/phy/sys/{mod,raw_socket,tuntap_interface,bpf}.rs`)
+  is the host TAP/raw-socket/BPF code behind the `phy-*`/`std` features,
+  which is not compiled for the kernel. So the kernel links no smoltcp
+  `unsafe`.
+- **Build script:** `build.rs` runs on the host at build time; it only
+  turns the `*-count-N`/`*-size-N` features and `SMOLTCP_*` environment
+  variables into constants (`config.rs` in `OUT_DIR`). No network or
+  file access beyond that.
+- **Caveats:** smoltcp has one socket per TCP connection and no accept
+  queue (patina's listener keeps a pool, D68); no loopback "deliver to
+  self" path (patina's mux, D67); it never answers a neighbor solicitation
+  for `::1` (the mux re-addresses those, see `net/mux.rs`); a wildcard
+  listen/bind endpoint matches both IP versions (patina filters by family).
+
+### smoltcp's transitive dependencies
+
+All resolved by `Cargo.lock`; none has default features that pull `std`.
+
+| crate | version | why (for smoltcp) | no_std | unsafe |
+|---|---|---|---|---|
+| managed | 0.8.0 | `ManagedSlice`/`ManagedMap`: borrowed or owned storage for sockets and buffers (`map` + `alloc` features) | yes | none |
+| heapless | 0.9.3 | fixed-capacity `Vec`/`LinearMap` (interface addresses, routes, neighbor cache) | yes | ~280 sites in 22 files: the container internals (`MaybeUninit` storage, raw-pointer drains, the `pool`/`mpmc`/`spsc` lock-free structures, which smoltcp does not use). Widely used embedded crate (rust-embedded org). |
+| hash32 | 0.3.1 | `heapless` dependency (32-bit hashers for its maps) | yes | 9 sites (`Hasher` byte casts) |
+| stable_deref_trait | 1.2.1 | `heapless` dependency (marker trait) | yes | 28 sites: `unsafe impl StableDeref` markers, no code |
+| byteorder | 1.5.0 | wire-format integer reads/writes | yes (`default-features = false`) | 40 sites in 2 files: unaligned pointer reads in its slice helpers |
+| bitflags | 1.3.2 | TCP/IP flag sets (smoltcp still uses bitflags 1; the kernel's own `bitflags` is 2.x, both are linked) | yes | 19 sites, all `from_bits_unchecked` (an `unsafe fn` smoltcp does not call) and its tests |
+| cfg-if | 1.0.5 | `cfg_if!` macro | yes | none |
+
+## patina-inet (in-tree, Phase 4)
+
+`crates/inet`: socket-address codec (`SockAddr` ↔ `sockaddr_in`/`_in6`/`_un`
+bytes, IPv4-mapped IPv6 handling) and the inet bind table (`PortTable`:
+EADDRINUSE with `SO_REUSEADDR`/`SO_REUSEPORT` and dual-stack overlap,
+ephemeral ports 32768–60999). Depends only on `patina-abi`; no `unsafe`;
+host tests in the crate (`cargo test -p patina-inet`).
