@@ -1,0 +1,15 @@
+# Go syscall package tests skipped under patina (scripts/test-gopkg.sh, D74).
+# One top-level test per line: TestName  # reason
+#
+# Child processes: testenv.MustHaveExec does not probe on linux, so these
+# fail instead of skipping (fork/exec: function not implemented).
+TestPidFD  # needs os/exec (no execve, D57): starts a child for pidfd_open
+TestZeroSysProcAttr  # needs os/exec (no execve, D57): runs cat
+TestSetpgid  # needs os/exec (no execve, D57): runs cat
+TestPgid  # needs os/exec (no execve, D57): runs cat
+TestExec  # needs os/exec (no execve, D57): syscall.Exec of itself
+TestRlimitRestored  # needs os/exec (no execve, D57): runs itself
+TestPrlimitOtherProcess  # needs os/exec (no execve, D57): prlimit on a child (panics on the nil Process when the start fails)
+TestPrlimitFileLimit  # needs os/exec (no execve, D57): runs itself
+TestFcntlFlock  # needs os/exec (no execve, D57): the child checks F_GETLK (the parent's F_SETLK part runs and passes)
+TestPassFD  # needs os/exec (no execve, D57): passes an fd to a child

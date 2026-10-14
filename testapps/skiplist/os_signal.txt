@@ -1,0 +1,7 @@
+# Go os/signal package tests skipped under patina (scripts/test-gopkg.sh, D74).
+# One top-level test per line: TestName  # reason
+#
+# Child processes: testenv.MustHaveExec does not probe on linux, so these
+# fail instead of skipping (fork/exec /app: function not implemented).
+TestAtomicStop  # needs os/exec (no execve, D57): runs itself with -test.run
+TestNotifyContextNotifications  # needs os/exec (no execve, D57): runs itself with -check_notify_ctx_notification
