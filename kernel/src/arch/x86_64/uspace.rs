@@ -15,8 +15,13 @@ use super::paging::{
 };
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, frame, phys_to_virt};
 
-/// Lowest address above user space (47-bit user VA).
-pub const USER_VA_END: usize = 0x0000_8000_0000_0000;
+/// Lowest address above user space: Linux's x86_64 `TASK_SIZE_MAX`,
+/// `(1 << 47) - PAGE_SIZE`. The top page of the canonical lower half is
+/// never mapped, so a `syscall` that ends at the boundary cannot leave a
+/// non-canonical return address for `sysretq`; `mmap`/`mremap` there fail
+/// as on Linux (ENOMEM / EINVAL), and `arch_prctl(ARCH_SET_FS)` / `clone`
+/// TLS at or above it is EPERM.
+pub const USER_VA_END: usize = 0x0000_7fff_ffff_f000;
 
 /// `invlpg` only invalidates the executing CPU's TLB: other CPUs keep
 /// stale user translations until they flush, so a frame unmapped here must
