@@ -300,7 +300,10 @@ impl UnixSocket {
                         let info = RecvInfo {
                             len: n,
                             full: m.data.len(),
-                            from: Some(name::addr(&m.from)),
+                            // Linux `unix_copy_addr`: an unnamed sender
+                            // yields no address at all (namelen 0), not an
+                            // empty abstract name.
+                            from: (!m.from.is_empty()).then(|| name::addr(&m.from)),
                             control: Vec::new(),
                         };
                         if peek {

@@ -4,9 +4,6 @@
 # AF_UNIX sockets are being added by another change (socket(AF_UNIX) is
 # EAFNOSUPPORT in this tree); the tcp subtests of these pass. Re-enable
 # once AF_UNIX is merged.
-TestSpliceFile  # AF_UNIX: pending (Basic-Unix, OneLess-Unix, Unix-To-TTY)
-TestGetPollFDAndNetwork  # AF_UNIX: pending (unix subtest)
-TestSendFile  # AF_UNIX: pending (sendfile-to-unix)
 #
 # Child processes: testenv.MustHaveExec does not probe on linux, so these
 # fail instead of skipping (fork/exec of /app fails).
