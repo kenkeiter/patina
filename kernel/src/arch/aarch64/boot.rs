@@ -18,7 +18,8 @@ use core::arch::global_asm;
 
 use super::dtb::{self, UartKind};
 use super::{
-    KERNEL_SIZE, KERNEL_VA_BASE, LOAD_PHYS, PHYS_OFFSET, console, cpu, layout, paging, power,
+    KERNEL_SIZE, KERNEL_VA_BASE, LOAD_PHYS, PHYS_OFFSET, console, cpu, gic, layout, paging, power,
+    timer,
 };
 use crate::bootinfo::{BootInfo, MemKind, MemoryMap, PhysRange, PlatformInfo};
 use crate::mm::{PhysAddr, frame, heap};
@@ -332,6 +333,10 @@ pub extern "C" fn early_main(dtb_phys: usize, load_phys: usize) -> ! {
     if let Some(c) = plat.psci {
         power::set_conduit(c);
     }
+    if let Some(g) = plat.gic {
+        gic::set_desc(g);
+    }
+    timer::early_init(plat.timer_virt_intid);
 
     // ---- Console: `console=` on the cmdline picks the UART type when it
     // names one we drive (ttyAMA0 = PL011, ttyS0 = 16550); otherwise (absent,

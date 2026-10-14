@@ -65,3 +65,51 @@ pub(super) fn enable_pan() -> bool {
     }
     true
 }
+
+/// Upper bound on CPUs with dedicated per-CPU arch state (overflow stacks,
+/// GIC redistributor slots). CPU ids at or above it share the last slot.
+pub const MAX_CPUS: usize = 8;
+
+/// Kernel stack for the next entry from user mode: a no-op on aarch64.
+/// Entries from EL0 use SP_EL1, which is wherever the kernel left it at the
+/// `eret` (the top of the frame area on the current thread's kernel stack,
+/// see `ctx::enter_user`), so switching threads switches it implicitly.
+#[inline]
+pub fn set_kernel_stack(_top: usize) {}
+
+macro_rules! read_sysreg {
+    ($name:ident, $reg:literal) => {
+        #[inline]
+        pub fn $name() -> u64 {
+            let v: u64;
+            // SAFETY: read-only ID register.
+            unsafe { asm!(concat!("mrs {}, ", $reg), out(reg) v, options(nomem, nostack, preserves_flags)) };
+            v
+        }
+    };
+}
+
+read_sysreg!(read_midr, "midr_el1");
+read_sysreg!(read_id_aa64isar0, "id_aa64isar0_el1");
+read_sysreg!(read_id_aa64pfr0, "id_aa64pfr0_el1");
+
+/// (AT_HWCAP, AT_HWCAP2) for auxv: the ID_AA64ISAR0_EL1-derived bits from
+/// `patina_abi`, plus FP/ASIMD (always), CPUID (EL0 `MRS` of ID registers is
+/// emulated, see `exceptions::emulate_mrs`), and from ID_AA64PFR0_EL1
+/// FPHP/ASIMDHP (FP/AdvSIMD field == 1) and DIT, as Linux sets them.
+/// HWCAP2 is 0.
+pub fn hwcap() -> (u64, u64) {
+    use patina_abi::aarch64::hwcap;
+    let mut h = hwcap::from_id_aa64isar0(read_id_aa64isar0()) | hwcap::FP | hwcap::ASIMD | hwcap::CPUID;
+    let pfr0 = read_id_aa64pfr0();
+    if (pfr0 >> 16) & 0xf == 1 {
+        h |= hwcap::FPHP;
+    }
+    if (pfr0 >> 20) & 0xf == 1 {
+        h |= hwcap::ASIMDHP;
+    }
+    if (pfr0 >> 48) & 0xf >= 1 {
+        h |= hwcap::DIT;
+    }
+    (h, 0)
+}

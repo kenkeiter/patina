@@ -20,7 +20,13 @@ use crate::mm::{PhysAddr, frame, heap};
 /// direct-map window, ~94 TiB above PHYS_OFFSET).
 const UNMAPPED_KERNEL_VA: usize = 0xffff_dead_beef_0000;
 
+#[allow(clippy::collapsible_if)] // keeps the Phase 1 wiring snippet identical across arches
 pub fn run(cmdline: &str) {
+    if let Some(which) = crate::cmdline::param(cmdline, "patina.selftest") {
+        if crate::selftest_user::run(which) {
+            return;
+        }
+    }
     for tok in crate::cmdline::params(cmdline) {
         if let Some(which) = tok.strip_prefix("patina.selftest=") {
             match which {
