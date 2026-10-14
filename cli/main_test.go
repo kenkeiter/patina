@@ -77,3 +77,28 @@ func TestBuildAndInspectHello(t *testing.T) {
 		t.Fatalf("vz-x86_64 exit %d: %s", code, se.String())
 	}
 }
+
+// TestImagePack packs a raw kernel + initrd (scripts/run-qemu.sh's VZ path)
+// and reads the bundle back.
+func TestImagePack(t *testing.T) {
+	d := t.TempDir()
+	kernel := filepath.Join(d, "k")
+	initrd := filepath.Join(d, "i.cpio")
+	os.WriteFile(kernel, []byte("not a kernel"), 0o644)
+	os.WriteFile(initrd, []byte("not a cpio"), 0o644)
+	out := filepath.Join(d, "x.patina")
+	var so, se bytes.Buffer
+	if code := dispatch([]string{"image", "pack", "--kernel", kernel, "--initrd", initrd, "--target", "vz-aarch64", "-o", out}, &so, &se); code != 0 {
+		t.Fatalf("pack exit %d\n%s%s", code, so.String(), se.String())
+	}
+	so.Reset()
+	if code := dispatch([]string{"image", "inspect", out, "--json"}, &so, &se); code != 0 {
+		t.Fatalf("inspect exit %d: %s", code, se.String())
+	}
+	if !strings.Contains(so.String(), `"target": "vz-aarch64"`) || !strings.Contains(so.String(), `"name": "x"`) {
+		t.Fatalf("manifest:\n%s", so.String())
+	}
+	if code := dispatch([]string{"image", "pack", "--kernel", kernel, "-o", out}, &so, &se); code != exitUsage {
+		t.Fatalf("missing flags: exit %d, want %d", code, exitUsage)
+	}
+}

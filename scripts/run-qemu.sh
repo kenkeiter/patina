@@ -53,7 +53,18 @@
 #   N    from the last "[patina] exit code N" line
 #   124  timeout (guest did not power off in time)
 #   125  no exit sentinel seen
+#
+# PATINA_VMM=vz runs the same kernel + initrd + params + args under Apple
+# Virtualization.framework instead (`patina run --vmm vz`, aarch64 only):
+# this script execs scripts/run-vz.sh, which documents what maps and what
+# does not. Default: qemu.
 set -euo pipefail
+
+case ${PATINA_VMM:-qemu} in
+  qemu) ;;
+  vz) exec "$(dirname "${BASH_SOURCE[0]}")/run-vz.sh" "$@" ;;
+  *) echo "error: PATINA_VMM=$PATINA_VMM (want qemu or vz)" >&2; exit 2 ;;
+esac
 
 usage() { echo "usage: $0 <aarch64|x86_64> [initrd.cpio] [-- kernel args...]" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
