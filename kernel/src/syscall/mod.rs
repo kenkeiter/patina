@@ -382,6 +382,9 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::EPOLL_PWAIT => poll::epoll_pwait(i(0), u(1), i(2), i(3), u(4), u(5)),
         nr::EPOLL_PWAIT2 => poll::epoll_pwait2(i(0), u(1), i(2), u(3), u(4), u(5)),
         nr::PPOLL => poll::ppoll(u(0), u(1), u(2), u(3), u(4)),
+        nr::PSELECT6 => poll::pselect6(i(0), u(1), u(2), u(3), u(4), u(5)),
+        #[cfg(target_arch = "x86_64")]
+        nr::SELECT => poll::select(i(0), u(1), u(2), u(3), u(4)),
         #[cfg(target_arch = "x86_64")]
         nr::EPOLL_CREATE => poll::epoll_create(i(0)),
         #[cfg(target_arch = "x86_64")]

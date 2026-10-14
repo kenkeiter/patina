@@ -1,5 +1,6 @@
 // fdtest exercises the fd table and the Phase 2 file objects: pipes,
-// eventfd, epoll, dup/dup3, fcntl, fstat, ppoll, and finally Go timers
+// eventfd, epoll, dup/dup3, fcntl, fstat, ppoll, select (x86_64 select,
+// arm64 pselect6), and finally Go timers
 // (which need the runtime's netpoller: epoll + eventfd). Prints
 // "PASS fdtest" and exits 0, or "FAIL fdtest: ..." and exits 1.
 package main
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -483,6 +485,68 @@ func testPpoll() {
 	ok("ppoll")
 }
 
+func fdSet(s *syscall.FdSet, fd int)        { s.Bits[fd/64] |= 1 << (uint(fd) % 64) }
+func fdIsSet(s *syscall.FdSet, fd int) bool { return s.Bits[fd/64]&(1<<(uint(fd)%64)) != 0 }
+
+// syscall.Select: SYS_SELECT on amd64, pselect6 on arm64.
+func testSelect() {
+	p := pipe2(syscall.O_NONBLOCK)
+	nfd := max(p[0], p[1]) + 1
+	var r, w syscall.FdSet
+	fdSet(&r, p[0])
+	fdSet(&w, p[1])
+	n, err := syscall.Select(nfd, &r, &w, nil, &syscall.Timeval{})
+	if err != nil || n != 1 || fdIsSet(&r, p[0]) || !fdIsSet(&w, p[1]) {
+		fail("select empty pipe: n=%d err=%v r=%x w=%x", n, err, r.Bits[0], w.Bits[0])
+	}
+	syscall.Write(p[1], []byte("x"))
+	r, w = syscall.FdSet{}, syscall.FdSet{}
+	fdSet(&r, p[0])
+	fdSet(&w, p[1])
+	n, err = syscall.Select(nfd, &r, &w, nil, nil)
+	if err != nil || n != 2 || !fdIsSet(&r, p[0]) || !fdIsSet(&w, p[1]) {
+		fail("select ready: n=%d err=%v r=%x w=%x", n, err, r.Bits[0], w.Bits[0])
+	}
+	// A timeout: nothing readable on q.
+	q := pipe2(0)
+	r = syscall.FdSet{}
+	fdSet(&r, q[0])
+	tv := syscall.Timeval{Usec: 50000}
+	start := time.Now()
+	n, err = syscall.Select(q[0]+1, &r, nil, nil, &tv)
+	if d := time.Since(start); err != nil || n != 0 || r.Bits[0] != 0 || d < 50*time.Millisecond {
+		fail("select timeout: n=%d err=%v r=%x after %v", n, err, r.Bits[0], d)
+	}
+	// Linux writes the time left back (amd64 passes tv straight through).
+	if runtime.GOARCH == "amd64" && (tv.Sec != 0 || tv.Usec != 0) {
+		fail("select timeout: time left %+v, want 0", tv)
+	}
+	// A reader blocked in select is woken by a write from another thread.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		syscall.Write(q[1], []byte("y"))
+	}()
+	r = syscall.FdSet{}
+	fdSet(&r, q[0])
+	tv = syscall.Timeval{Sec: 5}
+	n, err = syscall.Select(q[0]+1, &r, nil, nil, &tv)
+	if err != nil || n != 1 || !fdIsSet(&r, q[0]) {
+		fail("select wake-up: n=%d err=%v r=%x", n, err, r.Bits[0])
+	}
+	if runtime.GOARCH == "amd64" && (tv.Sec < 4 || tv.Sec > 5) {
+		fail("select wake-up: time left %+v", tv)
+	}
+	// A descriptor that is not open, and a negative nfds.
+	r = syscall.FdSet{}
+	fdSet(&r, 900)
+	_, err = syscall.Select(901, &r, nil, nil, &syscall.Timeval{})
+	wantErr(err, syscall.EBADF, "select closed fd")
+	_, err = syscall.Select(-1, nil, nil, nil, &syscall.Timeval{})
+	wantErr(err, syscall.EINVAL, "select nfds -1")
+	closeAll(p[0], p[1], q[0], q[1])
+	ok("select")
+}
+
 func testTimers() {
 	start := time.Now()
 	time.Sleep(30 * time.Millisecond)
@@ -508,6 +572,7 @@ func main() {
 	testEventfd()
 	testEpoll()
 	testPpoll()
+	testSelect()
 	testTimers()
 	fmt.Println("PASS fdtest")
 }
