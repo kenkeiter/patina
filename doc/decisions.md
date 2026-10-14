@@ -431,3 +431,62 @@ reports the frame (flags = `USER` only), `unmap` returns it, and a later
 fault as `NotPresent`. User page tables are never freed (one process per
 VM), everything runs under ASID 0 / without PCID, and `activate` does a full
 TLB flush; Phase 2 may add ASIDs.
+
+## D35: `AT_RANDOM` and `getrandom` come from a non-cryptographic PRNG until virtio-rng
+*2026-10-14 · Phase 1*
+
+There is no entropy source before the virtio-rng driver (Phase 3).
+`kernel/src/random.rs` is a SplitMix64 generator seeded from the boot
+counter and `patina.epoch`, with the clock mixed in on every call; it feeds
+the 16 `AT_RANDOM` bytes (Go's hash seeds) and `getrandom`. It is NOT
+cryptographic: `crypto/rand` output from a Phase 1 kernel must not be
+trusted. Phase 3 replaces the generator's input with virtio-rng and keeps
+the interface.
+
+## D36: User address-space layout and mmap policy
+*2026-10-14 · Phase 1*
+
+One `AddressSpace` (`kernel/src/mm/vm.rs`): an ordered VMA map (merged when
+adjacent and identical), a `BTreeSet` of resident pages, and the arch
+`UserTables`. ELF segments are filled eagerly (design §4); everything else
+is lazy zero-fill on first touch. The main stack is an 8 MiB VMA ending at
+`0x7fff_f000_0000`; anonymous mappings without a usable hint are placed
+top-down below `MMAP_BASE = 0x7f00_0000_0000`, never below
+`MMAP_MIN_ADDR = 0x10000`; a hint is honoured when the range is free and
+page-aligned (Go's `0x00c0_0000_0000 | i << 32` arena hints), and
+`MAP_FIXED` replaces whatever is there. Only anonymous mappings exist
+(`MAP_SHARED|MAP_ANONYMOUS` is treated as private: there is no fork);
+file mappings get `ENODEV`. `PROT_NONE` reservations cost no frames;
+`madvise(DONTNEED|FREE)` frees frames and keeps the VMA; `HUGEPAGE`,
+`NOHUGEPAGE`, `COLLAPSE`, `RANDOM`, `NORMAL` are accepted and ignored;
+`mremap` supports in-place growth and `MREMAP_MAYMOVE` (frames are
+re-mapped, not copied), `MREMAP_FIXED`/`DONTUNMAP` → `EINVAL`; `brk`
+returns the fixed break (end of the highest ELF segment) like the raw Linux
+syscall; `mincore` reports real residency. The resident-page set makes
+munmap/mprotect/madvise over Go's multi-GiB `PROT_NONE` reservations cost
+only the pages actually present. The kernel reaches user memory only
+through `AddressSpace::{copy_from_user, copy_to_user, read_val, write_val,
+read_cstr, zero_user}`, which fault pages in like a user access and copy
+through the direct map (D27).
+
+## D37: Phase 1 syscall-layer conventions
+*2026-10-14 · Phase 1*
+
+`kernel/src/syscall/` dispatches on `patina_abi::current::nr` constants;
+handlers return `Result<isize, Errno>`. Unknown numbers get `ENOSYS` and one
+`[patina] ENOSYS <nr> (<name>)` line per number (design §7);
+`patina.strace=1` prints `[strace] <tid> <name>(<args>) = <ret>` inline
+(it interleaves with the program's output). Phase 1 stubs that Go's startup
+tolerates: every path lookup is `ENOENT` (logged once per path; the VFS is
+Phase 3), fds 0–2 are the console (`write` 1/2, `read` 0 → EOF,
+`fstat`/`newfstatat(AT_EMPTY_PATH)` report a character device,
+`fcntl(F_GETFL)` → `O_RDWR`, `ioctl` → `ENOTTY`), `uname` reports
+`Linux 6.6.0-patina`, `prlimit64` answers NOFILE 1024/1048576 and STACK
+8 MiB, `sched_getaffinity` reports the vCPUs the scheduler runs on (one in
+Phase 1), CPU-time clocks return time since boot, `kill`/`tgkill` to a
+valid target return 0 and log once per signal number that delivery is
+Phase 2 (Go's sysmon sends `SIGURG` for async preemption and would print
+errors on `ENOSYS`), `rt_sigaction`/`rt_sigprocmask`/`sigaltstack` store
+state exactly (KILL/STOP rejected, mask never blocks them) but nothing is
+delivered, and `rt_sigreturn` is fatal (exit 139). Kernel-mode user memory
+access never touches user VAs (D27, D36).
