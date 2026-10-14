@@ -19,6 +19,9 @@ scripts/test-hello.sh [aarch64] [x86_64]            # build hello, pack initrd, 
 scripts/test-hello.sh --app <name> [arch...]        # run testapps/<name>: expect 'PASS <name>' + exit 0
 scripts/test-hello.sh --threads <arch>              # run testapps/threads and only show its output
 scripts/test-signals.sh [aarch64] [x86_64]          # 6 signal cases per arch (signals, sigstress)
+scripts/test-smp.sh [--app <name>] [--cpus "1 2 4"] [--repeat N] [arch...]
+                                                    # app at each vCPU count (default smpstress; smpstress/threads get -cpus N)
+scripts/test-runtime.sh [aarch64] [x86_64]          # Phase 2 umbrella: hello, threads, smpstress, fdtest, signals, pproftest per CPU count
 cargo test --workspace --exclude patina-kernel      # host tests
 ```
 
@@ -27,7 +30,11 @@ Environment for `run-qemu.sh` (and `smoke.sh`): `PATINA_MEM` (MiB, default
 `PATINA_TIMEOUT` (seconds, default 60), `PATINA_KERNEL`, `PATINA_LOG`,
 `PATINA_QEMU_EXTRA`, `PATINA_MACHINE` (x86_64: `microvm` default, `pc`,
 `q35`). `test-hello.sh --app` passes `PATINA_PARAMS` as extra kernel
-params (e.g. `patina.strace=1`). `build-kernel.sh` (and the test scripts)
+params (e.g. `patina.strace=1`). `test-runtime.sh` runs every suite at each
+CPU count in `PATINA_CPUS_LIST` (default `1 2 4`) and prints one PASS/FAIL
+row per case (logs in `out/test/runtime/`); `test-smp.sh` logs to
+`out/test/`. `test-smp.sh` defaults `PATINA_TIMEOUT` to 180 s,
+`test-runtime.sh` to 120 s. `build-kernel.sh` (and the test scripts)
 honor `PATINA_PROFILE=dev|release` (default release). `run-qemu.sh` exits with the code from the
 `[patina] exit code N` serial line, 124 on timeout, 125 if no sentinel.
 
@@ -134,9 +141,9 @@ booted) · `—` not applicable.
 
 | Target | boot | console | poweroff | initrd | SMP bring-up (Phase 2) |
 |---|---|---|---|---|---|
-| QEMU `virt` aarch64, HVF | V **boot-hvf** | V PL011 | V PSCI HVC | V **initrd-args** | V **selftest-smp-a64** (1/2/4/8 CPUs, GICv3, PSCI HVC) |
-| QEMU `virt` aarch64, TCG | V **boot-tcg**, **el2-drop** | V PL011 | V PSCI HVC / SMC | V (same DTB path; **initrd-args** run on HVF) | V **selftest-smp-a64** (GICv3 1/2/4, GICv2, EL2 entry + PSCI SMC) |
-| QEMU `microvm` x86_64, TCG | V **boot-x86** | V 16550 port 0x3f8 | V isa-debug-exit | V **initrd-args-x86** | V **selftest-smp-x86** (1/2/4/8 CPUs, MADT via BIOS-area RSDP scan) |
+| QEMU `virt` aarch64, HVF | V **boot-hvf** | V PL011 | V PSCI HVC | V **initrd-args** | V **selftest-smp-a64** (1/2/4/8 CPUs, GICv3, PSCI HVC); scheduler: **test-smp**, **threads-smp**, **fdtest-smp**, **test-signals-smp**, **pproftest**, **test-runtime** (1/2/4 CPUs) |
+| QEMU `virt` aarch64, TCG | V **boot-tcg**, **el2-drop** | V PL011 | V PSCI HVC / SMC | V (same DTB path; **initrd-args** run on HVF) | V **selftest-smp-a64** (GICv3 1/2/4, GICv2, EL2 entry + PSCI SMC); scheduler: **test-smp** (`PATINA_ACCEL=tcg`, 4 CPUs) |
+| QEMU `microvm` x86_64, TCG | V **boot-x86** | V 16550 port 0x3f8 | V isa-debug-exit | V **initrd-args-x86** | V **selftest-smp-x86** (1/2/4/8 CPUs, MADT via BIOS-area RSDP scan); scheduler: **test-smp**, **threads-smp**, **fdtest-smp**, **test-signals-smp**, **pproftest**, **test-runtime** (1/2/4 CPUs; memory safety pending D52, see Phase 2) |
 | QEMU `pc` / `q35` x86_64, TCG | V **machines-x86** | V 16550 | V isa-debug-exit; ACPI/i8042 fallback (one of them) | V **machines-x86** | V **selftest-smp-x86** (MADT) |
 | Firecracker aarch64 | U (no KVM on this host) | U 16550 MMIO | U PSCI | U | U |
 | Firecracker x86_64 | U | U | U | U | U (MP table / MADT) |
@@ -194,26 +201,38 @@ Phase 1 proper:
 
 Test names (all at `PATINA_CPUS=1` unless noted; aarch64 = QEMU `virt`
 HVF, x86_64 = QEMU `microvm` TCG, release profile unless noted). Decisions:
-D42–D49 (D50/D51 for the scheduler core and timers, second pass).
+D42–D52 (D50 SMP scheduler core, D51 timers and CPU clocks, D52 x86_64
+TLB shootdown).
 
 | Name | Command | Observed |
 |---|---|---|
-| **test-hello-p2** | `scripts/test-hello.sh` | `PASS aarch64`, `PASS x86_64`; also with `PATINA_CPUS=2` (outside `patina.selftest=smp` nothing calls `start_secondaries` yet, so the second CPU stays parked) |
+| **test-hello-p2** | `scripts/test-hello.sh` | `PASS aarch64`, `PASS x86_64`; also with `PATINA_CPUS=2` (run before D50, when the second CPU stayed parked outside `patina.selftest=smp`; SMP runs are **test-smp** and **test-runtime**) |
 | **fdtest** | `scripts/test-hello.sh --app fdtest` | `PASS fdtest aarch64`, `PASS fdtest x86_64`; the 19 `ok` lines: `ok os.Pipe round trip + EOF`, `ok EPIPE`, `ok 70000-byte transfer`, `ok non-blocking pipe2 (EAGAIN, capacity 64 KiB)`, `ok blocking raw read`, `ok fstat pipe S_IFIFO`, `ok fcntl F_GETFL/F_SETFL shared by dup`, `ok dup/dup3/F_DUPFD_CLOEXEC/close EBADF`, `ok EMFILE after N dups (soft limit was M)`, `ok eventfd counter/semaphore/blocking`, `ok epoll level-triggered, EEXIST/ENOENT/EINVAL`, `ok epoll edge-triggered`, `ok epoll oneshot + MOD re-arm`, `ok epoll timeout`, `ok epoll blocking wait`, `ok epoll HUP/ERR/auto-removal`, `ok epoll + eventfd`, `ok ppoll`, `ok time.Sleep/After/Ticker`; also passes with `PATINA_PROFILE=dev` on aarch64; with `PATINA_PARAMS=patina.strace=1`: `pipe2(…, 0x80000) = 0`, `epoll_create1(0x80000) = 5`, `eventfd2(0x0, 0x80800) = 6`, `epoll_ctl(0x5, 0x1, 0x6, …) = 0` |
 | **threads-p2** | `scripts/test-hello.sh --app threads` | `PASS threads` on both arches: `threads: GOMAXPROCS=1 NumCPU=1`, `threads: 1000 goroutines ok, NumGC=56 HeapAlloc=509KiB`, the sleep/ticker checks, and the async-preemption starvation case passes |
 | **test-signals** | `scripts/test-signals.sh aarch64 x86_64` | 12/12 PASS. `signals -self`: `signals: got terminated`, `PASS signals (handler)`, exit 0. `signals -mode nohandler -self`: `[patina] exit signal SIGTERM`, `[patina] exit code 143`. `sigstress`: `preemption: 1 spinners, main ran 73 turns in 2s`, `nil deref recovered: runtime error: invalid memory address or nil pointer dereference`, `divide by zero recovered: runtime error: integer divide by zero`, `kill: 1000/1000 SIGUSR1 received`, `tgkill: 100/100`, `nanosleep interrupted after 81ms, rem 4.92s`, `blocking pipe read restarted across signals`, `20 x time.Sleep(10ms) under SIGUSR1 storm: 201ms`, `PASS sigstress`. `sigstress -procs 2` passes. `sigstress -crash`: `[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x4ab040]`, exit 2. `sigstress -breakpoint`: `SIGTRAP: trace trap`, exit 2. Also 12/12 with `PATINA_PROFILE=dev`. Under `patina.strace=1`: `read(…) = -errno 512` ×7 then success, `nanosleep(…) = -errno 516`, `futex(…) = -errno 512`, 1528 `rt_sigreturn` calls |
 | **selftest-smp-a64** | `PATINA_CPUS=N scripts/run-qemu.sh aarch64 -- patina.selftest=smp` | HVF, N = 1/2/4/8. N=4: `[patina] smp: 4 cpus (psci hvc)`, `smp: cpu 1 online (mpidr 0x1, entered at EL1)` …, `selftest smp: 3 secondaries started in 279 us`, `timer irqs cpu0:+3 cpu1:+3 cpu2:+3 cpu3:+3`, `deadline +2 ms fired after 2003 us (1 timer irq)`, `cancelled deadline: 0 timer irqs in 5 ms`, `past deadline fired after 3 us`, `selftest smp: ok (4 cpus, 15 ipis, deadline 2003 us)`. TCG `gic-version=3`, N = 1/2/4: ok (deadline 2164–2710 us). TCG `-M virt,virtualization=on`: ok (APs enter at EL2, PSCI SMC). TCG `gic-version=2`: ok (`GICD_SGIR` path) |
 | **selftest-smp-x86** | `PATINA_CPUS=N scripts/run-qemu.sh x86_64 -- patina.selftest=smp` | N=2: `[patina] smp: 2 cpus (acpi madt @ 0x1fffff5d, rsdp from bios-area scan @ 0xf5560), boot cpu apic id 0`, `smp: cpu 1 online (apic id 1)`, `selftest smp: reschedule ipis 1 in 105 us, deadline irq 663 us late, ap ticks [5]`, `selftest smp: ok (2 cpus, 2 ipis, deadline 2737 us)`. N=4: `ok (4 cpus, 6 ipis, deadline 2549 us)`. N=8 and N=1: ok. `PATINA_MACHINE=pc` (MADT @ 0x1ffe2275) and `q35` (MADT @ 0x1ffe2213): ok. `PATINA_QEMU_EXTRA="-cpu max,-fsgsbase,-xsave,-smep,-smap"`: ok. Forced sources via `patina.smp.skip`: 2 → fw_cfg `etc/acpi/tables`; 3 (with `-smp 2,sockets=2`) → `mp table @ 0xf56f0`; 4 → `fw_cfg nb_cpus` |
+| **test-smp** | `scripts/test-smp.sh --cpus "2 4" aarch64 x86_64` (smpstress) | aarch64, 4 CPUs: `[patina] smp: 4 cpus online`, `smpstress: GOMAXPROCS=4 NumCPU=4`, `smpstress: ping-pong 1088286 bounces, 4874240 spins in 2s`, `mutex 16 goroutines x 20000 ok in 98ms`, `sleeps: 8x1250 x Sleep(100us) 1.261s; 200 x Sleep(500us) 265ms`, `gc under load ok, NumGC 0 -> 40`, `parallel tids 4,1: 100/100 buckets each 100/100, both 100/100`, `PASS smpstress`. PASS at 2 and 4 CPUs on aarch64 and at 4 on x86_64, each run ending with the exit sentinel after the other CPUs stopped. **x86_64 at 2 CPUs failed once**: `#GP general protection (vector 13) in kernel mode on cpu 1` inside `frame::alloc_frames` (a free-list link read as garbage: a freed frame written through a stale TLB entry, the missing x86_64 TLB shootdown, D52). Also PASS with `PATINA_PROFILE=dev` at 4 CPUs on both arches and with `PATINA_ACCEL=tcg` on aarch64 at 4 CPUs (`200 x Sleep(500us) 289ms`) |
+| **threads-smp** | `scripts/test-smp.sh --app threads --cpus "2 4" aarch64 x86_64` | `threads: GOMAXPROCS=4 NumCPU=4`, `threads: 1000 goroutines ok, NumGC=68 HeapAlloc=601KiB`, `PASS threads` at 2 and 4 CPUs on both arches |
+| **fdtest-smp** | `scripts/test-smp.sh --app fdtest --cpus 4 --repeat 3 aarch64 x86_64` | `PASS fdtest` ×3 on both arches |
+| **test-signals-smp** | `PATINA_CPUS=2` and `PATINA_CPUS=4 scripts/test-signals.sh aarch64 x86_64` | all 6 cases PASS at 2 and 4 CPUs on both arches; `sigstress` repeated 6× at 4 and at 2 CPUs on aarch64 and 4× at 4 CPUs on x86_64 |
+| **pproftest** | `scripts/test-smp.sh --app pproftest --cpus "1 2 4" <arch>` | `PASS pproftest` everywhere. pprof samples / spinning thread's CPU clock / sleeping thread's CPU clock over 200 ms: aarch64 1 CPU 100 / +199.85 ms / +3.6 µs, 2 CPUs 198 / +199.97 ms / +5.3 µs, 4 CPUs 200 / +199.92 ms / +11.7 µs; x86_64 94 / +198.88 ms / +87 µs, 196 / +199.86 ms / +82 µs, 198 / +199.60 ms / +104 µs. The 5 ms `SIGEV_THREAD_ID` timer delivered 10–17 SIGUSR1 per 100 ms; SIGALRM from a 20 ms `ITIMER_REAL` arrived after 21–31 ms. `PATINA_PROFILE=dev` at 2 CPUs: 198 / 200 samples. Under `patina.strace=1`: Go's per-M `timer_create(0x3, …) = 0` (`CLOCK_THREAD_CPUTIME_ID`), `timer_settime`, `setitimer(0x2, …)` (`ITIMER_PROF`), `timer_delete` |
+| **test-runtime** | `PATINA_CPUS_LIST="1 2 4" scripts/test-runtime.sh` | 66/66 rows PASS: hello, threads, smpstress, fdtest, signals handler / nohandler, sigstress, sigstress `-procs 2`, `-crash`, `-breakpoint`, pproftest × 3 CPU counts × 2 arches. This run predates the D52 TLB fix; it is to be repeated after it |
+| **sleep-latency** | the `smpstress` sleep phase (**test-smp**), before and after D50's one-shot deadlines | aarch64/HVF: 200 × `time.Sleep(500µs)` 2.001 s → 248 ms (1, 2 and 4 CPUs; x86_64/TCG 263–268 ms); 10 000 sleeps from 8 goroutines 12.5 s → ~1.5 s; the ~1.2 ms per-sleep floor is Go's netpoller (`epoll_pwait` with whole-millisecond timeouts) |
 
 Runtime and scheduling:
 
 - [x] `clone` (thread flag set only, else `EINVAL`), kernel stacks with guard pages, TLS (`FS_BASE` / `TPIDR_EL0`) — done in Phase 1 (**test-hello**, **selftest-kstack**)
 - [x] `futex` WAIT/WAKE (+ `_PRIVATE`, timeouts) — Phase 1 (**hello-strace**, **selftest-sched**); now interruptible (`ERESTARTSYS` without a timeout, `ERESTART_RESTARTBLOCK` with one; D45) — **test-signals** (strace `futex = -errno 512`)
-- [x] Goroutines, GC and async preemption on one vCPU — **threads-p2** (1000 goroutines, 56 GCs, starvation case), **test-signals** (`preemption: 1 spinners, main ran 73 turns in 2s`; `-procs 2` on one vCPU)
-- [ ] Per-vCPU runqueues, IPI wake-ups, idle CPUs in `WFI`/`HLT` woken by IPI (second pass, D50); today the secondaries are started only by `patina.selftest=smp` and user threads run only on CPU 0
-- [ ] `exit_group` stopping the other CPUs (Stop IPI exists, **selftest-smp-***; not wired to exit yet)
-- [ ] `sched_getaffinity` reporting all vCPUs → `GOMAXPROCS` (still 1)
-- [~] Multi-CPU races (wake-ups, signal kicks via `kick_remote`, futexes across CPUs): code written for SMP (D38, D40, D45) but nothing runs on two CPUs yet
+- [x] Goroutines, GC, async preemption and pprof working — **threads-p2** (1 vCPU: 1000 goroutines, 56 GCs, starvation case), **threads-smp** (2 and 4 vCPUs), **test-signals** / **test-signals-smp** (`preemption: 1 spinners, main ran 73 turns in 2s`; `-procs 2`), **pproftest**
+- [x] SMP bring-up under the scheduler: `run_smp` starts the APs and every CPU enters the idle loop (`[patina] smp: N cpus online`) — **test-smp**, **test-runtime** (D50)
+- [x] Per-vCPU runqueues, wake-ups placed on idle CPUs with a `Reschedule` IPI, idle CPUs in `WFI`/`HLT`, work stealing, the `on_cpu` switch protocol — **test-smp** (ping-pong between threads, contended mutex = futex wake-ups across CPUs, `parallel tids 4,1: … both 100/100`), **threads-smp**, **fdtest-smp**, **test-signals-smp** (signal kicks via `kick_remote`)
+- [x] `exit_group` / exit / panic stop the other CPUs (`Stop` IPI, `STOPPED` mask, D50) — **test-smp**, **test-runtime** (every SMP run ends with the exit sentinel and a clean exit); Stop while another CPU is mid-print or stuck with IRQs masked is reasoned only
+- [x] `sched_getaffinity` reports all vCPUs → `GOMAXPROCS` = `NumCPU` = vCPUs — **test-smp**, **threads-smp** (`GOMAXPROCS=4 NumCPU=4`)
+- [x] Per-thread CPU time (`Thread::cpu_time_ns`, `CLOCK_THREAD_CPUTIME_ID`, the process CPU clock) — **pproftest** (spinning thread +198.9–200.0 ms, sleeping thread +3.6–104 µs over 200 ms)
+- [~] x86_64 SMP memory safety: no TLB shootdown yet, so a frame freed on one CPU can be reached through another CPU's stale TLB entry (**test-smp**: x86_64 2-CPU `#GP` in `frame::alloc_frames`); fix in progress (D52). aarch64 user-page invalidation already broadcasts (`tlbi vale1is`)
+- [~] More than 4 vCPUs under the scheduler — untested (the arch self-tests ran 8 CPUs)
+- [~] Tickless idle — not implemented: idle CPUs keep the 100 Hz tick
 
 Signals (D42–D45):
 
@@ -254,12 +273,13 @@ SMP and timers (arch layer, D47/D48):
 - [x] x86_64 CPU enumeration (MADT via BIOS-area RSDP, fw_cfg ACPI tables, MP table, fw_cfg `NB_CPUS`) and INIT-SIPI-SIPI bring-up, up to 8 CPUs tested — **selftest-smp-x86**
 - [x] IPIs (Reschedule, Stop): GICv3 SGIs, GICv2 SGIs, xAPIC fixed IPIs — **selftest-smp-a64**, **selftest-smp-x86**
 - [x] Per-CPU periodic tick on every CPU and per-CPU one-shot `set_deadline` (fires ≥ deadline, cancel, past deadline) — **selftest-smp-a64**, **selftest-smp-x86**
-- [ ] Sub-tick deadlines in the sleep list (sleeps and timeouts are still tick-granular, never early; second pass, D51)
-- [ ] `setitimer`, `timer_create`/`settime`/`delete`, per-thread CPU time (`SIGPROF`), pprof (second pass, D51)
-- [~] `cpu::hw_random` (RNDR / RDSEED / RDRAND): detection reported by **selftest-smp-a64** (HVF: none); not yet used
-- [ ] `getrandom`/`AT_RANDOM` seeded from RNDR/RDSEED (D35 still applies)
+- [x] Sub-tick deadlines: the sleep list arms the per-CPU one-shot timer (`sched::arm_deadline`); sleeps and timeouts are never early (D50) — **sleep-latency** (200 × `Sleep(500µs)` 2.001 s → 248 ms), **test-smp**
+- [x] `setitimer`/`getitimer`, `timer_create`/`settime`/`gettime`/`getoverrun`/`delete` (`SIGEV_THREAD_ID`, `SI_TIMER` / `SI_KERNEL`), CPU-clock timers (D51) — **pproftest** (SIGALRM after 21–31 ms, 10–17 SIGUSR1 per 100 ms from a 5 ms timer, Go's per-M `timer_create(0x3, …)` in strace)
+- [x] pprof CPU profiles (Go's per-M `CLOCK_THREAD_CPUTIME_ID` SIGPROF timers and `ITIMER_PROF`) — **pproftest** (94–200 samples per run at 100 Hz)
+- [~] `alarm`, `getrusage`, `times`, `clock_nanosleep` on CPU clocks (`EINVAL`/`ENOTSUP`), `TIMER_ABSTIME`, `ITIMER_VIRTUAL`, overrun accounting under load — implemented, untested
+- [~] `getrandom`/`AT_RANDOM` seeded from `cpu::hw_random` (RNDR / RDSEED / RDRAND), logged as `[patina] random: seeded from …` (D50) — every **test-smp** log shows the line; HVF on this host has no RNDR (`seeded from boot counter only`), only TCG `-cpu max` does. Still not cryptographic (D35)
 - [~] x2APIC IPIs, APIC ids > 254, > 8 CPUs, PSCI SMC on real firmware — implemented, untested
-- [ ] Firecracker x86_64 + aarch64 boots; KVM / Cloud Hypervisor (needs a KVM host)
+- [~] Firecracker x86_64 + aarch64, KVM / Cloud Hypervisor: SMP and scheduler code written to the spec, never booted (needs a KVM host)
 
 ## Phase 3 — OS
 
