@@ -94,6 +94,10 @@ pub struct Conn {
     reset: bool,
     peer: Option<IpEndpoint>,
     local: Option<IpEndpoint>,
+    /// `SO_KEEPALIVE` was turned on after the handshake and is not yet
+    /// handed to smoltcp: the start (ns) of the idle period the first probe
+    /// waits out (see [`apply_live_tcp_opts`]).
+    ka_since: Option<u64>,
 }
 
 pub enum Tcp {
@@ -219,13 +223,59 @@ fn remove_tcp(sockets: &mut smoltcp::iface::SocketSet<'static>, h: SocketHandle)
     heap::uncharge(TCP_BUFS);
 }
 
+/// The keep-alive interval `o` asks for (`TCP_KEEPIDLE`), if enabled.
+fn keep_alive(o: &Opts) -> Option<Duration> {
+    o.keepalive
+        .then(|| Duration::from_secs(o.keepidle.max(1) as u64))
+}
+
+/// Options for a socket that has not started a handshake yet (the smoltcp
+/// keep-alive timer is reset by `listen`/`connect` and started by the
+/// handshake, so keep-alive can be set directly).
 fn apply_tcp_opts(o: &Opts, t: &mut tcp::Socket) {
+    t.set_keep_alive(keep_alive(o));
+    apply_tcp_common(o, t);
+}
+
+/// Options set on a connection (`setsockopt` after `connect`/`accept`).
+///
+/// Keep-alive cannot simply be handed to smoltcp here: enabling it on an
+/// idle synchronized socket arms smoltcp's keep-alive timer at time 0
+/// (`Timer::set_keep_alive`), so the next poll sends a probe (one garbage
+/// byte at SND.NXT-1) right away. Go turns on `SO_KEEPALIVE` for every
+/// accepted and dialed connection, which put that 1-byte segment after
+/// every handshake (D85). Linux sends the first probe only after
+/// `TCP_KEEPIDLE` s without traffic, so it is deferred: `ka_since` starts
+/// the idle period, our send/recv paths restart it, and [`Stack::track`]
+/// hands the interval to smoltcp once it has elapsed (smoltcp then probes
+/// and rewinds its own timer on every segment).
+fn apply_live_tcp_opts(o: &Opts, c: &mut Conn, t: &mut tcp::Socket, now_ns: u64) {
+    match keep_alive(o) {
+        None => {
+            c.ka_since = None;
+            t.set_keep_alive(None);
+        }
+        Some(d)
+            if t.keep_alive().is_some()
+                || matches!(
+                    t.state(),
+                    tcp::State::Closed | tcp::State::SynSent | tcp::State::SynReceived
+                ) =>
+        {
+            // Already running (the timer is armed: only the interval
+            // changes), or the handshake will start the timer.
+            c.ka_since = None;
+            t.set_keep_alive(Some(d));
+        }
+        Some(_) => {
+            c.ka_since.get_or_insert(now_ns);
+        }
+    }
+    apply_tcp_common(o, t);
+}
+
+fn apply_tcp_common(o: &Opts, t: &mut tcp::Socket) {
     t.set_nagle_enabled(!o.nodelay);
-    t.set_keep_alive(if o.keepalive {
-        Some(Duration::from_secs(o.keepidle.max(1) as u64))
-    } else {
-        None
-    });
     t.set_timeout(if o.user_timeout > 0 {
         Some(Duration::from_millis(o.user_timeout as u64))
     } else {
@@ -375,6 +425,21 @@ impl Sock {
     }
 }
 
+impl Sock {
+    /// Data moved through send/recv: restart a deferred keep-alive's idle
+    /// period (Linux counts from the last segment received; this counts
+    /// from the last successful read or write).
+    fn touch(&mut self) {
+        if let Kind::Tcp(Tcp::Conn(Conn {
+            ka_since: Some(since),
+            ..
+        })) = &mut self.kind
+        {
+            *since = crate::arch::timer::now_ns();
+        }
+    }
+}
+
 fn accept_ready(st: tcp::State) -> bool {
     !matches!(
         st,
@@ -488,6 +553,18 @@ impl Stack {
                     {
                         c.reset = true;
                         sock.error = ECONNRESET;
+                    }
+                    if let Some(since) = c.ka_since {
+                        // Deferred keep-alive (apply_live_tcp_opts): idle
+                        // long enough, smoltcp probes from here on.
+                        match keep_alive(&sock.opts) {
+                            Some(d) if now_ns.saturating_sub(since) / 1000 >= d.total_micros() => {
+                                c.ka_since = None;
+                                t.set_keep_alive(Some(d));
+                            }
+                            Some(_) => {}
+                            None => c.ka_since = None,
+                        }
                     }
                     c.last = st;
                 }
@@ -724,7 +801,10 @@ impl InetSocket {
         }
         match t.send_slice(data) {
             Ok(0) => Err(Errno(EAGAIN)),
-            Ok(n) => Ok(n),
+            Ok(n) => {
+                sock.touch();
+                Ok(n)
+            }
             Err(_) => Err(Errno(EPIPE)),
         }
     }
@@ -744,6 +824,7 @@ impl InetSocket {
             } else {
                 t.recv_slice(buf).unwrap_or(0)
             };
+            sock.touch();
             return Ok(RecvInfo {
                 len: n,
                 full: n,
@@ -1046,6 +1127,7 @@ impl SocketOps for InetSocket {
                     reset: false,
                     peer,
                     local,
+                    ka_since: None,
                 })),
             );
             ns.opts = opts;
@@ -1150,6 +1232,7 @@ impl SocketOps for InetSocket {
                 reset: false,
                 peer: Some(remote),
                 local,
+                ka_since: None,
             }));
             Err(Errno(EINPROGRESS))
         })
@@ -1354,8 +1437,9 @@ impl SocketOps for InetSocket {
                 _ => return Err(Errno(ENOPROTOOPT)),
             }
             // Live TCP options reach the smoltcp socket.
-            if let Kind::Tcp(Tcp::Conn(c)) = &sock.kind {
-                apply_tcp_opts(&sock.opts, sockets.get_mut::<tcp::Socket>(c.h));
+            if let Kind::Tcp(Tcp::Conn(c)) = &mut sock.kind {
+                let t = sockets.get_mut::<tcp::Socket>(c.h);
+                apply_live_tcp_opts(&sock.opts, c, t, crate::arch::timer::now_ns());
             }
             Ok(())
         })
