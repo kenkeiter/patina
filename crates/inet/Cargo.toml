@@ -1,0 +1,10 @@
+[package]
+name = "patina-inet"
+version = "0.1.0"
+edition.workspace = true
+description = "patina socket addresses (sockaddr codec, dual-stack mapping) and the inet bind/port table (host-testable)"
+license.workspace = true
+publish = false
+
+[dependencies]
+patina-abi = { path = "../abi" }

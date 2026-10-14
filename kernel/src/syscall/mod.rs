@@ -8,12 +8,13 @@
 //!
 //! Handlers are grouped by area: [`fs`] (fds), [`path`] (paths, cwd,
 //! metadata), [`poll`] (epoll, ppoll), [`mm`] (memory),
-//! [`signal`], [`proc`] (ids, limits, exit_group, randomness, Tier-3
+//! [`net`] (sockets), [`signal`], [`proc`] (ids, limits, exit_group, randomness, Tier-3
 //! stubs), [`thread`] (clone, exit, futex, sched_yield), [`time`] (clocks,
 //! sleeps).
 
 mod fs;
 mod mm;
+mod net;
 mod path;
 mod poll;
 mod proc;
@@ -24,7 +25,7 @@ mod time;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use patina_abi::current::{self, nr};
-use patina_abi::errno::{ECHILD, ENOSYS, EOPNOTSUPP, EPERM, Errno};
+use patina_abi::errno::{ECHILD, EINVAL, ENOSYS, EOPNOTSUPP, EPERM, Errno};
 #[cfg(target_arch = "x86_64")]
 use patina_abi::fs::AT_FDCWD;
 
@@ -192,6 +193,14 @@ pub fn dispatch(frame: &mut TrapFrame) {
 
     if strace {
         trace_path(n, &a);
+        if let Some(addr) = net::trace_addr(n, &a) {
+            crate::kprintln!(
+                "[strace] {} {} addr {}",
+                TraceTid(task::current().tid),
+                current::syscall_name(n).unwrap_or("?"),
+                addr
+            );
+        }
     }
     let r = call(n, &a, frame);
     let ret = match r {
@@ -242,9 +251,11 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::SYNC => Ok(0),
         nr::READAHEAD => fs::fadvise64(i(0), 0),
         // Go falls back to read/write on ENOSYS; not worth a log line.
-        nr::COPY_FILE_RANGE | nr::SENDFILE | nr::SPLICE | nr::TEE | nr::OPENAT2 => {
-            Err(Errno(ENOSYS))
-        }
+        nr::COPY_FILE_RANGE | nr::SENDFILE | nr::OPENAT2 => Err(Errno(ENOSYS)),
+        // Go's splice path (io.Copy between TCP conns, poll.Splice) falls
+        // back only on EINVAL ("splice unsupported for this fd type");
+        // ENOSYS would fail the copy.
+        nr::SPLICE | nr::TEE => Err(Errno(EINVAL)),
         #[cfg(target_arch = "x86_64")]
         nr::DUP2 => fs::dup2(i(0), i(1)),
         #[cfg(target_arch = "x86_64")]
@@ -341,6 +352,24 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::EPOLL_WAIT => poll::epoll_pwait(i(0), u(1), i(2), i(3), 0, 0),
         #[cfg(target_arch = "x86_64")]
         nr::POLL => poll::poll(u(0), u(1), i(2)),
+
+        // net.rs
+        nr::SOCKET => net::socket(i(0), i(1), i(2)),
+        nr::SOCKETPAIR => net::socketpair(i(0), i(1), i(2), u(3)),
+        nr::BIND => net::bind(i(0), u(1), u(2)),
+        nr::LISTEN => net::listen(i(0), i(1)),
+        nr::ACCEPT => net::accept4(i(0), u(1), u(2), 0),
+        nr::ACCEPT4 => net::accept4(i(0), u(1), u(2), a[3] as u32),
+        nr::CONNECT => net::connect(i(0), u(1), u(2)),
+        nr::GETSOCKNAME => net::getsockname(i(0), u(1), u(2)),
+        nr::GETPEERNAME => net::getpeername(i(0), u(1), u(2)),
+        nr::SETSOCKOPT => net::setsockopt(i(0), i(1), i(2), u(3), i(4)),
+        nr::GETSOCKOPT => net::getsockopt(i(0), i(1), i(2), u(3), u(4)),
+        nr::SENDTO => net::sendto(i(0), u(1), u(2), a[3] as u32, u(4), a[5] as u32 as usize),
+        nr::RECVFROM => net::recvfrom(i(0), u(1), u(2), a[3] as u32, u(4), u(5)),
+        nr::SENDMSG => net::sendmsg(i(0), u(1), a[2] as u32),
+        nr::RECVMSG => net::recvmsg(i(0), u(1), a[2] as u32),
+        nr::SHUTDOWN => net::shutdown(i(0), i(1)),
 
         // mm.rs
         nr::MMAP => mm::mmap(u(0), u(1), a[2] as u32, a[3] as u32, i(4), a[5]),

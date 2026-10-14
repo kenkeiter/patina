@@ -1554,6 +1554,111 @@ signal SIGUSR1, `--timeout`, SIGINT → 143, double SIGINT → 137. A `patina
 run` killed with SIGKILL still leaves QEMU running (own process group, no
 parent-death signal on macOS).
 
+## D67: TCP/IP stack: smoltcp behind one lock, a loopback mux, one net task
+*2026-10-14 · Phase 4*
+
+The stack (`kernel/src/net/stack.rs`) is one smoltcp 0.14 `Interface`, one
+`SocketSet`, the per-socket state of every inet socket and the bind table,
+all in one IRQ-safe `SpinLock<Stack>`; nothing in it blocks. smoltcp has no
+"deliver to self" path, so its single `Device` is a mux (`net/mux.rs`) over
+the NIC (`net::device::take()`, after `drivers::init`) and a fixed 256-frame
+loopback ring: a transmitted frame goes to the ring if it is for our MAC, is
+an IP packet for one of our addresses / 127/8 / `::1`, or is an ARP request
+or neighbor solicitation for one of them (smoltcp then answers its own ARP and
+learns the neighbor, like its `examples/loopback.rs`); everything else goes
+to the NIC, or is counted and dropped without one. One deviation from that
+recipe: smoltcp never answers a solicitation for `::1` (its solicited-node
+check skips the loopback address), so the mux re-addresses such a
+solicitation to `::1` itself (fixing the ICMPv6 checksum); smoltcp records
+`::1` → our MAC from its link-layer option. `transmit` refuses a token while
+the ring is full, so loopback backpressure holds data in the TCP socket
+instead of dropping it. The interface always has 127.0.0.1/8 and ::1/128, a
+fe80::/64 EUI-64 address with a NIC, and the static `ip=` client address plus
+a default IPv4 route through the gateway (`ip=dhcp` only logs that the DHCP
+client is not implemented; `stack::start_dhcp` is the hook). The MAC is the
+NIC's or 02:00:00:00:00:01. One boot line reports it: `[patina] net:
+<driver> hwaddr …, addrs …, gateway …` or `[patina] net: no device, loopback
+only (hwaddr …, addrs …)`. The interface is run by the net task (a kernel
+thread from `drivers::spawn`: poll, fire readiness notifications, sleep on
+the NIC's `Event` — or a stack-owned one — until `poll_delay`, at most 1 s,
+with a guard against zero-delay spinning) and inline by every socket syscall
+that changes state, right after the change and under the same lock, so a
+`write` is on the wire (over loopback: in the peer's receive buffer) before
+it returns; such a syscall signals the task's event only when the poll left
+an earlier deadline than the one the task sleeps on. `Stack::poll_all` feeds
+ingress one packet at a time (refilling TCP listen pools after each, D68),
+then egress, repeating while the loopback ring is non-empty (bounded
+rounds). After each poll every socket's readiness is recomputed and hooks
+are notified of new bits (and of a grown receive queue even if `IN` was
+already set, for edge-triggered users); the notifications are collected
+under the lock and fired after it (fs/file.rs lock order). The NIC IRQ
+handler only signals the event (net/device.rs contract). Delayed ACKs are
+off (`set_ack_delay(None)`): they only add latency over loopback.
+Verified by `scripts/test-hello.sh --app sockets` and httphello `-selftest`
+on both arches (no NIC: loopback only), `scripts/test-smp.sh --app sockets
+--cpus "1 2 4"`.
+
+## D68: inet sockets and the socket syscalls: `SocketOps`, listen pools, dual stack
+*2026-10-14 · Phase 4*
+
+Socket syscalls (`syscall/net.rs`) find the socket through
+`File::as_socket() -> Option<&dyn net::socket::SocketOps>` (`ENOTSOCK`
+otherwise) and own everything family-independent: copying addresses
+(`patina_inet::SockAddr`, which already decodes `sockaddr_un`), iovecs,
+option values and `msghdr`; blocking with `fs::file::wait_ready` honouring
+`O_NONBLOCK`, `MSG_DONTWAIT` and `SO_RCVTIMEO`/`SO_SNDTIMEO` (timeout →
+`EAGAIN`); `MSG_WAITALL` loops; `SIGPIPE` on `EPIPE` unless `MSG_NOSIGNAL`.
+`SocketOps` methods never block. AF_UNIX is meant to be a second
+implementor plus two lines in `socket`/`socketpair` (which return
+`EAFNOSUPPORT` for AF_UNIX today; AF_INET `socketpair` is `EOPNOTSUPP`;
+AF_NETLINK, AF_PACKET and the rest `EAFNOSUPPORT`). Interrupted waits return
+`ERESTARTSYS` (no timeout set) or `EINTR` (Linux `sock_intr_errno`); a
+blocking `connect` returns `EINTR` and the attempt continues, a nonblocking
+one always returns `EINPROGRESS` even when loopback could finish at once
+(Linux does the same in practice, and Go waits for `EPOLLOUT` then reads
+`SO_ERROR`). The inet socket (`net/inet.rs`) is an id; its state lives in the
+stack. TCP listen with smoltcp's one-socket-per-connection model deviates
+from "a pool of min(backlog, 16) refilled on accept": a listener keeps
+`LISTEN_POOL` (4) sockets in `Listen` plus an accept queue of sockets that
+left `Listen`, bounded by the backlog (clamped to 1..128); the pool is
+refilled after every ingress packet, so a burst of SYNs (50 concurrent
+dials) each find a listening socket, and a SYN is only refused (RST) when
+the accept queue is full. `accept4` takes the first queued socket past
+`SynReceived`. Connection errors come from smoltcp state transitions tracked
+after each poll: `SynSent → Closed` is `ECONNREFUSED` (`SO_ERROR`, `EPOLLERR`),
+75 s in `SynSent` is `ETIMEDOUT`, a synchronized state → `Closed` is a reset
+(`ECONNRESET` once, then EOF on read and `EPIPE` on write). Close is graceful
+(`close()`, the smoltcp socket kept as a zombie until `Closed`/`TimeWait`, at
+most 60 s); unread data, data arriving after close, or `SO_LINGER` {1, 0}
+abort with a RST, as on Linux. Socket buffers are 64 KiB each way (TCP) and
+16 × 2 KiB packets each way (UDP); `EPOLLOUT` is reported once a quarter of
+the send buffer is free. Ports: a bind table in `crates/inet` (host-tested)
+with Linux's ephemeral range 32768–60999 per protocol, `EADDRINUSE` unless
+both sides set `SO_REUSEPORT`, or both set `SO_REUSEADDR` and the existing
+one is not listening; a binding is released when its socket's file is (so a
+closed listener's port is immediately reusable even without `SO_REUSEADDR`;
+TIME_WAIT never blocks a bind). Dual stack: AF_INET6 sockets default to
+`IPV6_V6ONLY` = 0; a wildcard binding covers both families for the bind
+table, the smoltcp endpoint has no address and matches both versions, IPv4
+peers show as `::ffff:a.b.c.d`, and `::ffff:` destinations are used as IPv4.
+With `V6ONLY` = 1, mapped addresses give `EINVAL` (bind) and `ENETUNREACH`
+(connect/sendto). smoltcp wildcard endpoints match both versions even for
+AF_INET or V6ONLY sockets, so a connection of the wrong family is reset at
+accept and a datagram of the wrong family is dropped at receive. Go's IPv6
+probe (bind `[::1]:0` with V6ONLY=1 and `[::ffff:127.0.0.1]:0` with
+V6ONLY=0) succeeds, matching what the stack does. Other kernel changes:
+`splice`/`tee` return `EINVAL` instead of `ENOSYS` — Go's `io.Copy` between
+TCP connections tries splice and falls back to read/write only on `EINVAL`
+(ENOSYS failed the copy and closed the echo connection). Of 127/8 only
+127.0.0.1 is an address (smoltcp accepts packets for exact addresses only):
+binding 127.0.0.2 is `EADDRNOTAVAIL`, connecting to it `ENETUNREACH`. Not done: UDP
+datagrams larger than the MTU (`EMSGSIZE`; no IP fragmentation), ICMP errors
+to UDP sockets, `SO_RCVTIMEO` on plain `read`/`write` (only the `recv*`/
+`send*`/`accept`/`connect` syscalls look at it; Go uses deadlines instead),
+`TCP_INFO` (`ENOPROTOOPT`), `sendmmsg`/`recvmmsg` (`ENOSYS`), multicast.
+Verified by testapps/sockets (21 `ok` checks) on both arches at 1, 2
+and 4 vCPUs and by httphello `-selftest`.
+
 ## D69: virtio-net driver: one queue pair, no offloads, `NetDevice` handle
 *2026-10-14 · Phase 4*
 

@@ -156,6 +156,8 @@ pub fn kernel_main(bi: &'static BootInfo) -> ! {
     );
 
     drivers::init(&cl);
+    // After drivers::init: the NIC (if any) is registered by now.
+    net::init(&cl);
     ctl::init((bi.memory.total_bytes() >> 20) as u64);
 
     selftest::run(bi.cmdline);
