@@ -33,6 +33,7 @@ const GICD_CTLR: usize = 0x0000;
 const GICD_IGROUPR: usize = 0x0080;
 const GICD_ISENABLER: usize = 0x0100;
 const GICD_IPRIORITYR: usize = 0x0400;
+const GICD_ICFGR: usize = 0x0c00;
 const GICD_ITARGETSR: usize = 0x0800;
 const GICD_SGIR: usize = 0x0f00;
 const GICD_IROUTER: usize = 0x6000;
@@ -325,6 +326,25 @@ pub fn enable(intid: u32) {
         }
         wr32(g.dist + GICD_ISENABLER + 4 * (i / 32), bit);
     }
+}
+
+/// Whether the GIC has been initialized (`init` ran once).
+pub fn is_initialized() -> bool {
+    GIC.get().is_some()
+}
+
+/// Configure SPI `intid` (>= 32) as edge- (`true`) or level-triggered.
+/// Call before [`enable`]. SGIs/PPIs are left alone.
+pub fn set_trigger(intid: u32, edge: bool) {
+    if intid < 32 {
+        return;
+    }
+    let g = gic();
+    let i = intid as usize;
+    let reg = g.dist + GICD_ICFGR + 4 * (i / 16);
+    let bit = 1u32 << (2 * (i % 16) + 1);
+    let v = rd32(reg);
+    wr32(reg, if edge { v | bit } else { v & !bit });
 }
 
 /// This CPU's affinity in GICD_IROUTER format (Aff3 at [39:32]).

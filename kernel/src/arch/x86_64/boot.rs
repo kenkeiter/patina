@@ -268,6 +268,10 @@ pub extern "C" fn early_main(start_info_pa: usize) -> ! {
     let present = console::Uart16550::present(port);
     // SAFETY: legacy COM port range.
     console::install(unsafe { console::Uart16550::new(port) });
+    if crate::cmdline::param(cmdline, "console").is_some_and(|c| c.starts_with("hvc")) {
+        // virtio-console comes up later; keep the boot log for it.
+        crate::console::start_early_ring();
+    }
 
     let si = match parsed {
         Ok(s) => s,
@@ -336,6 +340,7 @@ pub extern "C" fn early_main(start_info_pa: usize) -> ! {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     smp::enumerate(si.rsdp, skip);
+    super::platform::init(si.rsdp);
 
     // ---- Memory map.
     let mut map = MemoryMap::new();

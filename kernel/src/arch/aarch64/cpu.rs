@@ -166,3 +166,12 @@ pub fn hwcap() -> (u64, u64) {
     }
     (h, 0)
 }
+
+/// Full system barrier before a device doorbell (virtio notify): makes
+/// earlier normal-memory writes (descriptor/avail rings) visible to the
+/// device before the MMIO write (`dsb sy`).
+#[inline]
+pub fn io_barrier() {
+    // SAFETY: barrier only.
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+}

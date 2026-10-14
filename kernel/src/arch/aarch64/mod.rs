@@ -10,6 +10,7 @@ pub mod boot;
 pub mod console;
 pub mod cpu;
 pub mod ctx;
+pub mod devices;
 mod dtb;
 mod exceptions;
 mod gic;

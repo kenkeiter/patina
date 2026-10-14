@@ -345,3 +345,12 @@ pub fn hw_random() -> Option<u64> {
     }
     None
 }
+
+/// Barrier before a device doorbell (virtio notify). x86 stores are not
+/// reordered with other stores and port/UC MMIO accesses are serializing
+/// enough; `mfence` keeps it explicit and orders against WC memory too.
+#[inline]
+pub fn io_barrier() {
+    // SAFETY: barrier only.
+    unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)) };
+}

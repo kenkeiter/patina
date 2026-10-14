@@ -12,6 +12,7 @@
 //!   `trap::timer_tick` when a tick or deadline was due;
 //! * IPIs ([`IPI_RESCHEDULE_VECTOR`], [`IPI_STOP_VECTOR`],
 //!   [`IPI_TLB_FLUSH_VECTOR`]): EOI, then `trap::ipi`;
+//! * device interrupts (0x30-0x7f, I/O APIC): `irq::dispatch`, then EOI;
 //! * spurious: nothing (no EOI);
 //! * any exception from ring 0, and NMI / #DF / #MC from anywhere: fatal
 //!   register dump through `console::panic_write_fmt`, then `panic!`;
@@ -25,8 +26,8 @@ use core::mem::size_of;
 
 use super::ctx::TrapFrame;
 use super::entry::{
-    __isr_ipi, __isr_spurious, __isr_table, __isr_timer, IPI_RESCHEDULE_VECTOR, IPI_STOP_VECTOR,
-    IPI_TLB_FLUSH_VECTOR, SPURIOUS_VECTOR, TIMER_VECTOR,
+    __isr_dev, __isr_ipi, __isr_spurious, __isr_table, __isr_timer, IPI_RESCHEDULE_VECTOR,
+    IPI_STOP_VECTOR, IPI_TLB_FLUSH_VECTOR, SPURIOUS_VECTOR, TIMER_VECTOR,
 };
 use super::gdt::{IST_DOUBLE_FAULT, KERNEL_CS};
 use super::{cpu, irq, lapic, timer};
@@ -107,6 +108,10 @@ pub(super) fn init() {
         idt[IPI_RESCHEDULE_VECTOR as usize] = Gate::interrupt(ipi[0], 0, 0);
         idt[IPI_STOP_VECTOR as usize] = Gate::interrupt(ipi[1], 0, 0);
         idt[IPI_TLB_FLUSH_VECTOR as usize] = Gate::interrupt(ipi[2], 0, 0);
+        let dev = &*core::ptr::addr_of!(__isr_dev);
+        for (i, &addr) in dev.iter().enumerate() {
+            idt[irq::DEV_VECTOR_BASE as usize + i] = Gate::interrupt(addr, 0, 0);
+        }
         load();
     }
 }
@@ -198,6 +203,16 @@ pub(super) extern "C" fn handle_trap(tf: &mut TrapFrame) {
         return;
     }
     if v == SPURIOUS_VECTOR as u64 {
+        return;
+    }
+    if (irq::DEV_VECTOR_BASE as u64..irq::DEV_VECTOR_END as u64).contains(&v) {
+        // The return path may switch threads (a woken thread, need_resched)
+        // and reloads FS from the frame.
+        if tf.from_user() {
+            tf.fs_base = cpu::read_fs_base();
+        }
+        irq::dispatch(v as u8);
+        lapic::eoi();
         return;
     }
     if !tf.from_user() || matches!(v, 2 | 8 | 18) || v >= 32 {
