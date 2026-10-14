@@ -146,9 +146,11 @@
 //!
 //! ```text
 //! pub mod smp {
-//!     /// CPUs the platform reports (DTB /cpus; ACPI MADT via the PVH
-//!     /// start_info RSDP, else the MP table, else 1). >= 1, valid once
-//!     /// the boot CPU reached kernel_main. Capped at cpu::MAX_CPUS.
+//!     /// CPUs the platform reports (DTB /cpus on aarch64; on x86_64 the
+//!     /// ACPI MADT found via start_info.rsdp_paddr, an EBDA/BIOS-area
+//!     /// RSDP scan or fw_cfg, else the MP table, else fw_cfg NB_CPUS,
+//!     /// else 1). >= 1, valid once the boot CPU reached kernel_main.
+//!     /// Capped at cpu::MAX_CPUS.
 //!     pub fn cpu_count() -> usize;
 //!     /// Start every secondary CPU (PSCI CPU_ON / INIT-SIPI-SIPI). Each
 //!     /// one gets its own kernel stack, GDT/TSS/IST or vector table,
