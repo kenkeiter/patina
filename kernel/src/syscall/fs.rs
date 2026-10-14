@@ -48,6 +48,15 @@ fn partial(n: usize, e: Errno) -> SysResult {
     if n > 0 { Ok(n as isize) } else { Err(e) }
 }
 
+/// For a datagram socket, its largest message: `read`/`write` move a
+/// whole message per call instead of 64 KiB chunks.
+fn dgram_max(of: &OpenFile) -> Option<usize> {
+    of.file
+        .as_socket()
+        .filter(|s| !s.is_stream())
+        .map(|s| s.max_dgram())
+}
+
 /// One read into `kbuf`, blocking unless `O_NONBLOCK`.
 fn read_into(of: &OpenFile, kbuf: &mut [u8]) -> Result<usize, Errno> {
     loop {
@@ -70,10 +79,16 @@ fn write_from(of: &OpenFile, ubuf: usize, len: usize) -> SysResult {
     if len == 0 {
         return of.file.write(&[], of.flags()).map(|n| n as isize);
     }
-    let mut k = vec![0u8; len.min(CHUNK)];
+    // A datagram socket takes one write as one message: no chunking.
+    let dmax = dgram_max(of);
+    if dmax.is_some_and(|m| len > m) {
+        return Err(Errno(patina_abi::errno::EMSGSIZE));
+    }
+    let chunk = dmax.unwrap_or(CHUNK);
+    let mut k = vec![0u8; len.min(chunk)];
     let mut done = 0;
     while done < len {
-        let n = (len - done).min(CHUNK);
+        let n = (len - done).min(chunk);
         if let Err(e) = with_space(|s| s.copy_from_user(ubuf + done, &mut k[..n])) {
             return partial(done, e);
         }
@@ -115,7 +130,8 @@ pub fn read(fd: i32, buf: usize, len: usize) -> SysResult {
     if !of.flags().readable() {
         return Err(Errno(EBADF));
     }
-    let mut k = vec![0u8; len.min(MAX_RW).min(CHUNK)];
+    let chunk = dgram_max(&of).map_or(CHUNK, |m| m + 1);
+    let mut k = vec![0u8; len.min(MAX_RW).min(chunk)];
     let n = read_into(&of, &mut k)?;
     with_space(|s| s.copy_to_user(buf, &k[..n]))?;
     Ok(n as isize)
