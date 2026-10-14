@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,6 +119,11 @@ func Run(o Options) (int, error) {
 	}
 	if o.Strace {
 		params = append(params, "patina.strace=1")
+	}
+	// PATINA_PARAMS: extra kernel parameters (space-separated), for tests and
+	// experiments (e.g. patina.pci.irq=intx). Not part of the normal CLI surface.
+	if extra := os.Getenv("PATINA_PARAMS"); extra != "" {
+		params = append(params, strings.Fields(extra)...)
 	}
 	cfg.Cmdline, err = cmdline.Build(cmdline.Options{
 		Console: drv.Console(m.Arch),

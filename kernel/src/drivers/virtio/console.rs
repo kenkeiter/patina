@@ -29,7 +29,7 @@ use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::queue::{Buf, DmaBuf, VirtQueue};
-use super::{DEVICE_CONSOLE, Transport, attach_irq, driver_ok, negotiate, poll_until};
+use super::{DEVICE_CONSOLE, Transport, attach_irq, driver_ok, negotiate, poll_until_kicked};
 use crate::drivers::Event;
 use crate::sync::{OnceCell, SpinLock, SpinLockGuard};
 
@@ -154,7 +154,8 @@ impl TxQ {
         self.pending = 0;
         self.inflight = true;
         self.q.kick(t);
-        poll_until(timeout_ns, || self.reap())
+        let q = self.q.index();
+        poll_until_kicked(t, q, timeout_ns, || self.reap())
     }
 
     /// Stage `data`, flushing whenever the buffer fills.
@@ -165,7 +166,9 @@ impl TxQ {
                 ok &= self.flush(t, timeout_ns);
             }
             if !self.reap() {
-                // The device still owns the buffer: drop.
+                // The device still owns the buffer (a timed-out flush). Kick
+                // again in case the notification was lost, then drop.
+                self.q.kick(t);
                 self.dropped += data.len() as u64;
                 return false;
             }
@@ -505,6 +508,67 @@ pub fn write(port: usize, data: &[u8], timeout_ns: u64) -> bool {
 }
 
 static HVC_PORT: AtomicU32 = AtomicU32::new(0);
+
+/// TEMP diagnostic: report the hvc0 tx state over the control channel.
+pub fn diag_thread() {
+    use core::fmt::Write;
+    let now = crate::arch::timer::now_ns();
+    crate::task::wait::sleep_until(now + 700_000_000);
+    let Some(c) = DEV.get() else {
+        return;
+    };
+    let p = &c.ports[HVC_PORT.load(Ordering::Relaxed) as usize];
+    let mut s = alloc::string::String::new();
+    {
+        let g = p.tx.lock();
+        if let Some(tx) = g.as_ref() {
+            let (a, l, u, pa) = tx.q.debug_state();
+            let _ = write!(
+                s,
+                "tx inf {} drop {} pend {} av {} lu {} ui {} ring {:#x}",
+                tx.inflight, tx.dropped, tx.pending, a, l, u, pa
+            );
+        }
+    }
+    c.t.diag(&mut s);
+    crate::ctl::log_warn(format_args!("hvc0 diag:{}", s));
+    // Experiment: if the first buffer is stuck, post a second one and see
+    // which heads the device returns.
+    let stuck = p.tx.lock().as_ref().is_some_and(|tx| tx.inflight);
+    if !stuck {
+        return;
+    }
+    let Some(extra) = DmaBuf::new(64) else {
+        return;
+    };
+    extra.write(0, b"\r\n[diag] second buffer\r\n");
+    let head2 = {
+        let mut g = p.tx.lock();
+        let tx = g.as_mut().unwrap();
+        let h = tx.q.add(&[Buf {
+            addr: extra.pa(0),
+            len: 24,
+            write: false,
+        }]);
+        tx.q.kick(&*c.t);
+        h
+    };
+    let t0 = crate::arch::timer::now_ns();
+    crate::task::wait::sleep_until(t0 + 200_000_000);
+    let mut r = alloc::string::String::new();
+    {
+        let mut g = p.tx.lock();
+        let tx = g.as_mut().unwrap();
+        let (a, l, u, _) = tx.q.debug_state();
+        let _ = write!(r, "head2 {:?} av {} lu {} ui {} popped:", head2, a, l, u);
+        while let Some((h, len)) = tx.q.pop_used() {
+            let _ = write!(r, " ({},{})", h, len);
+        }
+        tx.inflight = false;
+    }
+    crate::ctl::log_warn(format_args!("hvc0 diag2: {}", r));
+    core::mem::forget(extra);
+}
 
 /// The `hvc0` kernel console: virtio-console port [`HVC_PORT`].
 pub struct Hvc;

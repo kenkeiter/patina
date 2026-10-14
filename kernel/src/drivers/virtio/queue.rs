@@ -178,6 +178,11 @@ impl VirtQueue {
         self.num_free
     }
 
+    /// TEMP: (avail_idx, last_used, device used idx, desc pa).
+    pub fn debug_state(&self) -> (u16, u16, u16, u64) {
+        (self.avail_idx, self.last_used, self.used_idx(), self.mem.pa(0))
+    }
+
     fn wr_desc(&self, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
         let p = self.mem.va(16 * i as usize);
         // SAFETY: descriptor `i` lies in the ring memory we own.

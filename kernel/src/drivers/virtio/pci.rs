@@ -254,6 +254,33 @@ impl Transport for PciTransport {
         self.r8(CONFIG_GENERATION) as u32
     }
 
+    fn diag(&self, out: &mut dyn Write) {
+        let _ = write!(
+            out,
+            " st {:#x} nq {} nm {}",
+            self.r8(DEVICE_STATUS),
+            self.r16(NUM_QUEUES),
+            self.notify_mult,
+        );
+        for q in 0..self.num_queues.min(2) {
+            self.w16(QUEUE_SELECT, q);
+            let _ = write!(
+                out,
+                " q{}[sz {} en {} no {} d {:#x} a {:#x} u {:#x}]",
+                q,
+                self.r16(QUEUE_SIZE),
+                self.r16(QUEUE_ENABLE),
+                self.r16(QUEUE_NOTIFY_OFF),
+                self.r32(QUEUE_DESC) as u64 | ((self.r32(QUEUE_DESC + 4) as u64) << 32),
+                self.r32(QUEUE_DRIVER) as u64 | ((self.r32(QUEUE_DRIVER + 4) as u64) << 32),
+                self.r32(QUEUE_DEVICE) as u64 | ((self.r32(QUEUE_DEVICE + 4) as u64) << 32),
+            );
+        }
+        // SAFETY: mapped ISR byte (diagnostic read; acks the interrupt).
+        let isr = unsafe { (self.isr as *const u8).read_volatile() };
+        let _ = write!(out, " isr {:#x}", isr);
+    }
+
     fn config_read8(&self, off: usize) -> u8 {
         if off >= self.device_len {
             return 0;
