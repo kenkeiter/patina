@@ -63,6 +63,23 @@ pub struct Platform {
     /// Every enabled UART we have a driver for, in DT order.
     pub uarts: [Option<UartDesc>; MAX_UARTS],
     pub psci: Option<Conduit>,
+    /// Interrupt controller (`arm,gic-v3` or a GICv2 compatible).
+    pub gic: Option<GicDesc>,
+    /// INTID of the EL1 virtual timer (`arm,armv8-timer` `interrupts`, 3rd
+    /// entry), if the DTB says.
+    pub timer_virt_intid: Option<u32>,
+}
+
+/// GIC description from the DTB.
+#[derive(Clone, Copy, Debug)]
+pub struct GicDesc {
+    /// 2 or 3.
+    pub version: u32,
+    /// Distributor (GICD) `(base, size)`.
+    pub dist: (usize, usize),
+    /// GICv3: redistributor region (all CPUs' GICR frames). GICv2: CPU
+    /// interface (GICC).
+    pub cpu: (usize, usize),
 }
 
 #[derive(Debug)]
@@ -89,6 +106,8 @@ pub unsafe fn parse(va: usize) -> Result<Platform, DtbError> {
         stdout_uart: None,
         uarts: [None; MAX_UARTS],
         psci: None,
+        gic: None,
+        timer_virt_intid: None,
     };
 
     for node in fdt.all_nodes() {
@@ -164,7 +183,47 @@ pub unsafe fn parse(va: usize) -> Result<Platform, DtbError> {
             _ => None,
         };
     }
+    p.gic = gic_from_fdt(&fdt);
+    p.timer_virt_intid = fdt
+        .find_compatible(&["arm,armv8-timer", "arm,armv7-timer"])
+        .and_then(|n| n.property("interrupts"))
+        .and_then(|pr| {
+            // Four <type number flags> triples: secure phys, non-secure phys,
+            // virtual, hypervisor. PPI n is INTID 16 + n.
+            let cell = |i: usize| {
+                pr.value
+                    .get(i * 4..i * 4 + 4)
+                    .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            };
+            match (cell(6)?, cell(7)?) {
+                (1, n) => Some(16 + n),
+                _ => None,
+            }
+        });
     Ok(p)
+}
+
+fn gic_from_fdt(fdt: &Fdt<'static>) -> Option<GicDesc> {
+    let (node, version) = match fdt.find_compatible(&["arm,gic-v3"]) {
+        Some(n) => (n, 3),
+        None => (
+            fdt.find_compatible(&[
+                "arm,gic-400",
+                "arm,cortex-a15-gic",
+                "arm,cortex-a9-gic",
+                "arm,cortex-a7-gic",
+            ])?,
+            2,
+        ),
+    };
+    let mut regs = node.reg()?;
+    let d = regs.next()?;
+    let c = regs.next()?;
+    Some(GicDesc {
+        version,
+        dist: (d.starting_address as usize, d.size.unwrap_or(0x10000)),
+        cpu: (c.starting_address as usize, c.size.unwrap_or(0x20000)),
+    })
 }
 
 fn is_disabled(n: &FdtNode<'_, '_>) -> bool {

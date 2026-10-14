@@ -2,17 +2,22 @@
 //!
 //! Translation regime: 4 KiB granule, 48-bit VA (T0SZ = T1SZ = 16).
 //! TTBR1 holds the kernel tables (higher-half image + direct map); TTBR0 is
-//! reserved for user mode and points at an empty table after boot.
+//! reserved for user mode ([`uspace::UserTables`]) and points at an empty
+//! table after boot.
 //! MAIR index 0 = Device-nGnRE, index 1 = Normal write-back cacheable.
 
 pub mod boot;
 pub mod console;
 pub mod cpu;
+pub mod ctx;
 mod dtb;
 mod exceptions;
+mod gic;
 pub mod irq;
 pub mod paging;
 pub mod power;
+pub mod timer;
+pub mod uspace;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 

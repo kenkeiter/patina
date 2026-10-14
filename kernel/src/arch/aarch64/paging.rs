@@ -8,8 +8,9 @@
 //! final tables.
 //!
 //! Phase 0 never replaces a valid entry, so no break-before-make is needed;
-//! `map_range` fails with `AlreadyMapped` instead. Phase 1 adds
-//! unmap/protect and user (TTBR0) tables on top of [`map_in`].
+//! `map_range` fails with `AlreadyMapped` instead. User (TTBR0) tables,
+//! with per-page unmap/protect/translate, are in `uspace.rs` and share the
+//! descriptor helpers below.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -47,25 +48,25 @@ pub enum MapError {
 }
 
 // Descriptor bits.
-const DESC_VALID: u64 = 1 << 0;
-const DESC_TABLE: u64 = 1 << 1; // at levels 0-2: table; at level 3: page
-const ATTR_IDX_DEVICE: u64 = 0 << 2;
+pub(super) const DESC_VALID: u64 = 1 << 0;
+pub(super) const DESC_TABLE: u64 = 1 << 1; // at levels 0-2: table; at level 3: page
+pub(super) const ATTR_IDX_DEVICE: u64 = 0 << 2;
 const ATTR_IDX_NORMAL: u64 = 1 << 2;
 const AP_EL0: u64 = 1 << 6; // AP[1]
-const AP_RO: u64 = 1 << 7; // AP[2]
+pub(super) const AP_RO: u64 = 1 << 7; // AP[2]
 const SH_INNER: u64 = 3 << 8;
 const AF: u64 = 1 << 10;
 const NG: u64 = 1 << 11;
 const PXN: u64 = 1 << 53;
-const UXN: u64 = 1 << 54;
-const ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+pub(super) const UXN: u64 = 1 << 54;
+pub(super) const ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
 
 /// MAIR_EL1: Attr0 = Device-nGnRE (0x04), Attr1 = Normal WB RA/WA (0xff).
 pub const MAIR_VALUE: u64 = 0xff04;
 
-const ENTRIES: usize = 512;
+pub(super) const ENTRIES: usize = 512;
 
-fn leaf_attrs(flags: MapFlags) -> u64 {
+pub(super) fn leaf_attrs(flags: MapFlags) -> u64 {
     let mut d = AF;
     if flags.contains(MapFlags::DEVICE) {
         d |= ATTR_IDX_DEVICE;
@@ -108,7 +109,7 @@ static PT_POOL: Pool = Pool(UnsafeCell::new([[0; PAGE_SIZE]; POOL_PAGES]));
 static PT_POOL_NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// A zeroed frame for a page table.
-fn alloc_table() -> Option<PhysAddr> {
+pub(super) fn alloc_table() -> Option<PhysAddr> {
     if frame::is_initialized() {
         return frame::alloc_frames_zeroed(0);
     }
@@ -127,7 +128,7 @@ pub fn pool_used() -> usize {
 }
 
 /// Virtual address through which the table at `pa` can be accessed.
-fn table_ptr(pa: u64) -> *mut u64 {
+pub(super) fn table_ptr(pa: u64) -> *mut u64 {
     let pa = pa as usize;
     let load = kernel_load_phys();
     if pa >= load && pa < load + kernel_size() {
