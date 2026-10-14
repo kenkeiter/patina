@@ -22,7 +22,7 @@ const (
 	subTickPeriod      = 500 * time.Microsecond
 	subTickRounds      = 100
 	subTickMaxAvg      = 4 * time.Millisecond
-	absSleepMaxLate    = 5 * time.Millisecond
+	absSleepMaxLate    = 3 * time.Millisecond
 	overrunBlockedTime = 20 * time.Millisecond
 )
 
@@ -191,8 +191,9 @@ func checkTimers() {
 		name  string
 		clock int
 	}{{"monotonic", clockMonotonic}, {"realtime", clockRealtime}} {
-		var worst time.Duration
-		for i := 0; i < 50; i++ {
+		var worst, sum time.Duration
+		const n = 50
+		for i := 0; i < n; i++ {
 			target := clockGettime(c.clock) + subTickPeriod
 			if err := clockNanosleep(c.clock, timerAbstime, target); err != nil {
 				fail("clock_nanosleep abs %s: %v", c.name, err)
@@ -202,11 +203,15 @@ func checkTimers() {
 				fail("clock_nanosleep abs %s returned %v early", c.name, -late)
 			}
 			worst = max(worst, late)
+			sum += late
 		}
-		if worst > absSleepMaxLate {
-			fail("clock_nanosleep abs %s: up to %v late", c.name, worst)
+		// The average must be sub-tick; a single wakeup may be late under
+		// host load (TCG).
+		if sum/n > absSleepMaxLate {
+			fail("clock_nanosleep abs %s: %v late on average (worst %v)", c.name, sum/n, worst)
 		}
-		ok("abs nanosleep %s: 50 x 500us, never early, worst %v late", c.name, worst.Round(time.Microsecond))
+		ok("abs nanosleep %s: %d x 500us, never early, %v late on average, worst %v", c.name, n,
+			(sum / n).Round(time.Microsecond), worst.Round(time.Microsecond))
 	}
 	// A past absolute deadline returns at once.
 	if err := clockNanosleep(clockRealtime, timerAbstime, clockGettime(clockRealtime)-time.Second); err != nil {
