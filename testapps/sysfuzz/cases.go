@@ -372,7 +372,7 @@ func casesFd(t *tcase) {
 	t.want("pipe2 read-only pointer", r, e, syscall.EFAULT)
 	// fs/eventfd.c: unknown flags → -EINVAL; read/write < 8 bytes →
 	// -EINVAL; writing ULLONG_MAX → -EINVAL.
-	r, e = scr(SYS_EVENTFD2, 0, 0x1)
+	r, e = scr(SYS_EVENTFD2, 0, 0x2) // 0x1 is EFD_SEMAPHORE (valid)
 	t.want("eventfd2 bad flags", r, e, syscall.EINVAL)
 	efd := must("eventfd2")(scr(SYS_EVENTFD2, 0, syscall.O_NONBLOCK|syscall.O_CLOEXEC))
 	r, e = scr(SYS_WRITE, efd, t.c.u64s(1), 4)
