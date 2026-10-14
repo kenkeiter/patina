@@ -3,6 +3,8 @@
 //
 //	hello        -> "PASS hello", exit 0
 //	hello 3 a b  -> "PASS hello", exit 3
+//
+// It also prints its environment as `env: ["K=V" ...]` (patina run --env).
 package main
 
 import (
@@ -14,6 +16,7 @@ import (
 func main() {
 	fmt.Println("hello from patina")
 	fmt.Printf("argv: %q\n", os.Args)
+	fmt.Printf("env: %q\n", os.Environ())
 	code := 0
 	if len(os.Args) > 1 {
 		n, err := strconv.Atoi(os.Args[1])

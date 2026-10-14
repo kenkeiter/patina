@@ -158,7 +158,9 @@ func cmdRun(args []string, stdout, stderr io.Writer) (int, error) {
 		}
 	}
 	sigs := make(chan os.Signal, 4)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	// SIGHUP too (terminal closed): QEMU runs in its own process group and
+	// would otherwise outlive `patina run`.
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigs)
 	return run.Run(run.Options{
 		Image: pos[0], VMM: *vmmName, VMMBin: *vmmBin, Name: *name, MemMB: *mem, CPUs: *cpus, Strace: *strace,

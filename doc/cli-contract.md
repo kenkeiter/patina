@@ -11,7 +11,7 @@ console=<dev> [ip=...] [patina.strace=1] patina.epoch=<unix-seconds> [patina.env
 - Tokens are separated by single spaces. `--` is always present; everything after the first `--` is argv[1:], and the kernel sets argv[0] = `/app`.
 - Keys, values and args are percent-encoded: every byte ≤0x20 or ≥0x7f, plus `% , = " ' \`. Decoding is `%XX` → that byte, all else literal.
 - `patina.env`: split on a raw `,`, then each item on its first raw `=`, then percent-decode.
-- Exception: QEMU microvm with `acpi=off` appends ` virtio_mmio.device=512@0xfeb00e00:12` *after* `--`. The CLI always escapes `=` in args, so a raw `virtio_mmio.device=` token after `--` is a kernel parameter, not an arg.
+- Exception: QEMU microvm with `acpi=off` appends ` virtio_mmio.device=512@0xfeb00e00:12 virtio_mmio.device=512@0xfeb00c00:11` (one per device, from the top of the window down; seen with the CLI's console + rng devices) *after* `--`. The CLI always escapes `=` in args, so a raw `virtio_mmio.device=` token after `--` is a kernel parameter, not an arg.
 - `console=`: `ttyAMA0` (PL011, QEMU aarch64), `ttyS0` (16550 at 0x3f8 on x86; Firecracker/CH), `hvc0` (virtio-console, Apple VZ).
 - Networking: `--net user` → `ip=10.0.2.15::10.0.2.2:255.255.255.0:patina:eth0:off:10.0.2.3` plus a virtio-net-device. A tap device → `ip=dhcp`.
 
@@ -21,14 +21,30 @@ aarch64:
 ```
 -M virt,gic-version=3 -accel hvf -cpu host -smp N -m M -nodefaults -no-user-config -display none -no-reboot
 -kernel K -initrd I -append CMDLINE -chardev stdio,id=con0,signal=off -serial chardev:con0
--device virtio-serial-device,id=vser0 -chardev socket,id=ctl0,path=...,server=on,wait=off
+-device virtio-serial-device,id=vser0 -chardev socket,id=ctl0,path=<run>/qemu-ctl.sock,server=on,wait=on
 -device virtserialport,bus=vser0.0,chardev=ctl0,name=patina.ctl -device virtio-rng-device
 ```
 
-x86_64: the same, but with `-M microvm` (ACPI on), `-accel tcg -cpu max`, and `-device isa-debug-exit,iobase=0xf4,iosize=0x04`. With ACPI on, the kernel finds virtio-mmio by probing from 0xfeb00000 in 512-byte steps (the first device was seen at 0xfeb00e00, IRQ 12) or through the DSDT.
+x86_64: the same, but with `-M microvm` (ACPI on), `-accel tcg -cpu max`, and `-device isa-debug-exit,iobase=0xf4,iosize=0x04`. With ACPI on (the CLI's setup), QEMU 11 describes the virtio-mmio devices in the DSDT and the kernel takes them from there: console at 0xfeb02e00 GSI 47, rng at 0xfeb02c00 GSI 46 (kernel lines `[patina] virtio: mmio @ 0xfeb02e00 irq 47 device-id 3 (console) [acpi dsdt, ...]`, level-triggered via the second IOAPIC). The 0xfeb00e00/IRQ 12 layout applies only to `-M microvm,acpi=off`, where QEMU passes the devices on the cmdline (see above). On aarch64 `virt` the devices come from the DTB (CLI layout: rng at 0xa003c00 INTID 78, console at 0xa003e00 INTID 79).
 
 - Control channel on QEMU: a virtio-mmio virtio-serial device (multiport) with a port named exactly `patina.ctl`, carrying NDJSON per design §10.2. vsock port 4242 on the other VMMs.
-- Exit code: the `exit` event first, then the `[patina] exit code N` serial line, then isa-debug-exit (x86; QEMU status = (v<<1)|1, only ≥3 is trusted). Exit code 0 must be reported through the event or the sentinel.
+- The chardev is `wait=on`: QEMU creates the socket and does not start the guest until `patina run`'s control proxy has connected, so the proxy sees every event, including `ready` and the `exit` of a program that ends in milliseconds. The QEMU "info: QEMU waiting for connection on: ..." line this causes is filtered from stderr (other QEMU stderr output passes through).
+- Exit code of `patina run` (all VMMs), first match wins:
+  1. `--timeout` expired: 124 (like timeout(1)), even if the guest then exited 0 or was forced.
+  2. The `exit` event's `code` (0, the program's code, 128+N for a `SIG_DFL` death, 137 `forced` after the grace).
+  3. A `panic` event: 255 (the kernel also prints `[patina] exit code 255`, but the event works without serial).
+  4. The `[patina] exit code N` serial line.
+  5. The VMM's own carrier: QEMU isa-debug-exit on x86 (status = (v<<1)|1, only ≥3 is trusted). Exit code 0 must be reported through the event or the sentinel.
+  6. The CLI killed the VMM (second interrupt, or no exit within grace + 2 s): 137.
+  7. Otherwise 1, with a message. CLI errors are 125, usage errors 2.
+
+## `patina run` signals and messages
+
+- Ctrl-C (SIGINT), SIGTERM and SIGHUP: `{"op":"stop","grace_ms":<--grace, default 10 s>}`; the result is the guest's exit code (0 for a program that handles SIGTERM, 143 without a handler). A second signal kills the VMM (137). If the control channel is not connected, the first signal kills.
+- `--timeout D`: the same stop when D expires, then exit 124.
+- `-v`: the VMM argv, `patina: control channel attached (...)`, and one `patina: control: <event>` line per event, e.g. `patina: control: ready: go1.27.1, 2 cpus, 512 MiB` and `patina: control: exit code 3`. A `panic` event is always printed (`patina: KERNEL PANIC: <msg>`).
+- CLI messages on stderr are written between console lines: if the guest console is mid-line, the message starts on a new line.
+- The run dir is removed when `patina run` returns; `patina ps` lists run dirs whose `patina run` process is alive. A `patina run` killed with SIGKILL leaves QEMU running (own process group) and a stale run dir, which the next run with that name replaces.
 
 ## initrd
 
@@ -36,7 +52,11 @@ newc cpio. Entry names have no leading slash (`app`, `srv/www/x`), parents come 
 
 ## Run state
 
-`patina run` writes `$XDG_RUNTIME_DIR/patina/<name>/` or `~/.patina/run/<name>/`, containing `state.json` and `ctl.sock`. `ctl.sock` is a proxy served by `run`: it holds the single upstream VMM connection and broadcasts guest events to all `ctl` clients (QEMU's chardev only accepts one client).
+`patina run` writes `$XDG_RUNTIME_DIR/patina/<name>/` or `~/.patina/run/<name>/`, containing `state.json` and `ctl.sock`. `ctl.sock` is a proxy served by `run`: it holds the single upstream VMM connection and broadcasts guest events to all `ctl` clients (QEMU's chardev only accepts one client). A client that connects after boot first receives the last `ready` line. `patina ctl <vm> stop` exits with the guest's exit code and prints every event line it receives (raw NDJSON), ending with the `exit` event; `ping` prints the `pong` (`{"ev":"pong","id":N,"uptime_ms":M}`); `signal`/`dump` print events for `--linger` (500 ms) and exit 0.
+
+## End-to-end test (real kernel, QEMU)
+
+`cd cli && PATINA_E2E=1 go test ./internal/run -run E2E -v` (`PATINA_E2E_ARCH=aarch64|x86_64` to limit; skipped without the env var, QEMU or `out/kernel-*`). It builds the CLI, `patina build`s testapps/hello and testapps/signals, and checks per arch: `hello -- 3 a b` → 3 and the argv line; `ctl stop` (handler → 0, nohandler → 143 with `"signal":"SIGTERM"`, ignore with `--grace 1s` → 137 `forced:true` in < 3.5 s); `ctl ping`; `ctl dump` → goroutine dump and 2; `ctl signal SIGUSR1`; `--timeout 3s` → 124; SIGINT to `patina run` → 143 (nohandler); two SIGINTs → 137; run dir removed. 60 s bound per wait.
 
 ## Firecracker and Cloud Hypervisor
 

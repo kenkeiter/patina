@@ -26,6 +26,7 @@
 //	                         stop:   serve ping, wait for {"op":"stop"}, exit 143 (SIGTERM)
 //	                         mute:   print one line and spin; never accepts vsock
 //	                         silent: power off without reporting any exit code
+//	                         panic:  ready, then a panic event and power off without a sentinel
 //	PATINA_FAKEVMM_CODE      exit code for the exit event (default 0)
 //	PATINA_FAKEVMM_SENTINEL  code printed in the "[patina] exit code N" line (default: CODE)
 //	PATINA_FAKEVMM_REFUSE    number of CONNECTs to drop before the guest listens (default 0)
@@ -477,7 +478,7 @@ func runGuest(vmm, cmdline string, vsock net.Listener) {
 		g.scenario = "exit"
 	}
 	fmt.Printf("fake %s: booting with cmdline: %s\n", vmm, cmdline)
-	listens := g.scenario == "exit" || g.scenario == "stop"
+	listens := g.scenario == "exit" || g.scenario == "stop" || g.scenario == "panic"
 	if vsock != nil {
 		g.ln = vsock
 		go g.accept(vsock, listens)
@@ -495,6 +496,16 @@ func runGuest(vmm, cmdline string, vsock net.Listener) {
 		fmt.Println("hello from the fake guest")
 		g.send(fmt.Sprintf(`{"ev":"exit","code":%d}`, g.code))
 		g.poweroff(true)
+	case "panic":
+		select {
+		case <-g.conn1:
+		case <-deadline:
+			os.Exit(3)
+		}
+		g.send(`{"ev":"ready","go":"go-fake","cpus":1,"mem_mb":128}`)
+		g.send(`{"ev":"panic","msg":"fake panic"}`)
+		fmt.Println("[patina] panic: fake panic")
+		g.poweroff(false)
 	case "serial":
 		fmt.Println("hello from the fake guest (no control channel)")
 		g.poweroff(true)
