@@ -8,8 +8,14 @@
 //!
 //! - Parameters are whitespace-separated; `"` toggles quoting (so a quoted
 //!   value may contain spaces) and is removed, like Linux `next_arg`.
-//! - Everything after a standalone `--` is the program's argv (after
-//!   `/app`), one element per token.
+//! - Everything after the first standalone `--` is the program's argv
+//!   (after `/app`), one element per token, EXCEPT tokens containing a raw
+//!   `=`: the CLI always percent-encodes `=` in real args (`%3D`), so a
+//!   post-`--` token with a raw `=` is a kernel parameter and is parsed
+//!   exactly like one before `--` (not added to argv). This is how QEMU
+//!   microvm's appended ` virtio_mmio.device=...` and
+//!   `run-qemu.sh -- patina.selftest=panic` reach the kernel (doc/decisions.md
+//!   D11, doc/cli-contract.md). A later bare `--` is an ordinary arg.
 //! - Percent-decoding (`%XX`) applies to argv elements, `patina.env` keys
 //!   and values, and `patina.*` values. `+` is literal. An invalid escape
 //!   is kept verbatim. The CLI must encode at least space, `"`, `%`, and,
@@ -369,11 +375,14 @@ impl Cmdline {
     /// Parse a full kernel command line. Never fails; see [`Cmdline::errors`].
     pub fn parse(s: &str) -> Cmdline {
         let mut c = Cmdline::default();
-        let mut tokens = tokenize(s).into_iter();
-        for tok in tokens.by_ref() {
-            if tok == "--" {
+        for tok in tokenize(s) {
+            if !c.has_separator && tok == "--" {
                 c.has_separator = true;
-                break;
+                continue;
+            }
+            if c.has_separator && !tok.contains('=') {
+                c.argv.push(percent_decode(&tok));
+                continue;
             }
             let (key, value) = match tok.split_once('=') {
                 Some((k, v)) => (k, Some(v)),
@@ -381,7 +390,6 @@ impl Cmdline {
             };
             c.param(key, value);
         }
-        c.argv = tokens.map(|t| percent_decode(&t)).collect();
         c
     }
 
@@ -519,7 +527,7 @@ mod tests {
 
     #[test]
     fn argv_only_after_separator() {
-        let c = Cmdline::parse("console=hvc0 -- -- x=y");
+        let c = Cmdline::parse("console=hvc0 -- -- x%3Dy");
         assert_eq!(c.argv, vec!["--", "x=y"]);
         assert!(c.unknown.is_empty());
         let c = Cmdline::parse("console=hvc0");
@@ -529,6 +537,42 @@ mod tests {
         assert_eq!(c, Cmdline::default());
         let c = Cmdline::parse("--");
         assert!(c.has_separator && c.argv.is_empty());
+    }
+
+    #[test]
+    fn raw_equals_after_separator_is_param() {
+        let c = Cmdline::parse("console=ttyS0 -- a virtio_mmio.device=512@0xfeb00e00:12 b");
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        assert_eq!(c.argv, vec!["a", "b"]);
+        assert_eq!(
+            c.virtio_mmio,
+            vec![VirtioMmioDevice {
+                size: Some(512),
+                base: 0xfeb0_0e00,
+                irq: 12,
+                id: None
+            }]
+        );
+
+        let c = Cmdline::parse("-- x%3Dy");
+        assert_eq!(c.argv, vec!["x=y"]);
+        assert!(c.unknown.is_empty());
+
+        let c = Cmdline::parse("console=ttyAMA0 -- patina.selftest=panic");
+        assert_eq!(c.get("patina.selftest"), Some(Some("panic")));
+        assert!(c.argv.is_empty());
+
+        let c = Cmdline::parse("-- patina.strace=1");
+        assert_eq!(c.get("patina.strace"), Some(Some("1")));
+        assert!(c.argv.is_empty());
+        let c = Cmdline::parse("patina.strace --");
+        assert_eq!(c.get("patina.strace"), Some(None));
+        assert!(c.argv.is_empty());
+
+        // A second `--` is an arg; a raw-`=` token after it is still a param.
+        let c = Cmdline::parse("-- -- k=v --");
+        assert_eq!(c.argv, vec!["--", "--"]);
+        assert_eq!(c.get("k"), Some(Some("v")));
     }
 
     #[test]
