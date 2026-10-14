@@ -479,9 +479,19 @@ enum Target {
 struct Fire {
     target: Target,
     info: SigInfo,
-    /// POSIX timer id and missed intervals (overrun bookkeeping if the
-    /// signal could not be queued).
-    posix: Option<(i32, u64)>,
+    /// POSIX timer overrun bookkeeping, settled once the send result is
+    /// known.
+    posix: Option<PosixFire>,
+}
+
+struct PosixFire {
+    id: i32,
+    /// Intervals skipped by this expiry.
+    missed: u64,
+    /// `overrun_acc` folded into this signal's overrun.
+    acc: u64,
+    /// The overrun the signal carries.
+    overrun: i32,
 }
 
 /// Timer tick hook (`sched::tick`, every CPU, IRQs masked).
@@ -560,13 +570,19 @@ fn run(wait: bool) {
                     None => continue,
                 },
             };
-            let overrun = t.overrun_acc.saturating_add(missed).min(i32::MAX as u64) as i32;
-            t.overrun_last = overrun;
-            t.overrun_acc = 0;
+            // Settled after the send: only a queued signal resets the
+            // accumulated overrun and becomes `timer_getoverrun`'s value.
+            let acc = t.overrun_acc;
+            let overrun = acc.saturating_add(missed).min(i32::MAX as u64) as i32;
             fires.push(Fire {
                 target,
                 info: SigInfo::timer(t.signo, id, overrun, t.sigval),
-                posix: Some((id, missed)),
+                posix: Some(PosixFire {
+                    id,
+                    missed,
+                    acc,
+                    overrun,
+                }),
             });
         }
         // One-shot timers and timers of exited threads disarmed.
@@ -578,10 +594,15 @@ fn run(wait: bool) {
             Target::Process => signal::send_to_process(f.info),
             Target::Thread(t) => signal::send_to_thread(t, f.info),
         };
-        if !queued && let Some((id, missed)) = f.posix {
+        if let Some(p) = f.posix {
             let mut tab = TABLE.lock();
-            if let Some(t) = tab.timers.get_mut(&id) {
-                t.overrun_acc = t.overrun_acc.saturating_add(1 + missed);
+            if let Some(t) = tab.timers.get_mut(&p.id) {
+                if queued {
+                    t.overrun_last = p.overrun;
+                    t.overrun_acc = t.overrun_acc.saturating_sub(p.acc);
+                } else {
+                    t.overrun_acc = t.overrun_acc.saturating_add(1 + p.missed);
+                }
             }
         }
     }

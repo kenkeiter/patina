@@ -1,6 +1,5 @@
 package main
 
-func checkTimers()  {}
 func checkSignals() {}
 func checkFds()     {}
 func checkRusage()  {}
