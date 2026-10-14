@@ -8,7 +8,7 @@
 //! (virtio-rng is Phase 3). Go uses `AT_RANDOM` to
 //! seed its hash functions and `getrandom` for `crypto/rand`; the latter
 //! must get a real source before anything security-relevant runs on patina.
-//! W2a decision, to be recorded in doc/decisions.md.
+//! See doc/decisions.md D35 (PRNG) and D50 (hardware seeding).
 
 use crate::sync::SpinLock;
 

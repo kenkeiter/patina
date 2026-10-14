@@ -1044,4 +1044,48 @@ exited threads are disarmed, and a signal for a `SIGEV_THREAD_ID` target
 that has exited is dropped.
 
 ## D52: x86_64 TLB shootdown and deferred frame reclaim
-*(pending: the shootdown worker's report)*
+*2026-10-14 · Phase 2*
+
+x86_64 `UserTables::unmap`/`protect` only `invlpg` the local TLB, so once
+D50 runs user threads on every vCPU a frame freed on one CPU could still
+be written through another CPU's stale translation after the frame
+allocator reused it (seen as a corrupted buddy free-list link in
+`frame::alloc_frames`, `#GP` in kernel mode; `testapps/tlbstress`
+reproduces it in one run). A synchronous shootdown that waits for acks
+would deadlock: the address-space lock is an IRQ-masking spinlock and
+other CPUs spin on it with IRQs masked (futex bucket → space, D40), so
+they could never take the IPI. The fix (`kernel/src/mm/tlb.rs`) is
+asynchronous with deferred reclaim, RCU-style: a global `FLUSH_GEN` and a
+per-CPU `CPU_GEN[c]` = the newest generation CPU `c` has fully flushed
+for. A vm operation that frees user frames (munmap, `MAP_FIXED` over
+resident pages, `madvise(DONTNEED|FREE)`, mremap shrink/move) collects
+them in one `Shootdown`; on drop it bumps `FLUSH_GEN` → g, queues
+`(g, frames)` on `DEFERRED`, reloads CR3 locally, sets its own `CPU_GEN`
+to g and sends `IpiKind::TlbFlush` (x86 vector 0xf2; aarch64 SGI 2,
+handled but never sent) to the other online CPUs without waiting. The
+receiver reads `FLUSH_GEN` *before* its full flush and `fetch_max`es it
+into `CPU_GEN` after (reading after the flush could claim a batch whose
+old entries were re-cached in between). `reclaim()` frees every batch with
+`g <= min(CPU_GEN[c] for c in online_mask())`; it uses `try_lock`, first
+brings a lagging caller up to date, and runs at the end of every vm
+operation, from every CPU's tick and in `vm::fault_in` before reporting
+ENOMEM (not from `frame::alloc`: the heap calls it with the heap lock
+held and reclaim drops `Vec`s). Permission reductions (mprotect revoking
+rights on resident pages, mremap move) send the IPI with nothing deferred;
+lazy fills and permission upgrades send nothing; one IPI per syscall, not
+per page. The arch contract gained `uspace::NEEDS_SHOOTDOWN` (true on
+x86_64, false on aarch64 whose `tlbi …is` broadcasts synchronously, so
+frames are freed at once there) and `uspace::flush_tlb_local()`. With
+`online_cpus() <= 1` frames are freed immediately and no IPI is sent,
+exactly as in Phase 1. Lock order: address space → `DEFERRED` → heap /
+frame allocator. Cost per munmap/madvise at > 1 CPU: one SeqCst bump, one
+short `DEFERRED` lock, one local CR3 reload, N−1 ICR writes and one CR3
+reload per receiver; frees are delayed until the slowest CPU takes the
+IPI (microseconds, at most until its next tick). Known limits: a stopped
+CPU (exit/panic) never advances its `CPU_GEN`, so batches queued after a
+stop stay pending (the `frames at exit` line can be slightly lower at > 1
+CPU); the pending list is unbounded while some CPU keeps IRQs masked;
+mprotect/munmap/mremap return before remote CPUs flush, so for a few
+microseconds a remote thread can still write through the old entry into a
+frame that is still held (lost write, no corruption), which Go does not
+rely on. Verified only under QEMU TCG (x86_64) and HVF (aarch64).
