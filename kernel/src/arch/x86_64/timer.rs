@@ -59,7 +59,20 @@ pub fn now_ns() -> u64 {
         mult = TSC_MULT.load(Ordering::Acquire);
     }
     let dt = cpu::rdtsc().wrapping_sub(TSC_BOOT.load(Ordering::Relaxed));
-    ((dt as u128 * mult as u128) >> 32) as u64
+    patina_vdso::vvar::mult32_to_ns(dt, mult)
+}
+
+/// (counter base, scale) for the vDSO's vvar page (D75): the TSC at
+/// monotonic 0 and ns per TSC tick as 32.32 fixed point, the same math as
+/// [`now_ns`].
+pub fn vdso_clock() -> (u64, u64) {
+    if TSC_MULT.load(Ordering::Acquire) == 0 {
+        calibrate();
+    }
+    (
+        TSC_BOOT.load(Ordering::Relaxed),
+        TSC_MULT.load(Ordering::Acquire),
+    )
 }
 
 /// Tick period in ns.

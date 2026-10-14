@@ -1,0 +1,13 @@
+[package]
+name = "patina-vdso"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The patina vDSO image (built for both arches by build.rs), its vvar layout, and an ELF checker"
+publish = false
+build = "build.rs"
+
+[dependencies]
+
+[dev-dependencies]
+patina-rand = { path = "../rand" }

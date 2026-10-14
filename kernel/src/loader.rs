@@ -12,7 +12,9 @@
 //! 4. An 8 MiB lazily filled stack VMA ending at [`STACK_TOP`], with the
 //!    Linux-exact argv/envp/auxv image from `patina_loader::stack::build`
 //!    copied to its top through uaccess.
-//! 5. The `Process` and thread 0 are created and thread 0 enters user mode.
+//! 5. The vDSO image and the vvar page are mapped (`vdso::map`, D75) and
+//!    `AT_SYSINFO_EHDR` leads the auxv, unless `patina.novdso=1`.
+//! 6. The `Process` and thread 0 are created and thread 0 enters user mode.
 //!
 //! Failures print `[patina] fatal: ...` and exit 127 (no/bad `/app` or
 //! initrd) or 126 (not a loadable executable), like a shell would.
@@ -139,6 +141,7 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
     };
 
     let strace = matches!(c.get("patina.strace"), Some(None) | Some(Some("1")));
+    let novdso = matches!(c.get("patina.novdso"), Some(None) | Some(Some("1")));
     let epoch_ns = c.epoch_ns.unwrap_or(0);
     crate::random::seed_boot(arch::timer::now_ns() ^ epoch_ns.rotate_left(32));
 
@@ -197,9 +200,26 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
         )
         .unwrap_or_else(|e| fatal(127, format_args!("cannot create the stack: {}", e)));
 
+    // vDSO + vvar (D75), unless patina.novdso=1.
+    let vdso_base = if novdso {
+        None
+    } else {
+        let b = crate::vdso::init(epoch_ns)
+            .then(|| crate::vdso::map(&mut space))
+            .flatten();
+        if b.is_none() {
+            crate::kprintln!("[patina] loader: cannot map the vDSO, running without it");
+        }
+        b
+    };
+
     let (argv, envp) = argv_envp(c);
     let (hwcap, hwcap2) = arch::cpu::hwcap();
-    let auxv = [
+    let mut auxv: Vec<(u64, u64)> = Vec::with_capacity(16);
+    if let Some(b) = vdso_base {
+        auxv.push((AT_SYSINFO_EHDR, b as u64));
+    }
+    auxv.extend_from_slice(&[
         (AT_PAGESZ, PAGE_SIZE as u64),
         (AT_PHDR, img.phdr_vaddr),
         (AT_PHENT, img.phent as u64),
@@ -213,7 +233,7 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
         (AT_GID, 0),
         (AT_EGID, 0),
         (AT_SECURE, 0),
-    ];
+    ]);
     // AT_RANDOM: see random.rs (no entropy source before Phase 3).
     let mut random = [0u8; 16];
     crate::random::fill(&mut random);
@@ -244,7 +264,7 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
         .map(|a| core::str::from_utf8(a).unwrap_or("<non-utf8>"))
         .collect();
     crate::kprintln!(
-        "[patina] loader: /app {} entry {:#x} phdr {:#x} {} segments, stack {:#x}-{:#x} sp {:#x}, argv {:?}{}",
+        "[patina] loader: /app {} entry {:#x} phdr {:#x} {} segments, stack {:#x}-{:#x} sp {:#x}, {}, argv {:?}{}",
         arch::NAME,
         img.entry,
         img.phdr_vaddr,
@@ -252,6 +272,10 @@ pub fn run(bi: &'static BootInfo, c: &Cmdline) -> ! {
         stack_lo,
         STACK_TOP,
         image.sp,
+        match vdso_base {
+            Some(_) => "vdso on",
+            None => "vdso off",
+        },
         argv_show,
         if strace { ", strace on" } else { "" }
     );

@@ -103,7 +103,11 @@ fn bsdcpio_fixture_static_zero_copy() {
     assert_eq!(fs.static_contents(ino), Some(&b"127.0.0.1 localhost\n"[..]));
     assert_eq!(fs.static_contents(R), None);
     fs.write_at(ino, 0, b"10").unwrap();
-    assert_eq!(fs.static_contents(ino), None, "written: no longer the backing");
+    assert_eq!(
+        fs.static_contents(ino),
+        None,
+        "written: no longer the backing"
+    );
     assert_eq!(fs.pages_used(), 1);
     assert_eq!(
         get(&mut fs, "/etc/hosts").unwrap(),

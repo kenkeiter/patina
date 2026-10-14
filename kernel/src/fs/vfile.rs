@@ -44,7 +44,11 @@ pub fn seek_pos(pos: u64, size: u64, off: i64, whence: i32) -> Result<u64, Errno
             if off as u64 >= size {
                 return Err(Errno(ENXIO));
             }
-            return Ok(if whence == SEEK_DATA { off as u64 } else { size });
+            return Ok(if whence == SEEK_DATA {
+                off as u64
+            } else {
+                size
+            });
         }
         _ => return Err(Errno(EINVAL)),
     };

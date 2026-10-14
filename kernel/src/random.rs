@@ -51,6 +51,7 @@ pub fn seed_boot(seed_val: u64) {
         s.add_entropy(&crate::arch::timer::now_ns().to_le_bytes());
         s.reseed();
     }
+    crate::vdso::rng_reseeded();
     virtio.fill(0);
     let hw_name = if hw > 0 { HW_RNG_NAME } else { "" };
     if nv > 0 {
@@ -74,9 +75,13 @@ pub fn seed_boot(seed_val: u64) {
 
 /// Mix `data` into the pool and reseed at once.
 pub fn add_entropy_and_reseed(data: &[u8]) {
-    let mut s = STATE.lock();
-    s.add_entropy(data);
-    s.reseed();
+    {
+        let mut s = STATE.lock();
+        s.add_entropy(data);
+        s.reseed();
+    }
+    // vDSO getrandom states (D75) refill their keys.
+    crate::vdso::rng_reseeded();
 }
 
 fn reseed_thread() {

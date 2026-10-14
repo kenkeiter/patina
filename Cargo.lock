@@ -141,6 +141,7 @@ dependencies = [
  "patina-inet",
  "patina-loader",
  "patina-rand",
+ "patina-vdso",
  "patina-vfs",
  "smoltcp",
 ]
@@ -155,6 +156,13 @@ dependencies = [
 [[package]]
 name = "patina-rand"
 version = "0.1.0"
+
+[[package]]
+name = "patina-vdso"
+version = "0.1.0"
+dependencies = [
+ "patina-rand",
+]
 
 [[package]]
 name = "patina-vfs"

@@ -28,6 +28,11 @@ scripts/test-os.sh [aarch64] [x86_64]               # Go's own `os` package test
 scripts/test-hello.sh --app sockets|unixsock [arch...] # Phase 4 AF_INET/AF_INET6 and AF_UNIX socket coverage over loopback
 scripts/test-net.sh [aarch64] [x86_64]              # Phase 4 Milestone A on QEMU: httphello via patina run --net user --publish, DHCP, PCI
 scripts/test-gonet.sh [--pkg net/http] [arch...]    # Go's own `net` (or net/http) package tests with testapps/skiplist/net.txt
+scripts/test-gopkg.sh <pkg>... [--arch aarch64|x86_64|both] [--cpus N] [--run RE] [--no-short] [--mem MiB]
+                                                    # Milestone B: any Go std package's tests with testapps/skiplist/<pkg>.txt (D74); test-os.sh/test-gonet.sh wrap it
+scripts/bench.sh [arch...] [--cpus 1,2] [--runs 3] [--novdso] [-n F] [--only L]
+                                                    # Phase 5 per-syscall benchmarks (testapps/bench): table of medians per arch (D79)
+GO=go1.26.9 scripts/build-testapp.sh <name> <arch> <out>  # build a testapp with another Go toolchain (default GO=go)
 PATINA_NET=user scripts/run-qemu.sh <arch> -- patina.selftest=net   # virtio-net driver self-test (ARP against slirp)
 cargo test --workspace --exclude patina-kernel      # host tests
 ```
@@ -389,4 +394,120 @@ CLI and Milestone A:
 
 ## Phase 5 — Hardening
 
-- [ ] Runtime test-suite harness + skip list (**Milestone B**), Tier-3 syscalls, vDSO, console-port control fallback, `AF_VSOCK` for the program, `--strace`, multi-queue net, benchmarks.
+Milestone B (D74): Go 1.27.1 `go test -c` binaries, `-test.short`, aarch64
+= QEMU `virt` HVF, release kernel. Command for every row:
+`scripts/test-gopkg.sh <pkg> --arch aarch64 [--cpus 4]` (logs in
+`out/test/gopkg/`). Counts are top-level tests: passed / skipped (of which
+by our skip list) / failed.
+
+| Name | Package | aarch64, 1 vCPU | aarch64, 4 vCPUs |
+|---|---|---|---|
+| **test-gopkg** | `runtime` | 378 / 148 (11) / 0 | 385 / 141 (11) / 0 (3 runs identical; `--no-short`, 2 GiB: 399 passed, 1 failed — `TestPanicSystemstack`, needs exec, since listed) |
+| **test-gopkg** | `os` | 248 / 33 (10) / 0 | 248 / 33 (10) / 0 |
+| **test-gopkg** | `net` | 254 / 55 (1) / 0 | 254 / 55 (1) / 0 |
+| **test-gopkg** | `os/signal` | 18 / 3 (2) / 0 | 18 / 3 (2) / 0 |
+| **test-gopkg** | `time` | 180 / 4 (0) / 0 | 180 / 4 (0) / 0 |
+| **test-gopkg** | `sync` | 51 / 2 (2) / 0 | 51 / 2 (2) / 0 |
+| **test-gopkg** | `syscall` | 25 / 28 (10) / 0 | 25 / 28 (10) / 0 |
+| **test-gopkg** | `io` | 72 / 0 / 0 | 72 / 0 / 0 |
+| **test-gopkg** | `bufio` | 88 / 0 / 0 | 88 / 0 / 0 |
+| **test-gopkg** | `context` | 46 / 0 / 0 | 46 / 0 / 0 |
+| **test-gopkg** | `net/http` | 612 / 9 (0) / 0 | 611 / 10 (0) / 0 (before the go.mod change) |
+| **test-gopkg** | `runtime/pprof` | 44 / 3 (0) / 0 | 44 / 3 (0) / 0 |
+| **test-gopkg** | `os/user` | 12 / 0 / 0 | 12 / 0 / 0 |
+| **test-gopkg-x86** | `runtime`, x86_64 (microvm, TCG), 1 vCPU | 379 / 150 (11) / 0 | not run |
+
+`ENOSYS` lines across all runs: `pidfd_open` (D57; Go's os/exec probe, falls
+back) and `clone3` (syscall tests that ask for a namespace or pidfd; Go
+falls back to `clone`, which cannot create processes, D57). The 4-vCPU
+column of the other packages was run before the final `go.mod` harness
+change (time then had 179 passed, 5 skipped).
+
+- [x] Milestone B harness `scripts/test-gopkg.sh` (D74): per-package defaults (RAM, timeouts, extra files), skip lists `testapps/skiplist/<pkg>.txt`, summary/failure rules of D65; `test-os.sh`/`test-gonet.sh` are wrappers — **test-gopkg** (reproduced test-os-p4 248/0 and test-gonet 254/0)
+- [x] **Milestone B on aarch64** (QEMU, 1 and 4 vCPUs): the design §13 packages (`runtime`, `os`, `net`, `os/signal`, `time`, `sync`, `syscall`) plus `io`, `bufio`, `context`, `net/http`, `runtime/pprof`, `os/user`, 0 failed; 36 listed tests, all "needs os/exec" or "GODEBUG re-exec" — **test-gopkg**
+- [~] Milestone B on x86_64: only `runtime` at 1 vCPU was run (379 / 150 (11) / 0) — **test-gopkg-x86**
+- [x] `recvmsg` reports `MSG_CMSG_CLOEXEC` back in `msg_flags` — **test-gopkg** syscall `TestSCMCredentials`
+- [x] Per-thread credentials (`set*uid`/`set*gid`/`setfs*`/`setgroups`/`getgroups`/`getres*` with Linux's rules and capability fix-ups, `patina_abi::cred` host-tested), `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS`, `capget` reports the sets, `/proc/1/status` `Uid`/`Gid`/`Groups`/`CapPrm`/`CapEff`, `/proc/1/task/<tid>/{status,stat,comm}` — **test-gopkg** syscall `TestSetuidEtc`, `TestAllThreadsSyscall`; os/signal `TestAllThreadsSyscallSignals`
+- [x] `fcntl` record locks (`F_GETLK`/`F_SETLK`/`F_SETLKW`, `F_OFD_*`): validated like Linux, granted — **test-gopkg** syscall `TestFcntlFlock` (parent half; the child half needs exec and the test is listed)
+- [x] `umount2` → `EINVAL`/`ENOENT` instead of `ENOSYS` — **test-gopkg** syscall (`TestUnshareMountNameSpace` cleanup; no `umount2` ENOSYS line any more)
+- [ ] Still open in Phase 5: console-port control fallback, `AF_VSOCK` for the program (deferred until the vsock driver has run on a real transport), `--strace`, multi-queue net.
+
+### vDSO
+
+Decision D75. `scripts/test-hello.sh --app vdsobench [arch...]` (add
+`PATINA_PARAMS="patina.novdso=1 patina.env=VDSOBENCH_EXPECT=novdso"` for the
+no-vDSO baseline, `PATINA_PARAMS=patina.strace=1` to check the timed loops
+for syscalls); `cargo test -p patina-vdso` for the image checks.
+
+| Name | Command | Observed |
+|---|---|---|
+| **vdsobench** | `scripts/test-hello.sh --app vdsobench aarch64 x86_64`, the same with `PATINA_PARAMS="patina.novdso=1 patina.env=VDSOBENCH_EXPECT=novdso"`, with `PATINA_CPUS=4`, and with `PATINA_PARAMS=patina.strace=1` | `PASS vdsobench` in all four configurations on both arches. ns per `time.Now()` (1e6 calls, 1 vCPU): **aarch64 63.4 with the vDSO / 333.5 without (5.3×)**, **x86_64 361.9 / 3004 (8.3×)**; `crypto/rand.Read` of 32 B: aarch64 120 / 569 ns, x86_64 1139 / 3837 ns; 4 vCPUs: 63.6 / 437.6 ns per `time.Now()`. `runtime.nanotime` lies within a `clock_gettime(CLOCK_MONOTONIC)` syscall bracket 1000/1000 times (exact math, same formula as the kernel), `time.Now()` within 1 ms of `CLOCK_REALTIME`, a 100 ms sleep measures 101–104 ms, `/proc/self/maps` shows `7ffff8000000-7ffff8001000 r-xp … [vdso]` and `7ffff8001000-7ffff8002000 r--p … [vvar]` (none with `patina.novdso=1`). strace: 0 `clock_gettime`/`gettimeofday`/`getrandom` syscalls inside the 1e6 `time.Now` loop and the 1e5 `rand.Read` loop; one 32-byte key fetch at the first `rand.Read` and one more after a forced kernel reseed |
+| **p5-vdso-regression** | on the vDSO tree: `scripts/test-hello.sh aarch64 x86_64`, `scripts/test-signals.sh aarch64 x86_64`, `scripts/test-hello.sh --app fileio aarch64 x86_64`, `PATINA_CPUS_LIST="1 4" scripts/test-runtime.sh aarch64 x86_64`, `scripts/test-os.sh aarch64`, `scripts/test-ctl.sh aarch64 x86_64`, host tests, clippy both targets | all PASS: hello, 12/12 signals cases, fileio, `test-runtime: all passed` (1/4 CPUs, both arches), `os aarch64 (cpus=1): 248 passed, 33 skipped (10 by our list), 0 failed`, test-ctl 16/16 (incl. `usr1-time`), `cargo test --workspace --exclude patina-kernel` 0 failures, clippy 0 warnings |
+| **vdso-image** | `cargo test -p patina-vdso` | 7 host tests: both images are clean `ET_DYN` objects (one R+X PT_LOAD at 0, PT_DYNAMIC, no relocations, no writable sections), Go's symbols resolve through `DT_HASH` with the version check of `runtime/vdso_linux.go`, Go's precomputed SysV hashes match, `__vvar_page` = the mapped vvar offset, the image's ChaCha20 = RFC 8439 |
+
+- [x] In-tree vDSO built with the pinned toolchain only (`crates/vdso/build.rs`: `rustc --emit=obj` + `rust-lld -shared`, both arches), embedded through the `patina-vdso` crate; `scripts/build-kernel.sh` unchanged — **vdso-image**, every QEMU run
+- [x] Mapped at `0x7fff_f800_0000` (`[vdso]`, R+X) + vvar page (`[vvar]`, R), `AT_SYSINFO_EHDR`; `patina.novdso=1` turns it off — **vdsobench**
+- [x] `clock_gettime` (REALTIME, MONOTONIC, MONOTONIC_RAW, BOOTTIME, *_COARSE, TAI; others → syscall from the vDSO), `gettimeofday`, `time`, `clock_getres`; Go's `nanotime`/`walltime` make no syscalls — **vdsobench** (strace)
+- [x] vvar seqlock; the control channel's `time` op updates the vvar realtime offset — **test-ctl** `usr1-time` (Go's `time.Now()` after the step goes through the vDSO)
+- [x] vDSO `getrandom` (Linux 6.11 contract: params query, per-thread opaque state, ChaCha20 with fast key erasure, key refill on kernel reseed via `rng_generation`) — **vdsobench** (output checks, strace shows the refill after a reseed)
+- [~] x86_64 TSC assumed synchronized/invariant across CPUs (true under TCG; not checked on KVM hosts); vDSO `getrandom` re-entry fallback (`in_use`), vvar refault after `madvise(DONTNEED)`/`munmap` of the vDSO: written, not exercised
+
+### Benchmarks
+
+Decision D79. `scripts/bench.sh aarch64 x86_64 --cpus 1,2 --novdso` runs
+`testapps/bench` (Go 1.27.1, release kernel, `PATINA_MEM=512`) 3× per
+configuration and prints the **median of 3**. Host: Apple M1 Max (10
+cores), macOS 26.6.2, QEMU 11.1.2; aarch64 = `virt` + HVF, x86_64 =
+`microvm` + **TCG** (an emulator: its absolute numbers are not comparable
+with aarch64 or with real x86 hardware, only its ratios mean something).
+Run 2026-10-14 while other agents' QEMU guests shared the host, so single
+runs vary by ~10–30 %; the medians are the honest number. Latency rows:
+lower is better; MB/s = 10^6 bytes/s. The `novdso` columns are the clock
+rows rerun with `patina.novdso=1` (other rows "-").
+
+| Benchmark | unit | aarch64 1 vCPU | aarch64 1, novdso | aarch64 2 vCPUs | aarch64 2, novdso | x86_64 1 vCPU | x86_64 1, novdso | x86_64 2 vCPUs | x86_64 2, novdso |
+|---|---|---|---|---|---|---|---|---|---|
+| `getpid-raw` (RawSyscall: bare entry/exit) | ns | 57 | - | 59 | - | 574 | - | 474 | - |
+| `getpid-syscall` (syscall.Syscall: + Go's entersyscall) | ns | 76 | - | 77 | - | 915 | - | 749 | - |
+| `clock_gettime-syscall` (raw, MONOTONIC) | ns | 132 | 136 | 134 | 135 | 1144 | 1174 | 1157 | 1026 |
+| `time.Now` (vDSO) | ns | 60 | 266 | 63 | 332 | 286 | 2478 | 266 | 2211 |
+| `getrandom32-syscall` (32 B) | ns | 387 | 388 | 385 | 388 | 2783 | 2816 | 2491 | 2307 |
+| `crypto-rand-read32` (vDSO getrandom) | ns | 121 | 427 | 122 | 455 | 1114 | 3655 | 908 | 3394 |
+| `futex-pingpong` (2 locked threads, raw WAIT/WAKE) | µs/round trip | 0.65 | - | 0.90 | - | 8.66 | - | 9.03 | - |
+| `chan-pingpong` (goroutines, unbuffered chans) | µs/round trip | 0.23 | - | 0.21 | - | 4.09 | - | 3.85 | - |
+| `mutex-handoff` (sync.Mutex + Cond, strict alternation) | µs/round trip | 0.22 | - | 0.22 | - | 4.06 | - | 4.13 | - |
+| `pipe-pingpong` (2 locked threads, blocking pipes, 1 B) | µs/round trip | 1.01 | - | 1.40 | - | 19.3 | - | 27.0 | - |
+| `pipe-throughput` (64 KiB writes, 1 s) | MB/s | 3306 | - | 3567 | - | 396 | - | 899 | - |
+| `netpoll-pipe-pingpong` (os.Pipe: epoll wakeup) | µs/round trip | 1.75 | - | 1.80 | - | 30.2 | - | 26.8 | - |
+| `tcp-rtt` (127.0.0.1, 1 B, TCP_NODELAY) | µs/round trip | 4.33 | - | 4.51 | - | 72.9 | - | 74.2 | - |
+| `tcp-throughput` (64 KiB writes, 2 s) | MB/s | 693 | - | 688 | - | 146 | - | 144 | - |
+| `unix-rtt` (AF_UNIX stream, 1 B) | µs/round trip | 1.87 | - | 1.96 | - | 34.1 | - | 33.5 | - |
+| `unix-throughput` (64 KiB writes, 2 s) | MB/s | 2823 | - | 3223 | - | 400 | - | 730 | - |
+| `thread-create-exit` (LockOSThread'd goroutine exits: clone + exit) | µs | 3.79 | - | 6.60 | - | 71.8 | - | 74.2 | - |
+| `mmap-munmap-1M` (anon, touch one page) | µs | 1.41 | - | 1.54 | - | 13.1 | - | 42.9 | - |
+| `signal-rtt` (kill(self, SIGUSR1) → signal.Notify chan) | µs | 3.17 | - | 6.89 | - | 41.3 | - | 40.0 | - |
+
+| Name | Command | Observed |
+|---|---|---|
+| **bench** | `scripts/bench.sh aarch64 x86_64 --cpus 1,2 --novdso` (3 runs each) | every run prints `PASS bench` and exits 0 on both arches, 1 and 2 vCPUs, with and without the vDSO; no `ENOSYS` line; table above. No HVF row crosses the pathology thresholds of D79 (futex > 50 µs, pipe ping-pong > 100 µs, TCP < 200 MB/s, signal > 100 µs) |
+
+- [x] Per-syscall benchmarks (design §14): `testapps/bench` (std only, `-n` scale, `-only`, `-list`) + `scripts/bench.sh` (medians, `--novdso`) — **bench**
+- [~] Known costs, explained in D79, not fixed: TCP loopback moves ~4× less data than AF_UNIX and has ~2.3× its round trip (smoltcp under one lock + the net task, D67); with 2 vCPUs, cross-CPU wakeups (Reschedule IPI to a CPU idling in WFI) roughly double `signal-rtt` and `thread-create-exit` on HVF; x86_64 `mmap-munmap-1M` at 2 vCPUs is 3× the 1-vCPU cost because `munmap` sends a `TlbFlush` IPI (aarch64 uses broadcast `tlbi …is` instead), which TCG makes expensive
+
+### Go version matrix
+
+Decision D79, design §13/§15. go1.26.9 (`go install
+golang.org/dl/go1.26.9@latest && go1.26.9 download`, outside the repo) next
+to the default go1.27.1. `GO=go1.26.9 scripts/build-testapp.sh …` picks the
+toolchain (default `go`, unchanged behaviour). Each app was run with
+`patina.strace=1` on both arches, 1 vCPU; the ENOSYS set is the union of
+`[patina] ENOSYS` lines and strace lines ending `= -ENOSYS` (the silent
+by-design ones).
+
+| Name | Command | Observed |
+|---|---|---|
+| **gomatrix-1.26** | per arch: `GO=go1.26.9 scripts/build-testapp.sh <app> …`, `run-qemu.sh … -- patina.strace=1 -- <args>` for hello (`3 a b`, exit 3), threads, fdtest, fileio, signals (`-self`), sockets, unixsock, httphello (`-selftest`), bench (`-n 0.01`); the same with go1.27.1 | **18/18 PASS with go1.26.9 and 18/18 with go1.27.1** (`go version` of each binary checked). ENOSYS set identical for both versions and arches: only `copy_file_range` (fileio, silent by design, Go falls back to read/write); no `[patina] ENOSYS` line at all. The distinct-syscall sets per app are the same for both versions except timing noise (`sched_yield`, and `getpid`+`tgkill` from a preemption signal, appear in one version's run or the other's) |
+| **gomatrix-os-1.26** | `scripts/test-os.sh aarch64` with `$HOME/sdk/go1.26.9/bin` first in `PATH` (test-gopkg.sh runs plain `go test -c`; the `GO` knob does not reach it, a PATH shim does, no harness change) | `os aarch64 (cpus=1): 247 passed, 33 skipped (10 by our list), 0 failed, exit 0`; test binary `go1.26.9`; ENOSYS: `pidfd_open` only (as with 1.27). 247 vs 248 is the test set: 1.27 adds `TestFileFdWithConcurrentIO`, `TestReadDirFD`, `TestRootSymlinkNormalization` and drops `TestRootOpenatFallback` |
+
+- [x] Two-version matrix (go1.26.9, go1.27.1): same ENOSYS set, no behavioural difference — **gomatrix-1.26**, **gomatrix-os-1.26**
+- [x] Go 1.27.1 syscall numbers (`runtime/sys_linux_{amd64,arm64}.s`, `internal/runtime/syscall/linux`, `internal/syscall/unix`, `syscall`, `os`, `net`, `internal/poll`, `crypto/rand`, `time`) diffed against `kernel/src/syscall/mod.rs`: nothing on a normal path is missing; the unimplemented ones are listed in D79

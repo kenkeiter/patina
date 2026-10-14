@@ -34,6 +34,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod auxv;
+pub mod cred;
 pub mod epoll;
 pub mod errno;
 pub mod fs;
