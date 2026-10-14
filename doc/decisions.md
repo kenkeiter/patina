@@ -2878,7 +2878,11 @@ writable before receiving, and offers control data only the writable part
 of `msg_control`; `recvfrom` checks `addrlen` and the address buffer. An
 epoll event whose copy-out still fails (a page that cannot be filled) is
 put back on the ready list (`Epoll::unreport`, Linux `ep_send_events`),
-`EPOLLONESHOT` items re-armed.
+`EPOLLONESHOT` items re-armed. Writes are the mirror image: `write`,
+`pwrite64`, `writev`, `sendto` and `sendmsg` size their copy-in to
+`readable_prefix` (a short count for a buffer that runs into a hole, as
+Linux's copy-until-fault; EFAULT if nothing is readable; a datagram must
+be whole or EFAULT), and `getrandom` fills only the writable run.
 
 Divergences. When a buffer is only partly valid, patina returns a short
 count sized to the valid part *before* reading, and leaves the rest of the

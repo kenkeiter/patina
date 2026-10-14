@@ -322,7 +322,7 @@ pub fn restore_frame(frame: &mut TrapFrame) -> Result<(SigSet, StackT), ()> {
     let sc = &uc.uc_mcontext;
     // A non-canonical rip would fault the kernel's iretq; Linux turns that
     // into SIGSEGV too.
-    if sc.rip >= crate::arch::uspace::USER_VA_END as u64 {
+    if sc.rip >= 1 << 47 {
         return Err(());
     }
     frame.r8 = sc.r8;

@@ -142,7 +142,12 @@ pub fn getrandom(buf: usize, len: usize, flags: u32) -> SysResult {
     {
         return Err(Errno(EINVAL));
     }
-    let len = len.min(i32::MAX as usize);
+    // drivers/char/random.c: import_ubuf (count clamped to MAX_RW_COUNT,
+    // access_ok → EFAULT), then get_random_bytes_user copies until a
+    // fault and returns the partial count (EFAULT only if nothing was
+    // copied): sized up front to the writable run (D86).
+    let len = len.min(super::fs::MAX_RW);
+    let len = super::fs::out_room(buf, len)?;
     let mut chunk = [0u8; 256];
     let mut done = 0;
     while done < len {

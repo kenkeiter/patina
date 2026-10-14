@@ -28,7 +28,9 @@ use patina_abi::net::*;
 use patina_abi::signal::{SI_USER, SIGPIPE, SigInfo};
 use patina_inet::{AddrError, SOCKADDR_MAX, SockAddr};
 
-use super::fs::{MAX_RW, OBJ_RESERVE, clamp_iov_out, get, install, out_room, read_iov};
+use super::fs::{
+    MAX_RW, OBJ_RESERVE, clamp_iov_in, clamp_iov_out, get, install, out_room, read_iov,
+};
 use super::{SysResult, with_space};
 use crate::fs::file::{OpenFile, wait_ready};
 use crate::mm::heap;
@@ -402,10 +404,18 @@ fn send_common(
         }
         e
     };
+    // Only the readable part of the data is sent (D86): a stream sends
+    // that much (a short count, as Linux's copy-until-fault); a datagram
+    // must be whole, so a short one is EFAULT as on Linux.
+    let want = iov.total();
+    clamp_iov_in(&mut iov.v)?;
     let total = iov.total();
     if !o.is_stream() {
-        if total > o.max_dgram() {
+        if want > o.max_dgram() {
             return Err(Errno(EMSGSIZE));
+        }
+        if total < want {
+            return Err(Errno(EFAULT));
         }
         let mut k = heap::try_zeroed(total)?;
         iov.gather(&mut k)?;

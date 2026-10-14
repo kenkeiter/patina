@@ -326,10 +326,11 @@ fn set_times(dirfd: i32, p: &[u8], times: [SetTime; 2], flags: u32) -> SysResult
     Ok(0)
 }
 
+/// `utimensat(dirfd, path, times, flags)`, checked in Linux's order
+/// (`fs/utimes.c`): the times are copied first (EFAULT, EINVAL); a NULL
+/// path with a real `dirfd` is `do_utimes_fd`, where any flag is EINVAL;
+/// otherwise unknown flags are EINVAL (`do_utimes_path`).
 pub fn utimensat(dirfd: i32, path: usize, times: usize, flags: u32) -> SysResult {
-    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
-        return Err(Errno(EINVAL));
-    }
     let t = if times == 0 {
         [SetTime::Now, SetTime::Now]
     } else {
@@ -340,11 +341,17 @@ pub fn utimensat(dirfd: i32, path: usize, times: usize, flags: u32) -> SysResult
         ]
     };
     // A NULL path is futimens(dirfd).
-    if path == 0 {
-        if dirfd == AT_FDCWD {
-            return Err(Errno(patina_abi::errno::EFAULT));
+    if path == 0 && dirfd != AT_FDCWD {
+        if flags != 0 {
+            return Err(Errno(EINVAL));
         }
-        return set_times(dirfd, &[], t, flags | AT_EMPTY_PATH);
+        return set_times(dirfd, &[], t, AT_EMPTY_PATH);
+    }
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno(EINVAL));
+    }
+    if path == 0 {
+        return Err(Errno(patina_abi::errno::EFAULT));
     }
     let p = upath(path)?;
     set_times(dirfd, &p, t, flags)
