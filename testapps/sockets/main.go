@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math/rand"
@@ -510,7 +511,29 @@ func httpRoundTrip() {
 	ok("http.Server + http.Get, 1 MiB body")
 }
 
+// selfAddr: with -self <ip> (the ip= client address), TCP and UDP echo
+// over our own non-loopback address, which the stack must loop back.
+func selfAddr(ip string) {
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+	must(err, "listen on "+ip)
+	go echoServer(ln)
+	echoOnce("tcp", ln.Addr().String(), "hello self")
+	ln.Close()
+	// A wildcard listener reached through the own address.
+	ws, err := net.Listen("tcp", ":0")
+	must(err, "listen :0")
+	go echoServer(ws)
+	echoOnce("tcp", net.JoinHostPort(ip, fmt.Sprint(ws.Addr().(*net.TCPAddr).Port)), "hello self wildcard")
+	ws.Close()
+	ok("tcp echo over own address " + ip)
+}
+
 func main() {
+	self := flag.String("self", "", "also test echo over this own (ip=) address")
+	flag.Parse()
+	if *self != "" {
+		selfAddr(*self)
+	}
 	tcpEcho()
 	concurrent()
 	bulk()

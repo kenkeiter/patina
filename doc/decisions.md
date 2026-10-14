@@ -1654,5 +1654,5 @@ datagrams larger than the MTU (`EMSGSIZE`; no IP fragmentation), ICMP errors
 to UDP sockets, `SO_RCVTIMEO` on plain `read`/`write` (only the `recv*`/
 `send*`/`accept`/`connect` syscalls look at it; Go uses deadlines instead),
 `TCP_INFO` (`ENOPROTOOPT`), `sendmmsg`/`recvmmsg` (`ENOSYS`), multicast.
-Verified by testapps/sockets (24 checks, see the test) on both arches at 1, 2
+Verified by testapps/sockets (21 `ok` checks) on both arches at 1, 2
 and 4 vCPUs and by httphello `-selftest`.
