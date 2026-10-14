@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -192,6 +193,9 @@ type prober struct {
 	net  bool
 	mu   sync.Mutex
 	seq  int
+	done int
+	// volatile lists DTB offsets whose value differs between boots.
+	volatile []int
 }
 
 // boot runs one probe and returns start -> guest stop.
@@ -263,9 +267,21 @@ func (pr *prober) count(needle string) int {
 // TestVZProbeDTB learns what the device tree VZ hands the guest contains by
 // timing a probe kernel (see testdata/vzprobe.S): it reads the whole blob a
 // nibble per boot, decodes it, and scans PCI ECAM space for devices.
+// Results are recorded in doc/cli-contract.md.
+//
 // Opt-in: PATINA_VZ_PROBE=1 cli/scripts/vztest.sh -test.run TestVZProbeDTB -test.v
-// PATINA_VZ_PROBE_OUT=<file> saves the raw DTB; PATINA_VZ_PROBE_NET=1 adds
-// the NAT NIC.
+// (about 15-20 minutes for the full DTB). Other knobs:
+//
+//	PATINA_VZ_PROBE_OUT=<file>     save the raw DTB
+//	PATINA_VZ_PROBE_CACHE=<file>   resumable per-byte cache
+//	PATINA_VZ_PROBE_SEED=<file>    earlier cache counted as a first read
+//	PATINA_VZ_PROBE_UNIT_MS=N      ms per value step (default 10)
+//	PATINA_VZ_PROBE_SKIP_DTB=1     skip the DTB read
+//	PATINA_VZ_PROBE_ECAM=0x...     scan PCI bus 0 at this ECAM base
+//	PATINA_VZ_PROBE_WORDS=0x..,..  read 32-bit physical words (e.g. PL031)
+//	PATINA_VZ_PROBE_NEEDLES=a|b    count occurrences of strings in the DTB
+//	PATINA_VZ_PROBE_NET=1          add the NAT NIC
+//	PATINA_VZ_PROBE_OVERHEAD=1     just time 20 boots
 func TestVZProbeDTB(t *testing.T) {
 	if os.Getenv("PATINA_VZ_PROBE") == "" {
 		t.Skip("set PATINA_VZ_PROBE=1 (and run via cli/scripts/vztest.sh)")
@@ -274,7 +290,7 @@ func TestVZProbeDTB(t *testing.T) {
 	if err != nil {
 		t.Skip(err)
 	}
-	pr := &prober{t: t, img: img, dir: t.TempDir(), unit: 20 * time.Millisecond, net: os.Getenv("PATINA_VZ_PROBE_NET") != ""}
+	pr := &prober{t: t, img: img, dir: t.TempDir(), unit: probeUnit(), net: os.Getenv("PATINA_VZ_PROBE_NET") != ""}
 	var ds []time.Duration
 	for range 5 {
 		d, err := pr.boot(probeParams{mode: 0, mask: 0xff, unitMs: 1, needle: "\x01nomatch"})
@@ -289,6 +305,14 @@ func TestVZProbeDTB(t *testing.T) {
 	slices.Sort(ds)
 	pr.base = ds[len(ds)/2] // median: an occasional boot is ~15ms slow
 	t.Logf("baseline boot->stop (v=0): %v", ds)
+	if os.Getenv("PATINA_VZ_PROBE_OVERHEAD") != "" {
+		t0 := time.Now()
+		for range 20 {
+			pr.boot(probeParams{mode: 0, mask: 0xff, unitMs: 1, needle: "\x01nomatch"})
+		}
+		t.Logf("20 sequential v=0 boots: %s", time.Since(t0))
+		return
+	}
 
 	for _, n := range strings.Split(os.Getenv("PATINA_VZ_PROBE_NEEDLES"), "|") {
 		if n != "" {
@@ -296,38 +320,18 @@ func TestVZProbeDTB(t *testing.T) {
 		}
 	}
 
-	// totalsize, then every byte as two nibbles, in parallel.
-	hdr := pr.readBytes(0, 8)
-	size := int(binary.BigEndian.Uint32(hdr[4:]))
-	if binary.BigEndian.Uint32(hdr) != 0xd00dfeed || size < 40 || size > 1<<20 {
-		t.Fatalf("bad FDT header % x", hdr)
-	}
-	t0 := time.Now()
-	blob := pr.readBytes(0, size)
-	// Second pass; re-read disagreeing bytes until two reads agree.
-	again := pr.readBytes(0, size)
-	var volatile []int
-	for i := range blob {
-		// A few bytes differ on every boot (random seeds): give up on a
-		// byte after a handful of disagreeing reads and report it.
-		for n := 0; blob[i] != again[i]; n++ {
-			if n == 3 {
-				volatile = append(volatile, i)
-				break
-			}
-			blob[i], again[i] = again[i], pr.readBytes(i, 1)[0]
+	// Physical words (e.g. PL031 RTC data register 0x20050000).
+	for _, w := range strings.Split(os.Getenv("PATINA_VZ_PROBE_WORDS"), ",") {
+		var addr uint64
+		if _, err := fmt.Sscanf(w, "0x%x", &addr); err == nil {
+			host := time.Now().Unix()
+			v := pr.readWord(addr)
+			t.Logf("word %#x = %#x (%d; host unix time at start %d)", addr, v, v, host)
 		}
 	}
-	t.Logf("bytes that change between boots: %v", volatile)
-	t.Logf("read %d-byte DTB twice in %s", size, time.Since(t0).Round(time.Second))
-	if out := os.Getenv("PATINA_VZ_PROBE_OUT"); out != "" {
-		os.WriteFile(out, blob, 0o644)
+	if os.Getenv("PATINA_VZ_PROBE_SKIP_DTB") == "" {
+		pr.readDTB()
 	}
-	tree, err := decodeFDT(blob)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	t.Logf("device tree:\n%s", tree)
 
 	// PCI: scan bus 0 of the ECAM window named by the DTB.
 	if base := os.Getenv("PATINA_VZ_PROBE_ECAM"); base != "" {
@@ -347,44 +351,116 @@ func TestVZProbeDTB(t *testing.T) {
 	}
 }
 
-// readBytes reads n DTB bytes from off, a nibble per boot, 4 boots at a time.
+// readDTB reads the whole blob (totalsize from the header), saves it to
+// PATINA_VZ_PROBE_OUT and logs it decoded.
+func (pr *prober) readDTB() {
+	t := pr.t
+	hdr := pr.readBytes(0, 8)
+	size := int(binary.BigEndian.Uint32(hdr[4:]))
+	if binary.BigEndian.Uint32(hdr) != 0xd00dfeed || size < 40 || size > 1<<20 {
+		t.Fatalf("bad FDT header % x", hdr)
+	}
+	t0 := time.Now()
+	pr.volatile = nil
+	blob := pr.readBytes(0, size)
+	t.Logf("bytes that change between boots: %v", pr.volatile)
+	t.Logf("read %d-byte DTB in %s", size, time.Since(t0).Round(time.Second))
+	if out := os.Getenv("PATINA_VZ_PROBE_OUT"); out != "" {
+		os.WriteFile(out, blob, 0o644)
+	}
+	tree, err := decodeFDT(blob)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	t.Logf("device tree:\n%s", tree)
+
+}
+
+// readBytes reads n DTB bytes from off, a nibble per boot; each nibble is
+// read until two consecutive reads agree (bytes that never agree, such as
+// per-boot random seeds, are recorded in pr.volatile). Two boots run at a
+// time (more skews the timing). With PATINA_VZ_PROBE_CACHE set, finished
+// bytes are appended to that file and reused on the next run.
 func (pr *prober) readBytes(off, n int) []byte {
 	out := make([]byte, n)
-	type job struct{ i, shift int }
-	jobs := make(chan job)
-	errs := make(chan error, 1)
+	load := func(path string) map[int]byte {
+		m := map[int]byte{}
+		if b, err := os.ReadFile(path); err == nil {
+			for _, l := range strings.Split(string(b), "\n") {
+				var o, v int
+				if _, err := fmt.Sscanf(l, "%d %d", &o, &v); err == nil {
+					m[o] = byte(v)
+				}
+			}
+		}
+		return m
+	}
+	cpath := os.Getenv("PATINA_VZ_PROBE_CACHE")
+	cache := load(cpath)
+	// PATINA_VZ_PROBE_SEED: an earlier cache whose values count as a first
+	// read (a re-run at a larger unit then confirms them with one boot).
+	seed := load(os.Getenv("PATINA_VZ_PROBE_SEED"))
+	jobs := make(chan int)
 	done := make(chan struct{})
-	const par = 4
+	const par = 2
 	for w := 0; w < par; w++ {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			for j := range jobs {
-				v, err := pr.retry(probeParams{mode: 2, offset: uint64(off + j.i), shift: uint64(j.shift), mask: 0xf})
-				if err != nil {
-					select {
-					case errs <- err:
-					default:
+			for i := range jobs {
+				var b byte
+				stable := true
+				for sh := 0; sh < 8; sh += 4 {
+					p := probeParams{mode: 2, offset: uint64(off + i), shift: uint64(sh), mask: 0xf}
+					prev, ok := -1, false
+					if sv, has := seed[off+i]; has {
+						prev = int(sv>>sh) & 0xf
 					}
-					continue
+					for range 6 {
+						v, err := pr.retry(p)
+						if err != nil {
+							pr.t.Logf("byte %d: %v", off+i, err)
+							break
+						}
+						if v == prev {
+							ok = true
+							break
+						}
+						prev = v
+					}
+					stable = stable && ok
+					b |= byte(prev) << sh
 				}
 				pr.mu.Lock()
-				out[j.i] |= byte(v) << j.shift
+				out[i] = b
+				if !stable {
+					pr.volatile = append(pr.volatile, off+i)
+				} else if cpath != "" {
+					if f, err := os.OpenFile(cpath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+						fmt.Fprintf(f, "%d %d\n", off+i, b)
+						f.Close()
+					}
+				}
+				pr.done++
+				if pr.done%256 == 0 {
+					pr.t.Logf("progress: %d bytes", pr.done)
+				}
 				pr.mu.Unlock()
 			}
 		}()
 	}
 	for i := 0; i < n; i++ {
-		jobs <- job{i, 0}
-		jobs <- job{i, 4}
+		if v, ok := cache[off+i]; ok {
+			out[i] = v
+			continue
+		}
+		jobs <- i
 	}
 	close(jobs)
 	for w := 0; w < par; w++ {
 		<-done
 	}
-	select {
-	case err := <-errs:
-		pr.t.Fatal(err)
-	default:
+	if pr.t.Failed() {
+		pr.t.FailNow()
 	}
 	return out
 }
@@ -393,11 +469,18 @@ func (pr *prober) readBytes(off, n int) []byte {
 func (pr *prober) readWord(addr uint64) uint32 {
 	var w uint32
 	for sh := 0; sh < 32; sh += 4 {
-		v, err := pr.retry(probeParams{mode: 3, offset: addr, shift: uint64(sh), mask: 0xf})
-		if err != nil {
-			pr.t.Fatalf("read %#x: %v", addr, err)
+		prev := -1
+		for range 6 {
+			v, err := pr.retry(probeParams{mode: 3, offset: addr, shift: uint64(sh), mask: 0xf})
+			if err != nil {
+				pr.t.Fatalf("read %#x: %v", addr, err)
+			}
+			if v == prev {
+				break
+			}
+			prev = v
 		}
-		w |= uint32(v) << sh
+		w |= uint32(prev) << sh
 	}
 	return w
 }
@@ -446,8 +529,14 @@ func decodeFDT(b []byte) (string, error) {
 			depth--
 			fmt.Fprintf(&sb, "%s};\n", ind())
 		case 3: // PROP
+			if p+8 > len(b) {
+				return sb.String(), fmt.Errorf("truncated property at %d", p)
+			}
 			ln, no := int(be.Uint32(b[p:])), int(be.Uint32(b[p+4:]))
 			p += 8
+			if ln > len(b)-p || int(offStrings)+no >= len(b) {
+				return sb.String(), fmt.Errorf("bad property (len %d, name %d) at %d", ln, no, p-8)
+			}
 			v := b[p : p+ln]
 			p += (ln + 3) &^ 3
 			fmt.Fprintf(&sb, "%s%s%s;\n", ind(), cstr(int(offStrings)+no), fdtValue(v))
@@ -483,4 +572,14 @@ func fdtValue(v []byte) string {
 		return " = <" + strings.Join(w, " ") + ">"
 	}
 	return fmt.Sprintf(" = [% x]", v)
+}
+
+// probeUnit is the timing unit per value step (PATINA_VZ_PROBE_UNIT_MS,
+// default 10). Start-completion latency varies by a few ms under load, so
+// smaller units misread.
+func probeUnit() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("PATINA_VZ_PROBE_UNIT_MS")); err == nil && v > 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return 10 * time.Millisecond
 }

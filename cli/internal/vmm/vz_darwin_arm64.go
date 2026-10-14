@@ -464,10 +464,12 @@ func (m *vzDarwin) waitLoop(ew *os.File) {
 	}
 	m.waitRes = ex
 	m.free()
-	// Drain the console: EOF arrives once the framework drops the attachment.
+	// Drain the console. The framework does not reliably close its end of
+	// the pipe when the VM is released (EOF came in ~1 of 10 runs), so give
+	// in-flight output a short grace and stop reading.
 	select {
 	case <-m.copied:
-	case <-time.After(2 * time.Second):
+	case <-time.After(250 * time.Millisecond):
 		m.serial.SetReadDeadline(time.Now())
 		<-m.copied
 	}
