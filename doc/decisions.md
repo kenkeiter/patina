@@ -311,3 +311,121 @@ carries a robust flag decodes to an unknown command and gets `ENOSYS`, as it
 would on Linux < 7.2, instead of silently running the base op. Go does not use
 these flags. The layout check compares the mask with the 7.2 value minus the
 two flags.
+
+## D27: Arch/core split for user mode: `trap.rs` hooks and the `ctx`/`uspace`/`timer` contract
+*2026-10-14 · Phase 1*
+
+The arch layer owns entry/exit assembly, the `TrapFrame` layout, user page
+tables, context switch and the timer; it calls five hooks in
+`kernel/src/trap.rs` (`syscall`, `user_fault`, `user_exception`,
+`timer_tick`, `before_return_to_user`) and implements the interface
+documented in `kernel/src/arch/mod.rs` (`ctx::{TrapFrame, FpState,
+KernelContext, switch, enter_user}`, `uspace::UserTables`, `timer::{init,
+now_ns}`, `cpu::{set_kernel_stack, hwcap}`). The arch-neutral core
+(syscalls, address space, scheduler) lives entirely behind those hooks, so
+both arches were built in parallel against `patina.selftest=user|userfault|
+timer|switch` before any loader existed. Hook interrupt state is part of
+the contract: `syscall`/`user_fault`/`user_exception` run with IRQs
+enabled, `timer_tick` and `before_return_to_user` with IRQs masked. The
+kernel never dereferences a user virtual address (PAN on aarch64, SMAP on
+x86_64 would fault): all user memory goes through the address space and the
+direct map, so a kernel-mode fault is always a bug and stays fatal.
+
+## D28: aarch64 user FP/SIMD state is saved eagerly in the trap frame
+*2026-10-14 · Phase 1*
+
+Resolves D5. The kernel keeps the NEON-capable `aarch64-unknown-none`
+target (the soft-float target is not in the pinned toolchain), so every
+entry from EL0 saves q0–q31, FPCR and FPSR into the 832-byte `TrapFrame`
+on the kernel stack and every return to EL0 restores them. `FpState` is a
+zero-sized marker on aarch64 and `fp_save`/`fp_restore` are no-ops;
+`KernelContext` also saves d8–d15 (AAPCS64 callee-saved) because kernel
+code uses SIMD across `switch`. Cost is ~70 instructions per entry; a lazy
+scheme (trap on first FP use) can replace it later without changing the
+contract. x86_64 is the opposite: `x86_64-unknown-none` is soft-float, so
+user FP state is only saved on context switch, with XSAVE (XCR0 =
+x87|SSE|AVX, 832 bytes in a 1024-byte 64-aligned `FpState`) when
+CPUID advertises XSAVE+AVX and FXSAVE otherwise; AVX-512 is never enabled
+in XCR0, so Go will not use it. Consequence: on x86_64 the scheduler must
+call `fp_save`/`fp_restore` around every thread switch.
+
+## D29: aarch64 kernel stack overflow runs on a per-CPU overflow stack (closes D15)
+*2026-10-14 · Phase 1*
+
+The EL1h sync vector checks the stack before touching it (TPIDRRO_EL0 is
+used as scratch, which is safe because EL1 sync is always fatal): if `sp`
+is not 16-byte aligned or any of three `AT S1E1W` probes at `sp-16`,
+`sp-4096` and `sp-8192` fails, it switches to a 16 KiB per-CPU static
+overflow stack (`cpu::MAX_CPUS = 8`) and dumps from there. Three probes are
+needed because a one-page guard below a page-granular stack is passed
+through 832 bytes at a time; a single probe at `sp-8K` landed in mapped
+memory below the guard and recursed. Kernel stacks therefore need no
+alignment, only an unmapped guard page, which rules out carving them from
+the 2 MiB-block direct map: thread stacks get their own 4 KiB-mapped VA
+range. x86_64 keeps IST1 for `#DF`.
+
+## D30: GICv3 with a GICv2 fallback; virtual timer PPI 27 at 100 Hz
+*2026-10-14 · Phase 1*
+
+The aarch64 tick uses the EL1 virtual timer (CNTV_*) at `trap::TICK_HZ`
+(100 Hz), re-armed in the handler, with the distributor/redistributor
+bases taken from the DTB (`arm,gic-v3`; `arm,cortex-a15-gic` falls back to
+a GICv2 driver so `-M virt,gic-version=2` under TCG still works — HVF only
+supports GICv3). `timer::early_init` (boot) sets CNTKCTL_EL1.EL0VCTEN so
+EL0 can read CNTVCT (Go's `cputicks`). `irq::register(intid, handler)` is
+the hook for Phase 2 SGIs/IPIs and device IRQs; `gic::init_cpu` finds a
+CPU's redistributor by MPIDR for AP bring-up.
+
+## D31: EL0 `MRS` of ID registers is emulated; `HWCAP_CPUID` advertised
+*2026-10-14 · Phase 1*
+
+Go's arm64 runtime reads `MIDR_EL1` from user mode when `AT_HWCAP` has
+`HWCAP_CPUID` (as Linux sets). patina advertises it and emulates the
+resulting EC 0x18 trap in `exceptions::emulate_mrs` (MIDR, ID_AA64ISAR0/1,
+ID_AA64PFR0/1, ID_AA64MMFR*, CTR, REVIDR, with Linux's sanitised view where
+it matters). On CPUs without FEAT_IDST the access arrives as EC 0x00 and is
+treated as an illegal instruction. `AT_HWCAP` itself is
+`patina_abi::aarch64::hwcap::from_id_aa64isar0` plus FP/ASIMD/CPUID.
+
+## D32: x86_64 user-mode CPU setup
+*2026-10-14 · Phase 1*
+
+SYSCALL/SYSRET with `swapgs` and a per-CPU block reached through
+`KERNEL_GS_BASE` (`percpu.rs`: self pointer, kernel stack top, user rsp
+scratch, cpu id); STAR = kernel CS 0x08 / SYSRET base 0x18|3 (user data
+0x20, user code64 0x28 per D24), SFMASK = IF|TF|DF|AC|NT. `sysretq` is used
+only when the frame is safe (user CS/SS, rcx == rip, r11 == rflags,
+canonical rip, TF/RF clear), otherwise `iretq`; a fresh `enter_user` frame
+always takes `iretq`. FSGSBASE is enabled when CPUID has it (QEMU `-cpu
+max` does) and `AT_HWCAP2` gets `HWCAP2_FSGSBASE`; else the FS_BASE MSR is
+used. The FS base lives in the `TrapFrame` and is read/written on every
+entry/exit (uniform `tls()`/`set_tls()`; Phase 2 may skip unchanged
+values). SMEP and SMAP are enabled when available. Interrupts are enabled
+inside syscalls and user exceptions (after CR2 is read). `AT_HWCAP` is
+CPUID.1:EDX as Linux's `ELF_HWCAP`.
+
+## D33: x86_64 timer: xAPIC periodic timer calibrated against PIT channel 0
+*2026-10-14 · Phase 1*
+
+The LAPIC is driven as xAPIC MMIO at `IA32_APIC_BASE` (x2APIC MSRs only if
+firmware already enabled it), timer vector 0xec in periodic mode (divide
+16), spurious vector 0xff, LINT0/error LVTs masked, IOAPIC untouched. Both
+the LAPIC timer and the TSC are calibrated in one ~10 ms window on PIT
+channel 0 (mode 0, latch reads): channel 2 cannot be used on `microvm`
+(no port 0x61 gate). TCG measures TSC ≈ 1 GHz. CPUID 0x15 returns zeros
+under TCG, so that fallback is untested. The 8259 PICs are remapped to
+0x20/0x28 and fully masked at boot: `microvm` leaves them uninitialised
+(vector base 0), so the PIT's IRQ 0 arrived as `#DE` the first time IRQs
+were enabled. The tick handler sends EOI before calling `trap::timer_tick`
+so the hook may switch threads.
+
+## D34: `PROT_NONE` user pages keep their frame in an invalid descriptor
+*2026-10-14 · Phase 1*
+
+`UserTables::protect` to no permissions writes an invalid descriptor that
+still carries the frame address plus a software bit, so `translate` still
+reports the frame (flags = `USER` only), `unmap` returns it, and a later
+`protect` back to R/W/X restores the mapping without a new frame. Accesses
+fault as `NotPresent`. User page tables are never freed (one process per
+VM), everything runs under ASID 0 / without PCID, and `activate` does a full
+TLB flush; Phase 2 may add ASIDs.
