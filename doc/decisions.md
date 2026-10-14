@@ -1818,3 +1818,88 @@ capabilities and the MSI-X table, the KVM ITS with 64 KiB table pages, the
 MSHV v2m DTB override, and `msi-map` offsets for segment > 0. Not done:
 x86 INTx (`_PRT`), bridge renumbering, the swizzle for INTx behind bridges,
 per-queue MSI-X vectors, and LPIs targeted at CPUs other than the boot CPU.
+
+## D73: net package test run, skip list, read-only netlink, sendfile
+*2026-10-14 · Phase 4*
+
+`scripts/test-gonet.sh [--pkg net|net/http] [arch...]` is the network
+counterpart of `test-os.sh` (D65) and follows it: `go test -c` (static,
+`-trimpath`), the package directory at `/src/<pkg>` plus
+`$GOROOT/src/testdata` at `/src/testdata` (net's sendfile tests read
+`../testdata/Isaac.Newton-Opticks.txt`), `patina.cwd=/src/<pkg>`,
+`HOME=/root`, 1 GiB, a 900 s QEMU timeout, `-test.short -test.v
+-test.timeout 13m -test.skip ^(…)$` from `testapps/skiplist/<pkg>.txt`
+(`net.txt`; `net_http.txt` if net/http ever needs one), the same summary
+line and failure rules, logs in `out/test/gonet/`. It adds a slirp NIC
+(`PATINA_NET=user`) and the static `ip=10.0.2.15::10.0.2.2:255.255.255.0:
+patina:eth0:off:10.0.2.3` line the CLI passes, so `eth0` has an address and
+`/etc/resolv.conf` points at slirp's DNS. Knobs: `GONET_TEST_RUN`,
+`GONET_TEST_SHORT=0`, `GONET_TEST_TIMEOUT`, `PATINA_PARAMS`.
+
+The skip list follows the D65 policy and has two categories (35 entries).
+"AF_UNIX: pending" (34): every top-level test with a unix, unixgram or
+unixpacket case, since `socket(AF_UNIX)` is `EAFNOSUPPORT` until the AF_UNIX
+change is merged; most of them also have tcp/udp subtests that pass, and the
+list is to be emptied of these after the merge. "needs os/exec" (1):
+`TestSplice` runs its peer as a re-exec of the test binary. The tests skip
+54 themselves, mostly "no external network in -short mode" (31) and other
+`-short` skips; also the cgo resolver (3), `-ipv6`/`-tcpbig`/`-dnsflood`
+flags, `/etc/services` (absent), the pty test, MPTCP (`IPPROTO_MPTCP` is
+`EPROTONOSUPPORT`, Go falls back) and the raw-IP cases. Results with
+`-test.short`, both arches, 1 vCPU, and 4 vCPUs on each arch: 220 passed,
+89 skipped (35 by our list), 0 failed; three 2-vCPU reruns on aarch64 were
+identical. Without `-test.short` (2 vCPUs, both arches; the DNS and
+external-network tests then run over slirp and pass): 250 passed, 3 failed —
+the two multicast listener tests (`IP_ADD_MEMBERSHIP` etc. are
+`ENOPROTOOPT`: multicast is not implemented; `-short` skips them) and
+`TestSendfileWithLargeFile` (a multi-GiB file does not fit the RAM-backed
+`/tmp`). `net/http` needs no list: 611 passed, 10 skipped, 0 failed with
+`-short` on both arches (616/5/0 without it, aarch64, 2 vCPUs). The `os` run
+(D65) now also runs `TestLargeCopyViaNetwork`; `TestSpliceFile`,
+`TestGetPollFDAndNetwork` and `TestSendFile` pass their tcp subtests and stay
+listed as "AF_UNIX: pending" for their unix ones (os: 245 passed, 36 skipped,
+13 by the list, 0 failed, both arches). The only `ENOSYS` line in either run
+is `pidfd_open` (D57).
+
+Kernel changes the run needed:
+
+- **Read-only `AF_NETLINK` / `NETLINK_ROUTE`** (`net/netlink.rs`; layouts in
+  `patina_abi::netlink`; request parsing and reply encoding host-tested in
+  `patina_inet::netlink`; `SockAddr::Netlink` for `sockaddr_nl`).
+  `net.Interfaces`, `InterfaceAddrs`, `InterfaceByName/Index` and every test
+  that looks for the loopback interface go through `syscall.NetlinkRIB`;
+  without it the four interface tests failed outright. A send of a
+  `RTM_GETLINK` or `RTM_GETADDR` dump queues `RTM_NEWLINK` / `RTM_NEWADDR`
+  messages (`NLM_F_MULTI`, the request's seq, the socket's port id) packed
+  into datagrams of at most 4 KiB, then `NLMSG_DONE`; `RTM_GETLINK` by
+  index or name answers that one link; anything else gets `NLMSG_ERROR`
+  `-EOPNOTSUPP`. Each `recv` returns one datagram (truncation and
+  `MSG_PEEK` as for UDP). Interfaces come from the stack: `lo` (index 1,
+  `UP|LOOPBACK|RUNNING|LOWER_UP`, MTU 65536, `ARPHRD_LOOPBACK`) with
+  127.0.0.1/8 and ::1/128, and with a NIC `eth0` (index 2,
+  `UP|BROADCAST|MULTICAST|RUNNING|LOWER_UP`, MTU 1500, `ARPHRD_ETHER`, the
+  NIC's MAC) with the link-local and `ip=` addresses (IPv4 ones with
+  `IFA_LOCAL`, `IFA_LABEL` and `IFA_BROADCAST`). `bind` with pid 0 (or the
+  first send) assigns the process id, or a descending id from `0xfffff000`
+  when another socket holds it; an explicit pid in use is `EADDRINUSE`.
+  There are no multicast groups and nothing can be changed. `/proc/net/igmp`
+  and `/proc/net/igmp6` list the all-hosts / all-nodes groups (and the
+  solicited-node group of each non-loopback IPv6 address), in Linux's
+  format: `TestInterfaceMulticastAddrs` wants an IPv6 group when a
+  loopback interface and more than one IPv6 address exist.
+- **`sendfile`** was `ENOSYS`. Go then falls back to a plain copy, but the
+  net `TestSendfile*` tests check that `poll.SendFile` handled the write.
+  It now reads from the input with `pread` (at `*offset`, or at the file
+  position, which advances) and writes through the output's `write` with
+  the usual blocking rules; only what was written counts as consumed. An
+  unseekable input is `EINVAL`, as on Linux before 5.12.
+- **`socket(AF_INET*, SOCK_RAW, …)`** is `EPERM`, which is what a process
+  without `CAP_NET_RAW` gets (it was `ESOCKTNOSUPPORT`). The `TestIPConn*`
+  tests check only for uid 0, and they skip their raw cases on `EPERM`
+  through `testenv.SyscallIsNotSupported`.
+
+The TCP/UDP semantics the suite exercises (dual stack, `[::ffff:…]`
+forms, deadlines, close/shutdown races, `TestDialParallel`, the accept
+abort tests, zero-byte reads and writes, UDP `ReadFrom`/`WriteTo` edge
+cases, many short-lived connections) passed on the D67/D68 stack without
+changes.

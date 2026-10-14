@@ -515,6 +515,13 @@ mod tests {
             Some((IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 443))
         );
 
+        let nl = SockAddr::Netlink { pid: 1, groups: 0x10 };
+        let n = nl.encode(&mut buf);
+        assert_eq!(n, 12);
+        assert_eq!(&buf[..2], &AF_NETLINK.to_ne_bytes());
+        assert_eq!(SockAddr::parse(&buf[..n]).unwrap(), nl);
+        assert_eq!(SockAddr::parse(&buf[..8]), Err(AddrError::Invalid));
+
         buf[0..2].copy_from_slice(&99u16.to_ne_bytes());
         assert_eq!(SockAddr::parse(&buf[..16]), Err(AddrError::Family(99)));
 
