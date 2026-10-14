@@ -295,6 +295,7 @@ pub fn tick() {
     }
     let cpu = this_cpu();
     let woke = super::sleep::expire(timer::now_ns());
+    super::timers::tick();
     // SAFETY: IRQs masked (tick hook contract), this CPU's data.
     let idle = unsafe { (*cpu.current.get()).is_none() };
     if idle {

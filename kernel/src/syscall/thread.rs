@@ -84,7 +84,9 @@ pub fn exit(code: u64) -> ! {
     if ctid != 0 && with_space(|s| s.write_val(ctid, &0u32)).is_ok() {
         futex::wake(ctid, 1, FUTEX_BITSET_MATCH_ANY);
     }
-    if task::unregister_current() {
+    let last = task::unregister_current();
+    crate::task::timers::account_dead(t.cpu_time_ns());
+    if last {
         super::proc::exit_group(code);
     }
     sched::exit_current()

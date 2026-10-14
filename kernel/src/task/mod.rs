@@ -20,6 +20,7 @@ pub mod sched;
 pub mod selftest;
 pub mod signal;
 pub mod sleep;
+pub mod timers;
 pub mod wait;
 
 use alloc::boxed::Box;
@@ -266,6 +267,12 @@ impl Thread {
                 started: false,
             }),
         }
+    }
+
+    /// CPU time this thread has consumed (ns, user + sys).
+    pub fn cpu_time_ns(&self) -> u64 {
+        // PLACEHOLDER until the SMP worker's accounting lands: wall time since boot
+        crate::arch::timer::now_ns()
     }
 
     pub fn clear_child_tid(&self) -> u64 {
