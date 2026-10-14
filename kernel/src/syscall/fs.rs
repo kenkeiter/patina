@@ -267,6 +267,11 @@ pub fn write(fd: i32, buf: usize, len: usize) -> SysResult {
     if !of.flags().writable() {
         return Err(Errno(EBADF));
     }
+    // Linux vfs_write: access_ok on the whole count (EFAULT before a byte
+    // is written), then the MAX_RW_COUNT clamp.
+    if !access_ok(buf, len) {
+        return Err(Errno(EFAULT));
+    }
     write_from(&of, buf, len.min(MAX_RW))
 }
 
@@ -388,6 +393,9 @@ pub fn pwrite64(fd: i32, buf: usize, len: usize, off: i64) -> SysResult {
     let of = get(fd)?;
     if !of.flags().writable() {
         return Err(Errno(EBADF));
+    }
+    if !access_ok(buf, len) {
+        return Err(Errno(EFAULT));
     }
     let mut k = heap::try_zeroed(len.min(CHUNK))?;
     with_space(|s| s.copy_from_user(buf, &mut k))?;
