@@ -249,12 +249,15 @@ func bulk() {
 			return
 		}
 		defer c.Close()
+		wrote := make(chan struct{})
 		go func() {
 			c.Write(b)
 			c.(*net.UnixConn).CloseWrite()
+			close(wrote)
 		}()
 		h := sha256.New()
 		io.Copy(h, c)
+		<-wrote // don't close before our own data is out
 		var s [32]byte
 		copy(s[:], h.Sum(nil))
 		srvGot <- s
