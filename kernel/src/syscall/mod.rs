@@ -156,7 +156,7 @@ fn path_arg(n: usize) -> Option<usize> {
         | nr::RENAMEAT2
         | nr::LINKAT => Some(1),
         nr::SYMLINKAT => Some(2),
-        nr::CHDIR | nr::TRUNCATE | nr::STATFS => Some(0),
+        nr::CHDIR | nr::TRUNCATE | nr::STATFS | nr::UMOUNT2 => Some(0),
         #[cfg(target_arch = "x86_64")]
         nr::OPEN
         | nr::STAT
@@ -316,6 +316,7 @@ fn call(n: usize, a: &[u64; 6], frame: &mut TrapFrame) -> SysResult {
         nr::UMASK => path::umask_call(a[0] as u32),
         nr::STATFS => path::statfs(u(0), u(1)),
         nr::FSTATFS => path::fstatfs(i(0), u(1)),
+        nr::UMOUNT2 => path::umount2(u(0), a[1] as u32),
         nr::CHROOT => Err(Errno(EPERM)),
         nr::SETXATTR
         | nr::LSETXATTR
