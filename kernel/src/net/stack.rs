@@ -798,6 +798,10 @@ impl Stack {
                 crate::ctl::log_info(format_args!("{}", line));
                 if let (true, Some((ip, _)), Some(gw)) = (first, new.addr, new.gateway) {
                     self.mux.tx.arp_request(ip, gw);
+                    // This runs while a pass settles its sets, after the
+                    // pass's own flush: ring the doorbell for the request
+                    // now rather than at the next poll (up to 1 s away).
+                    self.mux.flush();
                 }
                 self.cfg = new;
             }
