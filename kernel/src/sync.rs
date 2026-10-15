@@ -112,7 +112,8 @@ impl<'a, T: ?Sized> SpinLockGuard<'a, T> {
     /// then releases the interface lock first).
     pub fn swap_irq_state<U: ?Sized>(&mut self, other: &mut SpinLockGuard<'_, U>) {
         core::mem::swap(&mut self.irq, &mut other.irq);
-    }}
+    }
+}
 
 impl<T: ?Sized> Deref for SpinLockGuard<'_, T> {
     type Target = T;

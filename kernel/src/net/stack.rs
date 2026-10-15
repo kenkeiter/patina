@@ -344,9 +344,7 @@ fn check_order(set: bool) {
     let f = crate::arch::irq::save_disable();
     let cpu = crate::arch::cpu::id();
     let iface = IFACE_CPU.load(Ordering::Relaxed) == cpu + 1;
-    let sets = SETS_HELD
-        .get(cpu)
-        .map_or(0, |c| c.load(Ordering::Relaxed));
+    let sets = SETS_HELD.get(cpu).map_or(0, |c| c.load(Ordering::Relaxed));
     crate::arch::irq::restore(f);
     if iface {
         panic!(
@@ -836,7 +834,8 @@ fn drain_hold(s: &mut Held, d: &mut Drain, buf: &mut [u8; MAX_FRAME]) -> bool {
                 if timing {
                     prof::add(&prof::RESCANS, 1);
                 }
-                d.work.extend(s.entries.iter().filter_map(|e| e.set.clone()));
+                d.work
+                    .extend(s.entries.iter().filter_map(|e| e.set.clone()));
             }
             return true;
         };

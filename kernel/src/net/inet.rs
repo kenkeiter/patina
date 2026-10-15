@@ -1557,9 +1557,8 @@ impl SocketOps for InetSocket {
             } else {
                 self.udp_recv(sock, sockets, buf, flags)
             };
-            let poll = !peek
-                && matches!(&r, Ok(info) if info.len > 0)
-                && window_update_due(sock, sockets);
+            let poll =
+                !peek && matches!(&r, Ok(info) if info.len > 0) && window_update_due(sock, sockets);
             (r, poll)
         })
     }
@@ -1677,8 +1676,10 @@ impl SocketOps for InetSocket {
     }
 
     fn timeouts(&self) -> (Option<u64>, Option<u64>) {
-        self.op(false, |sock, _, _, _| Ok((sock.opts.rcvtimeo, sock.opts.sndtimeo)))
-            .unwrap_or((None, None))
+        self.op(false, |sock, _, _, _| {
+            Ok((sock.opts.rcvtimeo, sock.opts.sndtimeo))
+        })
+        .unwrap_or((None, None))
     }
 }
 
