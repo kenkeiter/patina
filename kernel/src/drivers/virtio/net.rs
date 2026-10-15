@@ -27,7 +27,7 @@
 //!   buffer from the pairs in turn (round robin, so one busy queue cannot
 //!   starve the others), copies the frame out and re-posts the buffer.
 //!   All pairs feed the one smoltcp interface (D67).
-//! * Transmit: per pair up to 32 slots of 2 KiB (header + frame, one
+//! * Transmit: per pair up to 128 slots of 2 KiB (header + frame, one
 //!   device-readable descriptor). [`NetDevice::send`] uses the pair of the
 //!   current CPU (`cpu % P`), or the next pair with a free slot when that
 //!   one is full; `can_send` is false only when every pair is full, which
@@ -115,7 +115,7 @@ const IRQ_CPUS: usize = 16;
 /// Bytes per receive buffer / transmit slot.
 const BUF: usize = 2048;
 const RX_WANT: u16 = 128;
-const TX_WANT: u16 = 32;
+const TX_WANT: u16 = 128;
 /// Pending receive reposts / transmit frames after which a queue is
 /// kicked without waiting for `flush`.
 pub const RX_BATCH: u16 = 32;
@@ -132,7 +132,7 @@ struct Pair {
     /// Transmit slot of each in-flight descriptor head (u8::MAX = none).
     tx_slot_of: [u8; 128],
     /// Bit per free transmit slot.
-    tx_free: u32,
+    tx_free: u128,
     tx_slots: usize,
     /// MSI-X vector of both queues (0: the shared interrupt).
     vector: u16,
@@ -216,7 +216,11 @@ impl Pair {
             tx_buf: DmaBuf::new(tx_slots * BUF)?,
             tx,
             tx_slot_of: [u8::MAX; 128],
-            tx_free: ((1u64 << tx_slots) - 1) as u32,
+            tx_free: if tx_slots >= 128 {
+                u128::MAX
+            } else {
+                (1u128 << tx_slots) - 1
+            },
             tx_slots,
             vector,
             rx_pending: 0,
@@ -247,7 +251,7 @@ impl Pair {
         while let Some((h, _)) = self.tx.pop_used() {
             let s = core::mem::replace(&mut self.tx_slot_of[h as usize], u8::MAX);
             if s != u8::MAX {
-                self.tx_free |= 1 << s;
+                self.tx_free |= 1u128 << s;
             }
         }
     }
@@ -335,7 +339,7 @@ impl Pair {
             return false;
         };
         self.tx_slot_of[h as usize] = slot as u8;
-        self.tx_free &= !(1 << slot);
+        self.tx_free &= !(1u128 << slot);
         self.tx_pending += 1;
         if self.tx_pending > 1 {
             DB_COALESCED[1].fetch_add(1, Ordering::Relaxed);
