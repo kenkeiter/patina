@@ -1,8 +1,7 @@
 //! The TCP/IP stack (design §9, D67): one smoltcp `Interface` over the
 //! [`Mux`] devices (NIC + loopback), one smoltcp `SocketSet` per socket,
-//! the per-socket state of every inet socket (`inet::Sock`), the flow
-//! table, the bind table and the per-set poll timers, all behind one
-//! IRQ-safe `SpinLock<Stack>`.
+//! each behind its own lock, the flow table, the bind table and the
+//! per-set poll timers.
 //!
 //! **Socket sets.** smoltcp's `poll_egress` and `poll_delay` walk every
 //! socket of the set they are given, and its ingress scans the set for a
@@ -13,21 +12,61 @@
 //! DHCP client its own, and a closed TCP connection still finishing its
 //! shutdown (a zombie) keeps the set it had. `accept` moves the smoltcp
 //! socket from the listener's set into the new connection's (`remove` +
-//! `add`). Owners: [`Owner`].
+//! `add`). A slot also holds its owner's state ([`Owner`]: for an inet
+//! socket all of `inet::Sock`: kind, options, error, readiness hooks).
 //!
-//! **Ingress demux.** Frames are taken one at a time (loopback queue
-//! first, then the NIC: at most `MAX_INGRESS` NIC frames per pass) and their
-//! transport tuple read (`patina_inet::demux::parse`). The tuple is looked
-//! up (a) exactly in [`Stack::flows`] — connections (from `connect` on,
-//! including zombies) and a listener's not-yet-accepted connections
-//! (pointing at the listener's set until `accept` re-points them); (b)
-//! else by local port in [`Stack::bound`] — listeners and bound UDP sockets,
-//! an exact local address before a wildcard, only sockets that cover the
-//! packet's family; UDP 67 → 68 goes to the DHCP client; (c) else the
-//! frame goes to an empty set: smoltcp still answers ARP, ICMP echo and
-//! NDISC at the interface level, a TCP segment for no socket gets a RST and
-//! a UDP datagram an ICMP port unreachable, as before. The set gets the
-//! frame through a one-frame device (`mux::OneFrame`).
+//! **Locks.** Each slot is behind its own lock ([`SetLock`]; the inet
+//! socket's `File` holds the `Arc`). The interface lock (the
+//! `SpinLock<Stack>`) covers what all sockets share: the smoltcp
+//! `Interface`, the `Mux` (transmit routing, the loopback queue, the NIC
+//! handle), the empty set, the flow table, the port map, the bind table,
+//! the timers, the slot registry with each set's backlog, configuration
+//! and DHCP state. Lock order: **set lock → interface lock → leaves**
+//! (the virtio-net driver's lock, the heap). Nobody waits for a set lock
+//! while holding the interface lock or another set lock (a `try_lock` of a
+//! set under the interface lock is allowed: it never waits). Hooks
+//! (`Notify::fire`) run with no set or interface lock held: readiness is
+//! collected under the set lock and fired after it is released
+//! (fs/file.rs lock order). The interface lock is held for one set's
+//! smoltcp calls at a time (its ingress, egress until it has nothing more
+//! to send, `track`/refill, `poll_delay`); the syscall's own work
+//! (`send_slice`/`recv_slice`, readiness) runs under the set lock alone.
+//! `check_order` panics on a blocking acquisition that breaks the order.
+//!
+//! **Ingress demux.** Frames are taken one at a time under the interface
+//! lock (loopback queue first, then the NIC) into a buffer owned by the
+//! taker, and their transport tuple read (`patina_inet::demux::parse`). The
+//! tuple is looked up (a) exactly in [`Stack::flows`] — connections (from
+//! `connect` on, including zombies) and a listener's not-yet-accepted
+//! connections (pointing at the listener's set until `accept` re-points
+//! them); (b) else by local port in [`Stack::bound`] — listeners and bound
+//! UDP sockets, an exact local address before a wildcard, only sockets that
+//! cover the packet's family; UDP 67 → 68 goes to the DHCP client; (c)
+//! else the frame goes to an empty set (fed right there, under the
+//! interface lock alone): smoltcp still answers ARP, ICMP echo and NDISC at
+//! the interface level, a TCP segment for no socket gets a RST and a UDP
+//! datagram an ICMP port unreachable. A set gets its frame through a
+//! one-frame device (`mux::OneFrame`).
+//!
+//! **Backlogs (frame order).** A frame bound for set Y is fed while the
+//! interface lock is still held from its demux: the taker `try_lock`s Y
+//! and, if that succeeds, feeds it, polls Y's egress, settles it, and only
+//! then drops the interface lock (`SpinLockGuard::swap_irq_state` lets it
+//! release the interface lock before Y's). If Y is busy (a syscall on Y,
+//! another CPU feeding it), the frame is copied onto Y's backlog (in its
+//! registry entry, under the interface lock) and `SetLock::pending` set.
+//! Whoever holds Y feeds the backlog before anything else the next time it
+//! takes the interface lock, and every release of a set lock checks
+//! `pending` afterwards (`service`: a `try_lock`, so it never waits). The
+//! taker that queued a frame calls `service` too; with `SeqCst` fences on
+//! both sides either the taker gets the lock or the releasing holder sees
+//! the flag, so no frame is stranded. Frames of one set are therefore fed
+//! in the order they were taken off the device, however many CPUs take
+//! frames (re-validating the demux after re-locking, as an alternative,
+//! reorders segments of one flow between CPUs). A frame is bound to the set
+//! its demux named when it was taken: operations that move smoltcp sockets
+//! out of a set (`accept`, closing a listener) feed the set's backlog
+//! first; a set that is freed drops its backlog.
 //!
 //! Flow-table invariant: an entry exists for the tuple of every smoltcp TCP
 //! socket that has one (left `Listen`, or `connect`ed), and points at the
@@ -39,67 +78,84 @@
 //! deletes an entry that still points at the remover's set, so a newer
 //! socket with the same tuple keeps its entry. An exact match therefore
 //! always reaches the socket smoltcp itself would pick (a SYN for a tuple
-//! still in `TimeWait` reaches that socket).
+//! still in `TimeWait` reaches that socket). The flow table, port map,
+//! timers and registry are only touched under the interface lock, by a
+//! holder of the set concerned (or for a set not yet registered).
 //!
-//! **A poll pass** ([`Stack::pass`]) runs `poll_egress` on the sets that
-//! may have something to send (the syscall's own set, sets changed by an
-//! operation, sets whose timer is due), then takes received frames, feeds
-//! each to its set and queues that set for egress, and repeats (at most
-//! `MAX_ROUNDS` rounds) until nothing is queued and the loopback queue is
-//! empty. So a write is in the peer's receive buffer (over loopback)
-//! before the syscall returns, and the peer's ACK is processed too. Then
-//! the NIC's deferred doorbells are flushed (`Mux::flush`) and every set
-//! the pass touched is settled: `inet` turns smoltcp state transitions of
-//! its sockets into socket-API events (`track`), refills a listener's pool,
-//! recomputes readiness (`Sock::refresh`) and the set's next poll time
-//! (`poll_delay`, plus socket-level deadlines: connect timeout, deferred
-//! keep-alive, zombie linger). The earliest poll time per set lives in
-//! `timers`. ARP and ICMPv6 frames may teach the interface a neighbor that
-//! some set is waiting for, and a DHCP lease change may invalidate source
-//! addresses: those (rare) events queue every set once.
+//! **Polling a set** ([`Stack::run_set`], set and interface lock held):
+//! feed its backlog (and the frame at hand), `poll_egress` until it has
+//! nothing more to send, settle it (`inet::track`: smoltcp state
+//! transitions → socket-API events; a listener's pool refill; a zombie's
+//! reaping; DHCP events), then `poll_delay` plus socket-level deadlines
+//! (connect timeout, deferred keep-alive, zombie linger) → the set's timer
+//! in `timers`. Readiness (`inet::Sock::refresh`) is recomputed after the
+//! interface lock is dropped, under the set lock.
 //!
 //! Who polls:
 //!
-//! * the **net task** (a kernel thread): a pass over the due sets and the
-//!   received frames, fire readiness changes, then sleep on an `Event`
-//!   until the earliest timer (at most 1 s). The event is the NIC's (its
-//!   IRQ handler signals it and never takes the stack lock) or a
-//!   stack-owned one without a NIC;
-//! * every **socket syscall** that changes state (send, recv that read
-//!   data, connect, listen, accept, close, ...): a pass for its own set
-//!   right after the change, under the same lock hold. If that leaves an
-//!   earlier timer than the one the task sleeps on, it signals the event.
+//! * every **socket syscall** ([`sys`]): lock its set (feed a pending
+//!   backlog first), do the operation (taking the interface lock inside
+//!   when it needs shared state), poll the set if the operation changed
+//!   something, release, fire; then **drain** received frames (loopback
+//!   first, every one of them, then at most `SYS_BUDGET` NIC frames). So a
+//!   write is in the peer's receive buffer (over loopback) before the
+//!   syscall returns — or on its backlog while another CPU holds the peer,
+//!   to be fed before that holder lets go — and the peer's ACK is
+//!   processed too;
+//! * the **net task** (a kernel thread): polls the sets whose timer is due
+//!   (and the dirty ones: zombies made by closing a listener), drains with
+//!   the large budget (`TASK_BUDGET`), then sleeps on an `Event` until the
+//!   earliest timer (at most 1 s). The event is the NIC's (its IRQ handler
+//!   signals it and never takes a stack lock) or a stack-owned one without
+//!   a NIC. Other holders signal it when they file an earlier timer, leave
+//!   NIC frames behind (a syscall's budget ran out) or need a rescan.
 //!
-//! Readiness notifications are collected under the lock and fired after
-//! it is released (fs/file.rs lock order).
+//! ARP and ICMPv6 frames may teach the interface a neighbor that some set
+//! is waiting for, and a DHCP lease change may invalidate source addresses:
+//! those (rare) events make the drainer (or the net task) poll every set
+//! once (`rescan`).
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::ManuallyDrop;
 use core::net::{Ipv4Addr, Ipv6Addr};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering, fence};
 
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::socket::dhcpv4;
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Cidr, Ipv6Cidr};
 
-use super::inet::Sock;
+use super::device::MAX_FRAME;
+use super::inet::{self, Sock};
 use super::mux::Mux;
 use super::prof::{self, Site};
+use crate::arch::cpu::MAX_CPUS;
 use crate::drivers::Event;
 use crate::fs::file::Notify;
 use crate::sync::{OnceCell, SpinLock, SpinLockGuard};
-use core::sync::atomic::{AtomicBool, Ordering};
 use patina_inet::PortTable;
 use patina_inet::demux::{self, Flow, Parsed, PortMap};
 
 /// Longest the net task sleeps between polls.
 const MAX_WAIT_NS: u64 = 1_000_000_000;
-/// Egress/ingress rounds per [`Stack::pass`].
+/// Drain rounds (take frames until none is left, then poll every set if a
+/// rescan was asked for) per drain.
 const MAX_ROUNDS: usize = 64;
-/// Frames ingested per round (bounds the time spent under the lock).
-const MAX_INGRESS: usize = 1024;
+/// NIC frames the net task takes per drain.
+const TASK_BUDGET: usize = 1024;
+/// NIC frames a syscall takes per drain after its own poll: it helps, but
+/// does not do bulk work for everyone (the net task is kicked for the
+/// rest).
+const SYS_BUDGET: usize = 64;
+/// Loopback frames per drain (a drain normally empties the loopback queue).
+const LO_BUDGET: usize = 4096;
+/// Frames one set's backlog holds at most (beyond: dropped).
+const MAX_BACKLOG: usize = 1024;
 /// "No timer".
 pub const NEVER: u64 = u64::MAX;
 
@@ -130,18 +186,25 @@ pub struct NetConfig {
 
 /// The current effective configuration (default without a stack).
 pub fn effective_config() -> NetConfig {
-    get().map_or_else(NetConfig::default, |l| l.lock().cfg.clone())
+    match get() {
+        Some(_) => lock_at(Site::SysNoPoll).cfg.clone(),
+        None => NetConfig::default(),
+    }
 }
 
-/// Index of a [`Slot`] (a socket set) in [`Stack::slots`].
+/// Index of a [`Slot`] (a socket set) in the stack's registry.
 pub type SetId = usize;
 
 /// Who a socket set belongs to.
+// The socket's state lives inline: a slot is allocated once per socket,
+// and a box would add an indirection to every operation.
+#[allow(clippy::large_enum_variant)]
 pub enum Owner {
-    /// Unused slot (on the free list).
+    /// Released: no longer registered (a holder of a stale reference finds
+    /// this and does nothing).
     Free,
-    /// The inet socket with this id (`inet::Sock::set` is this slot).
-    Sock(u64),
+    /// An inet socket (its whole state).
+    Sock(Sock),
     /// A closed TCP connection finishing its shutdown: its handle, the
     /// give-up deadline (ns) and its flow-table entry.
     Zombie {
@@ -153,52 +216,72 @@ pub enum Owner {
     Dhcp(SocketHandle),
 }
 
-/// A socket set and its bookkeeping.
+/// A socket set and its owner.
 pub struct Slot {
+    /// Registry index (stale once `owner` is [`Owner::Free`]).
+    pub id: SetId,
     pub set: SocketSet<'static>,
     pub owner: Owner,
-    /// A TCP listener's set (its pool is refilled after every frame fed
-    /// to it).
-    pub listen: bool,
-    /// Poll time this set is filed under in `timers` ([`NEVER`]: none).
-    due: u64,
-    /// Round / pass in which this set was last queued for egress /
-    /// settling (dedups the queues).
-    q_mark: u64,
-    a_mark: u64,
 }
 
+/// A slot behind its lock (see the module docs).
+pub struct SetLock {
+    slot: SpinLock<Slot>,
+    /// The set's backlog is not empty (written under the interface lock;
+    /// read by whoever releases the set lock).
+    pending: AtomicBool,
+}
+
+pub type SetRef = Arc<SetLock>;
+
+impl SetLock {
+    fn new(slot: Slot) -> SetRef {
+        Arc::new(SetLock {
+            slot: SpinLock::new(slot),
+            pending: AtomicBool::new(false),
+        })
+    }
+}
+
+/// A registry entry (under the interface lock).
+struct Entry {
+    set: Option<SetRef>,
+    /// Poll time this set is filed under in `timers` ([`NEVER`]: none).
+    due: u64,
+    /// Frames taken for this set while its lock was busy, in order.
+    backlog: VecDeque<Box<[u8]>>,
+}
+
+/// What the interface lock covers (see the module docs).
 pub struct Stack {
     pub iface: Interface,
     pub mux: Mux,
-    /// Socket sets, by [`SetId`].
-    pub slots: Vec<Slot>,
-    free_slots: Vec<SetId>,
+    /// Socket sets by [`SetId`], with their timers and backlogs.
+    entries: Vec<Entry>,
+    free_ids: Vec<SetId>,
     live_sets: usize,
+    /// Open inet sockets (for `MAX_SOCKETS`).
+    pub nsocks: usize,
     /// Exact transport tuples → the set holding that TCP socket (see the
     /// module docs for the invariant).
     pub flows: BTreeMap<Flow, SetId>,
     /// Listeners and bound UDP sockets by local port → their set.
     pub bound: PortMap<SetId>,
-    /// Sets changed by an operation on another socket (a connection made
-    /// by `accept`, zombies made by `close`): queued by the next pass.
-    pub dirty: Vec<SetId>,
+    /// Sets the net task should poll (zombies made from a closed
+    /// listener's queue).
+    dirty: Vec<SetId>,
     /// Frames for no socket are fed to this (always empty) set.
     empty: SocketSet<'static>,
     /// (poll time ns, set): every set's earliest poll time.
     timers: BTreeSet<(u64, SetId)>,
-    /// Queue every live set in the next round (a neighbor may have been
-    /// learned, or the addresses changed).
+    /// Poll every registered set (a neighbor may have been learned, or the
+    /// addresses changed).
     rescan: bool,
-    /// The last pass stopped taking NIC frames at its budget.
+    /// The last drain stopped taking NIC frames at its budget.
     nic_backlog: bool,
-    round: u64,
-    pass_no: u64,
-    egress_q: Vec<SetId>,
-    after_q: Vec<SetId>,
+    /// Wake the net task when this hold ends (an earlier timer, work left).
+    kick: bool,
     pub ports: PortTable,
-    /// Per-socket state, by socket id (also the bind-table owner id).
-    pub socks: BTreeMap<u64, Sock>,
     pub next_id: u64,
     /// Static IPv4 default gateway (`ip=`), for route checks.
     pub gw4: Option<Ipv4Addr>,
@@ -236,7 +319,7 @@ pub fn flow_remove(flows: &mut BTreeMap<Flow, SetId>, f: Flow, i: SetId) {
     }
 }
 
-/// The stack, once [`init`] ran.
+/// The stack (its interface lock), once [`init`] ran.
 pub fn get() -> Option<&'static SpinLock<Stack>> {
     STACK.get()
 }
@@ -245,71 +328,76 @@ fn event() -> &'static Event {
     EVENT.get().copied().unwrap_or(&LOCAL_EVENT)
 }
 
-/// Run `f` on the stack for socket `id`; then, if `poll`, run a poll pass
-/// for that socket's set ([`Stack::pass`]), else just recompute its
-/// readiness and poll time. Readiness changes are fired after the lock is
-/// released, and the net task is woken if it should poll earlier than
-/// planned.
-pub fn with<R>(poll: bool, id: u64, f: impl FnOnce(&mut Stack) -> R) -> R {
-    with_cond(id, |s| (f(s), poll))
-}
+// -- Lock order check -----------------------------------------------------
 
-/// [`with`], where `f` decides whether to poll (a `recv` that read
-/// nothing changed nothing).
-pub fn with_cond<R>(id: u64, f: impl FnOnce(&mut Stack) -> (R, bool)) -> R {
-    let lock = get().expect("net: stack not initialised");
-    let (r, notify, kick, timing) = {
-        let mut s = lock_at(lock, Site::SysNoPoll);
-        let timing = s.prof;
-        let t = prof::start(timing);
-        let (r, poll) = f(&mut s);
-        prof::WITH_OP.done(t);
-        let origin = s.socks.get(&id).map(|x| x.set);
-        let n = if poll {
-            s.site = Site::SysPoll;
-            s.pass(origin, false)
-        } else {
-            s.settle(origin)
-        };
-        let kick = s.earliest() < s.task_deadline;
-        (r, n, kick, timing)
-    };
-    fire(notify, timing, false);
-    if kick {
-        if timing {
-            prof::add(&prof::KICKS, 1);
-        }
-        event().signal();
+/// CPU (+1) holding the interface lock; 0: none.
+static IFACE_CPU: AtomicUsize = AtomicUsize::new(0);
+/// Set locks held per CPU.
+static SETS_HELD: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
+
+/// Panic if this CPU is about to wait for a lock out of order: the
+/// interface lock while holding it, a set lock while holding the
+/// interface lock or another set lock. (A thread holding a spinlock
+/// cannot migrate: IRQs are masked.)
+fn check_order(set: bool) {
+    let f = crate::arch::irq::save_disable();
+    let cpu = crate::arch::cpu::id();
+    let iface = IFACE_CPU.load(Ordering::Relaxed) == cpu + 1;
+    let sets = SETS_HELD
+        .get(cpu)
+        .map_or(0, |c| c.load(Ordering::Relaxed));
+    crate::arch::irq::restore(f);
+    if iface {
+        panic!(
+            "net: {} lock wanted while holding the interface lock",
+            if set { "a socket-set" } else { "the interface" }
+        );
     }
-    r
+    if set && sets > 0 {
+        panic!("net: a socket-set lock wanted while holding another one");
+    }
 }
 
-/// The stack lock, held for `site`. With `patina.stats=1` the
+fn sets_held(delta: i8) {
+    if let Some(c) = SETS_HELD.get(crate::arch::cpu::id()) {
+        if delta > 0 {
+            c.fetch_add(1, Ordering::Relaxed);
+        } else {
+            c.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+// -- The interface lock ---------------------------------------------------
+
+/// The interface lock, held for `site`. With `patina.stats=1` the
 /// acquisition (contention, spin time) and the hold time are counted per
-/// site (`net::prof`), under the site the holder ends up as.
-pub struct Held<'a> {
-    g: SpinLockGuard<'a, Stack>,
+/// site (`net::prof`), under the site the holder ends up as. Dropping it
+/// wakes the net task if the hold asked for that (`Stack::kick`).
+pub struct Held {
+    g: ManuallyDrop<SpinLockGuard<'static, Stack>>,
     pub site: Site,
     t0: u64,
     /// Spin wait of a contended acquisition (ns), if it was contended.
     spin: Option<u64>,
 }
 
-impl core::ops::Deref for Held<'_> {
+impl core::ops::Deref for Held {
     type Target = Stack;
     fn deref(&self) -> &Stack {
         &self.g
     }
 }
 
-impl core::ops::DerefMut for Held<'_> {
+impl core::ops::DerefMut for Held {
     fn deref_mut(&mut self) -> &mut Stack {
         &mut self.g
     }
 }
 
-impl Drop for Held<'_> {
+impl Drop for Held {
     fn drop(&mut self) {
+        let kick = core::mem::take(&mut self.g.kick) && self.site != Site::Task;
         if self.t0 != 0 {
             let st = &prof::SITES[self.site as usize];
             prof::add(&st.acq, 1);
@@ -318,43 +406,209 @@ impl Drop for Held<'_> {
             }
             st.record_hold(prof::now().saturating_sub(self.t0));
         }
+        IFACE_CPU.store(0, Ordering::Relaxed);
+        // SAFETY: dropped exactly once, here.
+        unsafe { ManuallyDrop::drop(&mut self.g) };
+        if kick {
+            if prof::on() {
+                prof::add(&prof::KICKS, 1);
+            }
+            event().signal();
+        }
     }
 }
 
-/// Take the stack lock for `site` (every taker goes through here).
-pub fn lock_at(lock: &SpinLock<Stack>, site: Site) -> Held<'_> {
-    if !prof::on() {
-        let mut g = lock.lock();
-        g.prof = false;
-        return Held {
-            g,
-            site,
-            t0: 0,
-            spin: None,
+/// Take the interface lock for `site` (every taker but netlink's read-only
+/// snapshot goes through here).
+pub fn lock_at(site: Site) -> Held {
+    let lock = get().expect("net: stack not initialised");
+    check_order(false);
+    let (mut g, spin, t0) = if !prof::on() {
+        (lock.lock(), None, 0)
+    } else {
+        let (g, spin) = match lock.try_lock() {
+            Some(g) => (g, None),
+            None => {
+                let t = prof::now();
+                let g = lock.lock();
+                (g, Some(prof::now().saturating_sub(t)))
+            }
         };
+        if let Some(c) = prof::LOCK_CPU.get(crate::arch::cpu::id()) {
+            prof::add(c, 1);
+        }
+        let t0 = prof::now();
+        let _ = prof::T_FIRST.compare_exchange(0, t0, Ordering::Relaxed, Ordering::Relaxed);
+        (g, spin, t0)
+    };
+    g.prof = t0 != 0;
+    IFACE_CPU.store(crate::arch::cpu::id() + 1, Ordering::Relaxed);
+    Held {
+        g: ManuallyDrop::new(g),
+        site,
+        t0,
+        spin,
     }
-    let (mut g, spin) = match lock.try_lock() {
-        Some(g) => (g, None),
+}
+
+/// The interface lock, taken on first use by a set holder (a syscall's
+/// operation needs it only for shared state: binds, flows, routes).
+pub struct Iface {
+    h: Option<Held>,
+}
+
+impl Iface {
+    fn new() -> Iface {
+        Iface { h: None }
+    }
+
+    /// The stack, locking the interface if not yet held.
+    pub fn get(&mut self) -> &mut Stack {
+        self.at(Site::SysNoPoll)
+    }
+
+    /// The same, counted under `site` from here on.
+    fn at(&mut self, site: Site) -> &mut Held {
+        let h = self.h.get_or_insert_with(|| lock_at(site));
+        h.site = site;
+        h
+    }
+}
+
+// -- Set locks --------------------------------------------------------------
+
+/// A set lock (see the module docs). Releasing it feeds a backlog that
+/// built up meanwhile ([`service`]).
+pub struct SetGuard<'a> {
+    g: ManuallyDrop<SpinLockGuard<'a, Slot>>,
+    l: &'a SetLock,
+    t0: u64,
+    spin: Option<u64>,
+    /// Run [`service`] after release (not for `service`'s own guards).
+    serve: bool,
+}
+
+impl core::ops::Deref for SetGuard<'_> {
+    type Target = Slot;
+    fn deref(&self) -> &Slot {
+        &self.g
+    }
+}
+
+impl core::ops::DerefMut for SetGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Slot {
+        &mut self.g
+    }
+}
+
+impl Drop for SetGuard<'_> {
+    fn drop(&mut self) {
+        if self.t0 != 0 {
+            let st = &prof::SITES[Site::SetLock as usize];
+            prof::add(&st.acq, 1);
+            if let Some(ns) = self.spin {
+                st.record_spin(ns);
+            }
+            st.record_hold(prof::now().saturating_sub(self.t0));
+        }
+        sets_held(-1);
+        // SAFETY: dropped exactly once, here.
+        unsafe { ManuallyDrop::drop(&mut self.g) };
+        if self.serve {
+            fence(Ordering::SeqCst);
+            if self.l.pending.load(Ordering::Relaxed) {
+                service(self.l, Site::Drain);
+            }
+        }
+    }
+}
+
+fn set_guard<'a>(
+    l: &'a SetLock,
+    g: SpinLockGuard<'a, Slot>,
+    spin: Option<u64>,
+    timed: bool,
+) -> SetGuard<'a> {
+    sets_held(1);
+    SetGuard {
+        g: ManuallyDrop::new(g),
+        l,
+        t0: if timed { prof::now() } else { 0 },
+        spin,
+        serve: true,
+    }
+}
+
+/// Lock set `l` (waiting).
+pub fn lock_set(l: &SetLock) -> SetGuard<'_> {
+    check_order(true);
+    if !prof::on() {
+        return set_guard(l, l.slot.lock(), None, false);
+    }
+    match l.slot.try_lock() {
+        Some(g) => set_guard(l, g, None, true),
         None => {
             let t = prof::now();
-            let g = lock.lock();
-            (g, Some(prof::now().saturating_sub(t)))
+            let g = l.slot.lock();
+            set_guard(l, g, Some(prof::now().saturating_sub(t)), true)
         }
-    };
-    g.prof = true;
-    if let Some(c) = prof::LOCK_CPU.get(crate::arch::cpu::id()) {
-        prof::add(c, 1);
     }
-    let t0 = prof::now();
-    let _ = prof::T_FIRST.compare_exchange(0, t0, Ordering::Relaxed, Ordering::Relaxed);
-    Held { g, site, t0, spin }
+}
+
+/// Lock set `l` if it is free (allowed under the interface lock).
+fn try_lock_set(l: &SetLock) -> Option<SetGuard<'_>> {
+    let g = l.slot.try_lock()?;
+    Some(set_guard(l, g, None, prof::on()))
+}
+
+/// Feed set `l`'s backlog if it has one and its lock is free; repeat while
+/// frames keep arriving. Never waits for the set lock.
+fn service(l: &SetLock, site: Site) {
+    loop {
+        if !l.pending.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(mut g) = try_lock_set(l) else {
+            // The holder sees `pending` when it lets go.
+            return;
+        };
+        g.serve = false;
+        {
+            let mut s = lock_at(site);
+            s.run_set(&mut g, None, false);
+            s.mux.flush();
+        }
+        let n = refresh(&mut g);
+        drop(g);
+        fire(n, site == Site::Task);
+        fence(Ordering::SeqCst);
+    }
+}
+
+/// Recompute set `y`'s readiness (under its lock): the notification to
+/// fire once it is released.
+fn refresh(y: &mut Slot) -> Notify {
+    let Owner::Sock(sock) = &mut y.owner else {
+        return Notify::NONE;
+    };
+    let t = prof::start(prof::on());
+    let n = sock.refresh(&y.set);
+    if t != 0 {
+        prof::REFRESH.done(t);
+        prof::add(&prof::REFRESH_EVALS, 1);
+        prof::add(&prof::REFRESH_HOOKS, n.hooks() as u64);
+    }
+    n
 }
 
 /// Fire `n`; with stats on and at least one hook, count it as from the
 /// net task or from a syscall.
-fn fire(n: Notify, timing: bool, from_task: bool) {
+fn fire(n: Notify, from_task: bool) {
     let hooks = n.hooks() as u64;
-    if !timing || hooks == 0 {
+    if hooks == 0 {
+        return;
+    }
+    if !prof::on() {
         n.fire();
         return;
     }
@@ -369,78 +623,253 @@ fn fire(n: Notify, timing: bool, from_task: bool) {
     }
 }
 
-impl Stack {
-    // -- Socket sets ------------------------------------------------------
+// -- Entry points -------------------------------------------------------------
 
-    /// A new, empty socket set for `owner`.
-    pub fn alloc_set(&mut self, owner: Owner) -> SetId {
-        self.live_sets += 1;
-        if let Some(i) = self.free_slots.pop() {
-            let s = &mut self.slots[i];
-            s.owner = owner;
-            s.listen = false;
-            return i;
-        }
-        self.slots.push(Slot {
-            set: SocketSet::new(Vec::new()),
-            owner,
-            listen: false,
-            due: NEVER,
-            q_mark: 0,
-            a_mark: 0,
-        });
-        self.slots.len() - 1
+/// A socket syscall on set `l` (see the module docs): `f` does the
+/// operation under the set lock (taking the interface lock through the
+/// [`Iface`] if it needs to) and says whether the set must be polled
+/// (something to send, state changed). Then readiness is refreshed and
+/// fired, and if it polled, received frames are drained.
+pub fn sys<R>(l: &SetLock, f: impl FnOnce(&mut Slot, &mut Iface) -> (R, bool)) -> R {
+    let mut g = lock_set(l);
+    let mut ifc = Iface::new();
+    if l.pending.load(Ordering::Relaxed) {
+        // Frames that arrived while the set was busy come first.
+        ifc.get().run_set(&mut g, None, false);
     }
+    let t = prof::start(prof::on());
+    let (r, poll) = f(&mut g, &mut ifc);
+    prof::WITH_OP.done(t);
+    if poll {
+        ifc.at(Site::SysPoll).run_set(&mut g, None, true);
+    } else if let Some(h) = ifc.h.as_mut() {
+        // A backlog fed above may have queued replies.
+        h.mux.flush();
+    }
+    drop(ifc);
+    let n = refresh(&mut g);
+    drop(g);
+    fire(n, false);
+    if poll {
+        drain(Site::Drain, SYS_BUDGET);
+    }
+    r
+}
 
-    /// Release set `i`; its sockets must have been removed already.
-    pub fn free_set(&mut self, i: SetId) {
-        if matches!(self.slots[i].owner, Owner::Free) {
+/// `File::poll` of an inet socket: `f` runs under the set lock, after a
+/// pending backlog was fed.
+pub fn poll_file<R>(l: &SetLock, f: impl FnOnce(&mut Slot) -> R) -> R {
+    let mut g = lock_set(l);
+    let mut n = Notify::NONE;
+    if l.pending.load(Ordering::Relaxed) {
+        {
+            let mut s = lock_at(Site::FilePoll);
+            s.run_set(&mut g, None, false);
+            s.mux.flush();
+        }
+        n = refresh(&mut g);
+    }
+    let r = f(&mut g);
+    drop(g);
+    fire(n, false);
+    r
+}
+
+/// Lock the interface for a socket being created (no set yet).
+pub fn lock_new() -> Held {
+    lock_at(Site::SysNoPoll)
+}
+
+/// Poll set `l` (egress, settle, timer) and fire its readiness.
+fn poll_set(l: &SetLock, site: Site) {
+    let mut g = lock_set(l);
+    {
+        let mut s = lock_at(site);
+        s.run_set(&mut g, None, true);
+    }
+    let n = refresh(&mut g);
+    drop(g);
+    fire(n, site == Site::Task);
+}
+
+/// Take received frames — the loopback queue first (up to `LO_BUDGET`),
+/// then at most `budget` from the NIC — and feed each to its set (see the
+/// module docs); then poll every set if a rescan was asked for, and take
+/// the frames that produced, for at most `MAX_ROUNDS` rounds.
+fn drain(site: Site, budget: usize) {
+    let mut buf = [0u8; MAX_FRAME];
+    let mut nic_n = 0;
+    let mut lo_n = 0;
+    let mut work: Vec<SetRef> = Vec::new();
+    let from_task = site == Site::Task;
+    for _ in 0..MAX_ROUNDS {
+        loop {
+            let mut s = lock_at(site);
+            let timing = s.prof;
+            let t = prof::start(timing);
+            let Some((len, nic)) = s.mux.next_frame(lo_n < LO_BUDGET, nic_n < budget, &mut buf)
+            else {
+                prof::INGRESS_NONE.done(t);
+                s.mux.flush();
+                s.nic_backlog = nic_n >= budget;
+                if s.nic_backlog || s.mux.lo_pending() {
+                    s.kick = true;
+                }
+                if s.rescan {
+                    s.rescan = false;
+                    if timing {
+                        prof::add(&prof::RESCANS, 1);
+                    }
+                    work.extend(s.entries.iter().filter_map(|e| e.set.clone()));
+                }
+                break;
+            };
+            if nic {
+                nic_n += 1;
+            } else {
+                lo_n += 1;
+            }
+            let f = &buf[..len];
+            let Some(id) = s.demux(f) else {
+                let now = now();
+                let Stack {
+                    iface, mux, empty, ..
+                } = &mut *s;
+                let _ = iface.poll_ingress_single(now, &mut mux.one_frame(f), empty);
+                prof::INGRESS.done(t);
+                if timing {
+                    prof::add(&prof::INGRESS_PKTS, 1);
+                }
+                continue;
+            };
+            let e = &mut s.entries[id];
+            let Some(r) = e.set.clone() else {
+                continue; // not expected: demux only names registered sets
+            };
+            if e.backlog.is_empty()
+                && let Some(mut g) = try_lock_set(&r)
+            {
+                s.run_set(&mut g, Some(f), false);
+                // Release the interface lock before the set's.
+                g.g.swap_irq_state(&mut s.g);
+                drop(s);
+                let n = refresh(&mut g);
+                drop(g);
+                fire(n, from_task);
+                continue;
+            }
+            if e.backlog.len() < MAX_BACKLOG {
+                e.backlog.push_back(Box::from(f));
+                r.pending.store(true, Ordering::Relaxed);
+                if timing {
+                    prof::add(&prof::BACKLOGGED, 1);
+                }
+            } else if timing {
+                prof::add(&prof::BACKLOG_DROPS, 1);
+            }
+            drop(s);
+            fence(Ordering::SeqCst);
+            service(&r, site);
+        }
+        if work.is_empty() {
             return;
         }
-        self.unschedule(i);
-        let s = &mut self.slots[i];
-        s.owner = Owner::Free;
-        s.listen = false;
-        if s.set.iter().next().is_some() {
-            // Not expected: drop whatever is left rather than hand it to
-            // the next owner.
-            s.set = SocketSet::new(Vec::new());
+        for r in work.drain(..) {
+            poll_set(&r, site);
         }
-        self.free_slots.push(i);
+    }
+}
+
+impl Stack {
+    // -- Registry -----------------------------------------------------------
+
+    /// A registry index for a new set (filled by [`Stack::register`]; give
+    /// it back with [`Stack::unreserve`] if the set is not made).
+    pub fn reserve_set(&mut self) -> SetId {
+        if let Some(i) = self.free_ids.pop() {
+            return i;
+        }
+        self.entries.push(Entry {
+            set: None,
+            due: NEVER,
+            backlog: VecDeque::new(),
+        });
+        self.entries.len() - 1
+    }
+
+    pub fn unreserve(&mut self, i: SetId) {
+        self.free_ids.push(i);
+    }
+
+    /// Register `slot` (its `id` from [`Stack::reserve_set`]) and file its
+    /// first poll time. It is reachable by the demux once the flow table or
+    /// port map points at it.
+    pub fn register(&mut self, slot: Slot) -> SetRef {
+        let id = slot.id;
+        let now_ns = crate::arch::timer::now_ns();
+        let at = match self
+            .iface
+            .poll_delay(Instant::from_micros((now_ns / 1000) as i64), &slot.set)
+        {
+            Some(d) => now_ns.saturating_add(d.total_micros().saturating_mul(1000)),
+            None => NEVER,
+        };
+        let r = SetLock::new(slot);
+        self.entries[id].set = Some(r.clone());
+        self.live_sets += 1;
+        self.schedule(id, at);
+        r
+    }
+
+    /// Release set `y` (registered; held by the caller): no timer, no
+    /// backlog, not registered; its owner becomes [`Owner::Free`]. Its
+    /// sockets must have been removed and its flow-table / port-map entries
+    /// dropped. Called once per set (its owner may already be `Free`).
+    pub fn unregister(&mut self, y: &mut Slot) {
+        let id = y.id;
+        if self.entries[id].set.is_none() {
+            return;
+        }
+        self.unschedule(id);
+        let e = &mut self.entries[id];
+        e.backlog.clear();
+        if let Some(r) = e.set.take() {
+            r.pending.store(false, Ordering::Relaxed);
+        }
+        self.free_ids.push(id);
         self.live_sets -= 1;
+        y.owner = Owner::Free;
+        if y.set.iter().next().is_some() {
+            // Not expected: drop whatever is left.
+            y.set = SocketSet::new(Vec::new());
+        }
     }
 
-    /// The socket set `i`.
-    pub fn set(&mut self, i: SetId) -> &mut SocketSet<'static> {
-        &mut self.slots[i].set
-    }
-
-    /// Point the flow table's entry for `f` at set `i`.
-    pub fn flow_insert(&mut self, f: Flow, i: SetId) {
-        self.flows.insert(f, i);
-    }
-
-    /// Remove the entry for `f` if it still points at set `i`.
-    pub fn flow_remove(&mut self, f: Flow, i: SetId) {
-        flow_remove(&mut self.flows, f, i);
+    /// Have the net task poll set `i` soon (it may have something to send).
+    pub fn mark_dirty(&mut self, i: SetId) {
+        self.dirty.push(i);
+        self.kick = true;
     }
 
     fn unschedule(&mut self, i: SetId) {
-        let d = self.slots[i].due;
+        let d = self.entries[i].due;
         if d != NEVER {
             self.timers.remove(&(d, i));
-            self.slots[i].due = NEVER;
+            self.entries[i].due = NEVER;
         }
     }
 
     fn schedule(&mut self, i: SetId, at: u64) {
-        if self.slots[i].due == at {
+        if self.entries[i].due == at {
             return;
         }
         self.unschedule(i);
         if at != NEVER {
             self.timers.insert((at, i));
-            self.slots[i].due = at;
+            self.entries[i].due = at;
+            if at < self.task_deadline {
+                self.kick = true;
+            }
         }
     }
 
@@ -452,143 +881,152 @@ impl Stack {
         self.timers.first().map_or(NEVER, |&(t, _)| t)
     }
 
-    /// Queue set `i` for egress in the current round.
-    fn enqueue(&mut self, i: SetId) {
-        let s = &mut self.slots[i];
-        if s.q_mark != self.round {
-            s.q_mark = self.round;
-            self.egress_q.push(i);
-        }
-    }
-
-    /// Queue set `i` for settling at the end of the pass.
-    fn touch(&mut self, i: SetId) {
-        let s = &mut self.slots[i];
-        if s.a_mark != self.pass_no {
-            s.a_mark = self.pass_no;
-            self.after_q.push(i);
-        }
-    }
-
-    // -- Poll passes ------------------------------------------------------
-
-    /// One poll pass (see the module docs): egress for `origin`, the dirty
-    /// sets and (if `due`) the sets whose timer expired; then received
-    /// frames, each fed to its set, whose egress follows in the next round;
-    /// then flush the NIC and settle every set touched. Returns the
-    /// readiness notifications to fire.
-    pub fn pass(&mut self, origin: Option<SetId>, due: bool) -> Notify {
-        let timing = self.prof;
-        let t_all = prof::start(timing);
-        let now = now();
-        let now_ns = crate::arch::timer::now_ns();
-        let t = prof::start(timing);
-        self.iface.poll_maintenance(now);
+    /// The net task's share: the dirty sets, the sets whose timer is due
+    /// (timer cleared), every set when a rescan was asked for.
+    fn collect_due(&mut self, work: &mut Vec<SetRef>) {
+        let t = prof::start(self.prof);
+        self.iface.poll_maintenance(now());
         prof::MAINT.done(t);
-        self.pass_no += 1;
-        self.round += 1;
-        if let Some(o) = origin {
-            self.enqueue(o);
-        }
+        let now_ns = crate::arch::timer::now_ns();
         while let Some(i) = self.dirty.pop() {
-            if !matches!(self.slots[i].owner, Owner::Free) {
-                self.enqueue(i);
+            if let Some(r) = &self.entries[i].set {
+                work.push(r.clone());
             }
         }
-        if due {
-            while let Some(&(at, i)) = self.timers.first() {
-                if at > now_ns {
-                    break;
-                }
-                self.timers.pop_first();
-                self.slots[i].due = NEVER;
-                self.enqueue(i);
+        while let Some(&(at, i)) = self.timers.first() {
+            if at > now_ns {
+                break;
+            }
+            self.timers.pop_first();
+            self.entries[i].due = NEVER;
+            if let Some(r) = &self.entries[i].set {
+                work.push(r.clone());
             }
         }
         if self.rescan {
-            self.rescan_all();
+            self.rescan = false;
+            if self.prof {
+                prof::add(&prof::RESCANS, 1);
+            }
+            work.extend(self.entries.iter().filter_map(|e| e.set.clone()));
         }
-        for round in 0..MAX_ROUNDS {
-            let mut q = core::mem::take(&mut self.egress_q);
-            self.round += 1;
-            for &i in &q {
-                self.egress(i, now);
-                self.touch(i);
-            }
-            if timing {
-                prof::add(&prof::SETS_EGRESSED, q.len() as u64);
-            }
-            q.clear();
-            self.egress_q = q;
-            // NIC frames only in the first round (at most MAX_INGRESS per
-            // pass): later rounds only carry the loopback replies, so a
-            // steady stream from the NIC cannot keep one pass going.
-            let nic = round == 0;
-            let mut n = 0;
-            while n < MAX_INGRESS {
+    }
+
+    // -- Polling one set ------------------------------------------------------
+
+    /// Poll set `y` (its lock and the interface lock held; see the module
+    /// docs): feed its backlog and `frame`, run its egress (if `egress` or
+    /// a frame was fed) until it has nothing more to send, settle it, file
+    /// its next poll time. Readiness is left to the caller ([`refresh`],
+    /// after the interface lock is dropped).
+    pub fn run_set(&mut self, y: &mut Slot, frame: Option<&[u8]>, egress: bool) {
+        if matches!(y.owner, Owner::Free) {
+            return;
+        }
+        let timing = self.prof;
+        let t_all = prof::start(timing);
+        let now_ns = crate::arch::timer::now_ns();
+        let now = Instant::from_micros((now_ns / 1000) as i64);
+        let mut fed = self.feed_backlog_at(y, now);
+        if let Some(f) = frame {
+            self.feed(y, f, now);
+            fed = true;
+        }
+        if egress || fed {
+            self.egress(y, now);
+        }
+        let own = match y.owner {
+            Owner::Free => None,
+            Owner::Sock(_) => self.track(y, now_ns),
+            Owner::Zombie { .. } => match inet::reap(self, y, now_ns) {
+                Some(d) => d,
+                None => {
+                    prof::POLL_ALL.done(t_all);
+                    return;
+                }
+            },
+            Owner::Dhcp(_) => {
                 let t = prof::start(timing);
-                let Some(len) = self.mux.next_frame(nic) else {
-                    prof::INGRESS_NONE.done(t);
-                    break;
-                };
-                n += 1;
-                self.ingest(len, now, t);
+                self.dhcp_events(y);
+                prof::DHCP_EV.done(t);
+                None
             }
-            if nic {
-                // Budget used up: frames may be left for the next pass.
-                self.nic_backlog = n == MAX_INGRESS;
-            }
-            if self.rescan {
-                self.rescan_all();
-            }
-            if self.egress_q.is_empty() && !self.mux.lo_pending() {
-                break;
-            }
-        }
-        // Deferred NIC doorbells (receive buffers reposted, frames queued).
-        self.mux.flush();
-        let mut notify = Notify::NONE;
-        let mut q = core::mem::take(&mut self.after_q);
-        for &i in &q {
-            notify = notify.and(self.after(i, now, now_ns, true));
-        }
-        q.clear();
-        self.after_q = q;
+        };
+        let t = prof::start(timing);
+        let at = match self.iface.poll_delay(now, &y.set) {
+            Some(d) => now_ns.saturating_add(d.total_micros().saturating_mul(1000)),
+            None => NEVER,
+        };
+        prof::DEADLINE.done(t);
+        self.schedule(y.id, own.map_or(at, |o| o.min(at)));
         if timing {
-            let n = self.socks.len() as u64;
-            prof::max(&prof::MAX_SOCKS, n);
-            prof::max(&prof::MAX_SET, self.live_sets as u64);
+            prof::add(&prof::SETS_EGRESSED, (egress || fed) as u64);
             if prof::get(&prof::POLL_ALL.calls).is_multiple_of(prof::SET_SAMPLE) {
                 prof::add(&prof::SET_SUM, self.live_sets as u64);
-                prof::add(&prof::SOCKS_SUM, n);
+                prof::add(&prof::SOCKS_SUM, self.nsocks as u64);
                 prof::add(&prof::SET_SAMPLES, 1);
             }
+            prof::max(&prof::MAX_SOCKS, self.nsocks as u64);
+            prof::max(&prof::MAX_SET, self.live_sets as u64);
         }
         prof::POLL_ALL.done(t_all);
-        notify
     }
 
-    /// Queue every live set (rare: see [`Stack::rescan`]).
-    fn rescan_all(&mut self) {
-        self.rescan = false;
-        if self.prof {
-            prof::add(&prof::RESCANS, 1);
+    /// Feed set `y`'s backlog (its lock held), e.g. before moving a socket
+    /// out of it. Returns whether there was one (its replies are sent by
+    /// the next egress of `y`).
+    pub fn feed_backlog(&mut self, y: &mut Slot) -> bool {
+        self.feed_backlog_at(y, now())
+    }
+
+    fn feed_backlog_at(&mut self, y: &mut Slot, now: Instant) -> bool {
+        if matches!(y.owner, Owner::Free) {
+            return false;
         }
-        for i in 0..self.slots.len() {
-            if !matches!(self.slots[i].owner, Owner::Free) {
-                self.enqueue(i);
-            }
+        let e = &mut self.entries[y.id];
+        if e.backlog.is_empty() {
+            return false;
+        }
+        if let Some(r) = &e.set {
+            r.pending.store(false, Ordering::Relaxed);
+        }
+        let mut q = core::mem::take(&mut e.backlog);
+        for f in q.drain(..) {
+            self.feed(y, &f, now);
+        }
+        // Keep the deque's capacity (nothing was queued meanwhile: the
+        // interface lock is held).
+        self.entries[y.id].backlog = q;
+        true
+    }
+
+    /// Feed one received frame to set `y`.
+    fn feed(&mut self, y: &mut Slot, f: &[u8], now: Instant) {
+        let timing = self.prof;
+        let t = prof::start(timing);
+        let _ = self
+            .iface
+            .poll_ingress_single(now, &mut self.mux.one_frame(f), &mut y.set);
+        prof::INGRESS.done(t);
+        if timing {
+            prof::add(&prof::INGRESS_PKTS, 1);
+        }
+        if let Owner::Sock(sock) = &mut y.owner
+            && inet::is_listener(sock)
+        {
+            // A burst of SYNs must each find a listening socket.
+            let t = prof::start(timing);
+            inet::refill(sock, &mut y.set, y.id, &mut self.flows);
+            prof::REFILL.done(t);
         }
     }
 
-    /// `poll_egress` on set `i` until it has nothing more to send.
-    fn egress(&mut self, i: SetId, now: Instant) {
+    /// `poll_egress` on set `y` until it has nothing more to send.
+    fn egress(&mut self, y: &mut Slot, now: Instant) {
         let timing = self.prof;
         loop {
             let t = prof::start(timing);
-            let r = self
-                .iface
-                .poll_egress(now, &mut self.mux, &mut self.slots[i].set);
+            let r = self.iface.poll_egress(now, &mut self.mux, &mut y.set);
             if r == PollResult::None {
                 prof::EGRESS_NONE.done(t);
                 break;
@@ -600,47 +1038,33 @@ impl Stack {
         }
     }
 
-    /// Feed the received frame (`len` bytes in the mux's buffer) to its
-    /// set; `t` is when taking it started (stats).
-    fn ingest(&mut self, len: usize, now: Instant, t: u64) {
+    /// Settle inet socket set `y` after a poll (`inet::track`, a
+    /// listener's refill); returns the socket's own next deadline.
+    fn track(&mut self, y: &mut Slot, now_ns: u64) -> Option<u64> {
         let timing = self.prof;
-        let target = self.demux(len);
-        let Stack {
-            iface,
-            mux,
-            slots,
-            empty,
-            ..
-        } = self;
-        let set = match target {
-            Some(i) => &mut slots[i].set,
-            None => empty,
+        let Slot { id, set, owner } = y;
+        let Owner::Sock(sock) = owner else {
+            return None;
         };
-        let _ = iface.poll_ingress_single(now, &mut mux.one_frame(len), set);
-        prof::INGRESS.done(t);
-        if timing {
-            prof::add(&prof::INGRESS_PKTS, 1);
+        let t = prof::start(timing);
+        inet::track(sock, set, *id, &mut self.flows, now_ns);
+        if t != 0 {
+            prof::TRACK.done(t);
+            prof::add(&prof::TRACK_SOCKS, 1);
         }
-        let Some(i) = target else {
-            return;
-        };
-        self.enqueue(i);
-        self.touch(i);
-        if self.slots[i].listen
-            && let Owner::Sock(id) = self.slots[i].owner
-        {
-            // A burst of SYNs must each find a listening socket.
+        if inet::is_listener(sock) {
             let t = prof::start(timing);
-            self.refill(id);
+            inet::refill(sock, set, *id, &mut self.flows);
             prof::REFILL.done(t);
         }
+        sock.own_deadline()
     }
 
-    /// The set the received frame (`len` bytes) belongs to; `None`: no
-    /// socket's (see the module docs).
-    fn demux(&mut self, len: usize) -> Option<SetId> {
+    /// The set the received frame `f` belongs to; `None`: no socket's (see
+    /// the module docs).
+    fn demux(&mut self, f: &[u8]) -> Option<SetId> {
         let timing = self.prof;
-        let f = match demux::parse(self.mux.frame(len)) {
+        let f = match demux::parse(f) {
             Parsed::Transport(f) => f,
             Parsed::Neighbor => {
                 // The interface may learn a neighbor some set waits for.
@@ -693,56 +1117,13 @@ impl Stack {
         }
     }
 
-    /// After a pass touched set `i` (or, `track` false, after a syscall
-    /// that did not poll): socket bookkeeping, readiness, the set's next
-    /// poll time.
-    fn after(&mut self, i: SetId, now: Instant, now_ns: u64, track: bool) -> Notify {
-        let (n, own) = match self.slots[i].owner {
-            Owner::Free => return Notify::NONE,
-            Owner::Sock(id) => self.settle_sock(id, i, now_ns, track),
-            Owner::Zombie { .. } => match self.reap(i, now_ns) {
-                Some(d) => (Notify::NONE, d),
-                None => return Notify::NONE,
-            },
-            Owner::Dhcp(_) => {
-                let t = prof::start(self.prof);
-                self.dhcp_events();
-                prof::DHCP_EV.done(t);
-                (Notify::NONE, None)
-            }
-        };
-        let t = prof::start(self.prof);
-        let at = match self.iface.poll_delay(now, &self.slots[i].set) {
-            Some(d) => now_ns.saturating_add(d.total_micros().saturating_mul(1000)),
-            None => NEVER,
-        };
-        prof::DEADLINE.done(t);
-        self.schedule(i, own.map_or(at, |o| o.min(at)));
-        n
-    }
-
-    /// A syscall that did not poll: settle its own set and any dirty ones
-    /// (readiness and poll time only).
-    fn settle(&mut self, origin: Option<SetId>) -> Notify {
-        let now = now();
-        let now_ns = crate::arch::timer::now_ns();
-        let mut n = Notify::NONE;
-        if let Some(o) = origin {
-            n = self.after(o, now, now_ns, false);
-        }
-        n
-    }
-
     /// Apply a DHCP client event (lease acquired, renewed with changes, or
-    /// lost). Runs whenever the client's set was polled.
-    fn dhcp_events(&mut self) {
-        let Some(i) = self.dhcp else {
+    /// lost). Runs whenever the client's set `y` was polled.
+    fn dhcp_events(&mut self, y: &mut Slot) {
+        let Owner::Dhcp(h) = y.owner else {
             return;
         };
-        let Owner::Dhcp(h) = self.slots[i].owner else {
-            return;
-        };
-        let lease = match self.slots[i].set.get_mut::<dhcpv4::Socket>(h).poll() {
+        let lease = match y.set.get_mut::<dhcpv4::Socket>(h).poll() {
             None => return,
             Some(dhcpv4::Event::Deconfigured) => None,
             Some(dhcpv4::Event::Configured(c)) => {
@@ -798,9 +1179,8 @@ impl Stack {
                 crate::ctl::log_info(format_args!("{}", line));
                 if let (true, Some((ip, _)), Some(gw)) = (first, new.addr, new.gateway) {
                     self.mux.tx.arp_request(ip, gw);
-                    // This runs while a pass settles its sets, after the
-                    // pass's own flush: ring the doorbell for the request
-                    // now rather than at the next poll (up to 1 s away).
+                    // Ring the doorbell for the request now rather than at
+                    // the next flush.
                     self.mux.flush();
                 }
                 self.cfg = new;
@@ -839,6 +1219,7 @@ impl Stack {
         // Sockets whose source address went away are reset by smoltcp
         // when they are next polled: poll every set.
         self.rescan = true;
+        self.kick = true;
     }
 
     pub fn alloc_id(&mut self) -> u64 {
@@ -963,9 +1344,10 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     let mut s = Stack {
         iface,
         mux,
-        slots: Vec::new(),
-        free_slots: Vec::new(),
+        entries: Vec::new(),
+        free_ids: Vec::new(),
         live_sets: 0,
+        nsocks: 0,
         flows: BTreeMap::new(),
         bound: PortMap::new(),
         dirty: Vec::new(),
@@ -973,12 +1355,8 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
         timers: BTreeSet::new(),
         rescan: false,
         nic_backlog: false,
-        round: 0,
-        pass_no: 0,
-        egress_q: Vec::new(),
-        after_q: Vec::new(),
+        kick: false,
         ports: PortTable::new(seed.rotate_left(17)),
-        socks: BTreeMap::new(),
         next_id: 0,
         gw4: None,
         task_deadline: 0,
@@ -1056,11 +1434,16 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
         sock.set_parameter_request_list(&DHCP_PARAMS);
         // The last received packet, for the host/domain name options.
         sock.set_receive_packet_buffer(alloc::vec![0u8; 1500].leak());
-        let i = s.alloc_set(Owner::Free);
-        let h = s.set(i).add(sock);
-        s.slots[i].owner = Owner::Dhcp(h);
-        s.dirty.push(i);
-        s.dhcp = Some(i);
+        let id = s.reserve_set();
+        let mut set = SocketSet::new(Vec::new());
+        let h = set.add(sock);
+        let _ = s.register(Slot {
+            id,
+            set,
+            owner: Owner::Dhcp(h),
+        });
+        s.dirty.push(id);
+        s.dhcp = Some(id);
         s.dhcp_t0 = crate::arch::timer::now_ns();
     }
     DHCP_REQUESTED.store(dhcp, Ordering::Relaxed);
@@ -1071,21 +1454,44 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     crate::drivers::spawn(task);
 }
 
+/// One round of the net task's work at `site`: poll the dirty and due sets
+/// (rescanning if asked), then drain with the large budget. Returns
+/// whether stats are on.
+fn round(site: Site, work: &mut Vec<SetRef>) -> bool {
+    let timing = {
+        let mut s = lock_at(site);
+        let timing = s.prof;
+        if timing && site == Site::Task {
+            prof::add(&prof::TASK_ROUNDS, 1);
+            if let Some(c) = prof::TASK_CPU.get(crate::arch::cpu::id()) {
+                prof::add(c, 1);
+            }
+        }
+        s.collect_due(work);
+        timing
+    };
+    for r in work.drain(..) {
+        poll_set(&r, site);
+    }
+    drain(site, TASK_BUDGET);
+    timing
+}
+
 /// `ip=dhcp` (or `ip=` without a client address): wait, at boot and before
 /// user mode, until the DHCP client has a lease or [`DHCP_WAIT_NS`] passed.
 /// Called from `kernel_main` after `ctl::init`, so a timeout is also
 /// reported as a control-channel log event. Interrupts are not needed: the
 /// NIC's `recv` polls its used ring. The client socket keeps its set;
-/// whoever polls it afterwards (the net task at its timer, or a pass that
+/// whoever polls it afterwards (the net task at its timer, or a drain that
 /// received a DHCP reply) applies renewals and losses.
 pub fn wait_dhcp() {
     if !DHCP_REQUESTED.load(Ordering::Relaxed) {
         return;
     }
-    let Some(lock) = get() else {
+    if get().is_none() {
         return;
-    };
-    if lock_at(lock, Site::Dhcp).dhcp.is_none() {
+    }
+    if lock_at(Site::Dhcp).dhcp.is_none() {
         crate::kprintln!("[patina] net: ip=dhcp: no network device, continuing without an address");
         crate::ctl::log_warn(format_args!(
             "net: ip=dhcp: no network device, continuing without an address"
@@ -1093,10 +1499,11 @@ pub fn wait_dhcp() {
         return;
     }
     let t0 = crate::arch::timer::now_ns();
+    let mut work = Vec::new();
     loop {
+        round(Site::Dhcp, &mut work);
         let (leased, next) = {
-            let mut s = lock_at(lock, Site::Dhcp);
-            let _ = s.pass(None, true);
+            let s = lock_at(Site::Dhcp);
             (s.cfg.leased, s.earliest())
         };
         if leased {
@@ -1118,30 +1525,22 @@ pub fn wait_dhcp() {
     ));
 }
 
-/// The net task: a pass over the due sets and received frames, notify,
-/// sleep until the earliest set timer (at most 1 s) or an event.
+/// The net task: poll the due sets, drain received frames, sleep until the
+/// earliest set timer (at most 1 s) or an event.
 fn task() {
-    let lock = get().expect("net: no stack");
     let ev = event();
     prof::NET_TASK_TID.store(crate::task::sched::current().tid, Ordering::Relaxed);
     let mut spins = 0u32;
+    let mut work = Vec::new();
     loop {
-        let (notify, mut deadline, timing) = {
-            let mut s = lock_at(lock, Site::Task);
-            let timing = s.prof;
-            if timing {
-                prof::add(&prof::TASK_ROUNDS, 1);
-                if let Some(c) = prof::TASK_CPU.get(crate::arch::cpu::id()) {
-                    prof::add(c, 1);
-                }
-            }
-            let n = s.pass(None, true);
+        let timing = round(Site::Task, &mut work);
+        let mut deadline = {
+            let mut s = lock_at(Site::Task);
             let now = crate::arch::timer::now_ns();
             let d = s.earliest().min(now + MAX_WAIT_NS);
             s.task_deadline = d;
-            (n, d, timing)
+            d
         };
-        fire(notify, timing, true);
         let now = crate::arch::timer::now_ns();
         if deadline <= now {
             // Something wants polling right away; do not spin forever.
@@ -1180,7 +1579,9 @@ fn task() {
 }
 
 /// `patina.stats=1` at exit (other CPUs stopped): the `net::prof`
-/// counters, a few derived numbers and the stack's current size.
+/// counters, a few derived numbers and the stack's current size. The
+/// header line and its totals are the interface lock's; the set locks have
+/// their own `lock set-lock` line.
 pub fn print_stats() {
     let Some(lock) = get() else {
         return;
@@ -1194,10 +1595,11 @@ pub fn print_stats() {
     let ncpu = crate::arch::smp::cpu_count().clamp(1, crate::arch::cpu::MAX_CPUS);
     let pct = |a: u64, b: u64| Pct(a, b);
     let avg = |a: u64, b: u64| a.checked_div(b).unwrap_or(0);
-    let total_hold: u64 = prof::SITES.iter().map(|s| get(&s.hold_ns)).sum();
-    let total_acq: u64 = prof::SITES.iter().map(|s| get(&s.acq)).sum();
-    let total_cont: u64 = prof::SITES.iter().map(|s| get(&s.contended)).sum();
-    let total_spin: u64 = prof::SITES.iter().map(|s| get(&s.spin_ns)).sum();
+    let ifs = &prof::SITES[..prof::IFACE_SITES];
+    let total_hold: u64 = ifs.iter().map(|s| get(&s.hold_ns)).sum();
+    let total_acq: u64 = ifs.iter().map(|s| get(&s.acq)).sum();
+    let total_cont: u64 = ifs.iter().map(|s| get(&s.contended)).sum();
+    let total_spin: u64 = ifs.iter().map(|s| get(&s.spin_ns)).sum();
     p(format_args!(
         "[patina] stats net-stack: window {} us (uptime since stack init {} us), lock acq {}, contended {} ({}%), spin {} us, held {} us = busy {}% of window ({}% of uptime), acq per cpu {}\n",
         window / 1000,
@@ -1271,7 +1673,7 @@ pub fn print_stats() {
     ph("fire_sys", &prof::FIRE_SYS);
     let (socks_now, set_now, flows_now, mux) = match lock.try_lock() {
         Some(s) => (
-            s.socks.len() as u64,
+            s.nsocks as u64,
             s.live_sets as u64,
             s.flows.len() as u64,
             Some(s.mux.tx.stats),
@@ -1279,7 +1681,7 @@ pub fn print_stats() {
         None => (0, 0, 0, None),
     };
     p(format_args!(
-        "[patina] stats net-stack demux: exact {}, port {}, no socket {}, not transport {}, rescans {}, sets egressed {}, flows now {}\n",
+        "[patina] stats net-stack demux: exact {}, port {}, no socket {}, not transport {}, rescans {}, sets egressed {}, flows now {}, backlogged {}, backlog drops {}\n",
         get(&prof::DEMUX_EXACT),
         get(&prof::DEMUX_PORT),
         get(&prof::DEMUX_MISS),
@@ -1287,6 +1689,8 @@ pub fn print_stats() {
         get(&prof::RESCANS),
         get(&prof::SETS_EGRESSED),
         flows_now,
+        get(&prof::BACKLOGGED),
+        get(&prof::BACKLOG_DROPS),
     ));
     p(format_args!(
         "[patina] stats net-stack counts: ingress pkts {}, egress some {}, track socks {}, refresh evals {}, refresh hooks {}, fire hooks task {} sys {}, socks max {} now {}, socketset max {} now {} (sampled avg socks {} set {}), mux {}\n",

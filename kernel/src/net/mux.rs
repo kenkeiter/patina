@@ -11,10 +11,14 @@
 //! `poll_egress` sends through (it never receives).
 //!
 //! Receive: the stack takes one frame at a time ([`Mux::next_frame`]:
-//! loopback first, then the NIC) into [`Mux`]'s receive buffer, reads its
-//! transport tuple to pick the socket set it belongs to (`stack`), and
-//! feeds it to smoltcp through [`OneFrame`], a device that yields exactly
-//! that frame once and transmits replies through the same classification.
+//! loopback first, then the NIC) into a buffer owned by the caller (a
+//! stack-local `[u8; MAX_FRAME]`: the frame may be fed to its socket set
+//! after the interface lock was dropped and re-taken, or queued on the
+//! set's backlog), reads its transport tuple to pick the socket set it
+//! belongs to (`stack`), and feeds it to smoltcp through [`OneFrame`], a
+//! device that yields exactly that frame once and transmits replies
+//! through the same classification. The `Mux` lives under the stack's
+//! interface lock; the NIC's own calls are serialized by its driver.
 //!
 //! The one wrinkle: smoltcp never answers a neighbor solicitation for
 //! `::1` (its solicited-node check skips the loopback address), so a
@@ -119,7 +123,6 @@ pub struct MuxTx {
 }
 
 pub struct Mux {
-    rx: Box<[u8; MAX_FRAME]>,
     pub tx: MuxTx,
     mtu: usize,
 }
@@ -128,7 +131,6 @@ impl Mux {
     pub fn new(nic: Option<Box<dyn NetDevice>>, mac: [u8; 6]) -> Mux {
         let mtu = nic.as_ref().map_or(1500, |n| n.mtu()).min(1500);
         Mux {
-            rx: Box::new([0; MAX_FRAME]),
             tx: MuxTx {
                 nic,
                 lo: LoQueue::new(),
@@ -332,29 +334,30 @@ fn caps(mtu: usize) -> DeviceCapabilities {
 }
 
 impl Mux {
-    /// Take the next received frame into the receive buffer: the loopback
-    /// queue first, then (if `nic`) the NIC. Returns its length.
-    pub fn next_frame(&mut self, nic: bool) -> Option<usize> {
-        if let Some(n) = self.tx.lo.pop_into(&mut self.rx) {
-            return Some(n);
+    /// Take the next received frame into `buf`: the loopback queue first
+    /// (if `lo`), then (if `nic`) the NIC. Returns its length and whether
+    /// it came from the NIC.
+    pub fn next_frame(
+        &mut self,
+        lo: bool,
+        nic: bool,
+        buf: &mut [u8; MAX_FRAME],
+    ) -> Option<(usize, bool)> {
+        if lo && let Some(n) = self.tx.lo.pop_into(buf) {
+            return Some((n, false));
         }
         if !nic {
             return None;
         }
-        let n = self.tx.nic.as_mut()?.recv(&mut self.rx[..])?;
+        let n = self.tx.nic.as_mut()?.recv(&mut buf[..])?;
         self.tx.stats.nic_rx += 1;
-        Some(n)
+        Some((n, true))
     }
 
-    /// The frame [`Mux::next_frame`] returned.
-    pub fn frame(&self, n: usize) -> &[u8] {
-        &self.rx[..n]
-    }
-
-    /// A device that yields that frame once (and transmits replies).
-    pub fn one_frame(&mut self, n: usize) -> OneFrame<'_> {
+    /// A device that yields `frame` once (and transmits replies).
+    pub fn one_frame<'a>(&'a mut self, frame: &'a [u8]) -> OneFrame<'a> {
         OneFrame {
-            frame: Some(&self.rx[..n]),
+            frame: Some(frame),
             tx: &mut self.tx,
             mtu: self.mtu,
         }

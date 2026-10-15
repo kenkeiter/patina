@@ -1,13 +1,14 @@
-//! `patina.stats=1` counters for the TCP/IP stack: who takes the stack
-//! lock and for how long, where the time under it goes (ingress, listener
+//! `patina.stats=1` counters for the TCP/IP stack: who takes the
+//! interface lock and the socket-set locks and for how long, where the time under it goes (ingress, listener
 //! refills, egress, `track`, readiness refresh, `poll_delay`; all per
 //! socket set since D67's per-socket sets), the ingress demux, how the net task
 //! wakes up, and the scheduler IPIs / wake-ups that reach it. Printed at
 //! exit by [`super::stack::print_stats`].
 //!
 //! Cost: relaxed atomic adds and `timer::now_ns` reads, all only when
-//! `crate::STATS` is set, which is read once per stack-lock hold (into
-//! `Stack::prof`). With stats off nothing is counted or timed.
+//! `crate::STATS` is set, which is read once per lock hold (into
+//! `Stack::prof` for the interface lock). With stats off nothing is
+//! counted or timed.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -40,23 +41,43 @@ pub fn now() -> u64 {
     crate::arch::timer::now_ns()
 }
 
-/// Who took the stack lock.
+/// Who took a stack lock. All but [`Site::SetLock`] are takers of the
+/// interface lock (`stack::Stack`); `SetLock` aggregates every socket-set
+/// lock acquisition (`stack::Slot`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Site {
-    /// The net task's poll round.
+    /// The net task: timer-due sets, its frame drain, rescans.
     Task = 0,
-    /// `stack::with(true, ..)`: a syscall that polls.
+    /// A socket syscall polling its own set (egress, `poll_delay`).
     SysPoll = 1,
-    /// `stack::with(false, ..)`.
+    /// A socket syscall that needs the interface without polling (bind,
+    /// socket creation, a set's backlog found at lock time).
     SysNoPoll = 2,
-    /// `InetSocket::poll` (epoll / poll / select readiness).
+    /// `InetSocket::poll` (epoll / poll / select readiness) that found a
+    /// backlog to feed.
     FilePoll = 3,
     /// Boot-time DHCP wait.
     Dhcp = 4,
+    /// A syscall draining received frames (loopback, then the NIC up to its
+    /// budget) after its own poll, and the backlog service of a set whose
+    /// lock was busy.
+    Drain = 5,
+    /// Socket-set locks (every site, aggregated).
+    SetLock = 6,
 }
 
-pub const NSITES: usize = 5;
-pub const SITE_NAMES: [&str; NSITES] = ["net-task", "sys-poll", "sys-nopoll", "file-poll", "dhcp"];
+pub const NSITES: usize = 7;
+/// Sites `0..IFACE_SITES` are interface-lock sites.
+pub const IFACE_SITES: usize = 6;
+pub const SITE_NAMES: [&str; NSITES] = [
+    "net-task",
+    "sys-poll",
+    "sys-nopoll",
+    "file-poll",
+    "dhcp",
+    "sys-drain",
+    "set-lock",
+];
 
 /// Hold-time histogram bucket upper bounds (ns); the last bucket is ≥100 µs.
 pub const HIST_NS: [u64; 7] = [1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000];
@@ -111,7 +132,7 @@ impl SiteStats {
 }
 
 pub static SITES: [SiteStats; NSITES] = [const { SiteStats::new() }; NSITES];
-/// Stack-lock acquisitions per CPU.
+/// Interface-lock acquisitions per CPU.
 pub static LOCK_CPU: [Counter; MAX_CPUS] = [const { Counter::new(0) }; MAX_CPUS];
 
 /// A phase inside a lock hold: calls and ns (ns only with stats on).
@@ -144,13 +165,15 @@ pub fn start(timing: bool) -> u64 {
     if timing { now() } else { 0 }
 }
 
-/// Whole poll passes (`Stack::pass`; printed as `poll_all`).
+/// Polls of one socket set under the interface lock (`Stack::run_set`:
+/// backlog / frame ingress, egress, settling, `poll_delay`; printed as
+/// `poll_all`).
 pub static POLL_ALL: Phase = Phase::new();
 /// `poll_maintenance`.
 pub static MAINT: Phase = Phase::new();
 /// Received frames: demux + `poll_ingress_single` into the frame's set.
 pub static INGRESS: Phase = Phase::new();
-/// Looking for a frame and finding none (one per round).
+/// Looking for a frame and finding none (one per drain).
 pub static INGRESS_NONE: Phase = Phase::new();
 /// Packets processed by ingress (calls that did not return None).
 pub static INGRESS_PKTS: Counter = Counter::new(0);
@@ -165,6 +188,10 @@ pub static DHCP_EV: Phase = Phase::new();
 pub static TRACK: Phase = Phase::new();
 /// Sockets tracked (one per `track` call).
 pub static TRACK_SOCKS: Counter = Counter::new(0);
+/// Frames queued on a socket set's backlog because its lock was busy, and
+/// frames dropped because a backlog was full.
+pub static BACKLOGGED: Counter = Counter::new(0);
+pub static BACKLOG_DROPS: Counter = Counter::new(0);
 pub static REFRESH: Phase = Phase::new();
 /// Socket readiness evaluations (one per `Sock::refresh`; printed as
 /// `refresh_all`).
@@ -187,7 +214,8 @@ pub static DEMUX_OTHER: Counter = Counter::new(0);
 pub static RESCANS: Counter = Counter::new(0);
 /// Socket sets egressed (one `poll_egress` loop each).
 pub static SETS_EGRESSED: Counter = Counter::new(0);
-/// The closure passed to `stack::with` (the syscall's own work).
+/// The closure passed to `stack::sys` (the syscall's own work, under its
+/// set lock).
 pub static WITH_OP: Phase = Phase::new();
 pub static MAX_SOCKS: Counter = Counter::new(0);
 pub static MAX_SET: Counter = Counter::new(0);
@@ -218,7 +246,7 @@ pub static TASK_WAKE_LAT_N: Counter = Counter::new(0);
 pub static TASK_WAKE_LAT_MAX: Counter = Counter::new(0);
 /// ns the net task spent asleep in `Event::wait`.
 pub static TASK_SLEEP_NS: Counter = Counter::new(0);
-/// Kicks (`event().signal()`) from `stack::with`.
+/// Kicks (`event().signal()`) of the net task by other lock holders.
 pub static KICKS: Counter = Counter::new(0);
 
 /// `Notify::fire` with at least one hook: (calls, hooks, ns) from the net

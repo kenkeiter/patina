@@ -1,25 +1,31 @@
 //! AF_INET / AF_INET6 sockets: TCP and UDP over smoltcp (D68).
 //!
-//! An [`InetSocket`] is the `File` an fd points at; it holds only an id.
-//! Its state ([`Sock`]) lives in the `Stack` (under the one stack lock);
-//! the smoltcp sockets it owns live in its own smoltcp `SocketSet`
-//! (`Sock::set`, a `stack::Slot`), so polling one socket never walks the
-//! others (D67):
+//! An [`InetSocket`] is the `File` an fd points at; it holds its socket
+//! set (a `stack::Slot` behind its own lock, `stack::SetRef`). The slot
+//! holds the socket's state ([`Sock`], as `stack::Owner::Sock`) and the
+//! smoltcp sockets it owns in its own smoltcp `SocketSet`, so polling one
+//! socket never walks the others (D67) and operations on different sockets
+//! run in parallel. Every operation runs under the set lock
+//! (`stack::sys`); the interface lock is taken inside, only when the
+//! operation touches shared state (the bind table, the port map, the flow
+//! table, routes, `iface.context()`) or polls the set:
 //!
 //! * TCP, idle: an empty set until `connect` or `listen`.
 //! * TCP listener: smoltcp has one socket per connection, so a listener's
 //!   set holds a small pool of sockets `listen()`ing on its endpoint
 //!   (`LISTEN_POOL`) plus a queue of sockets that left `Listen` (a SYN
 //!   arrived): the accept queue, bounded by the backlog. The pool is
-//!   refilled after every frame fed to the listener (`Stack::refill`), so
+//!   refilled after every frame fed to the listener ([`refill`]), so
 //!   a burst of SYNs each find a listening socket; a socket that leaves
 //!   `Listen` gets a flow-table entry pointing at the listener's set.
 //!   `accept` takes the first queued socket that is past `SynReceived` and
-//!   moves it into the new connection's own set (re-pointing its entry).
+//!   moves it into the new connection's own set (re-pointing its entry),
+//!   after feeding the listener's backlog (frames for its queued sockets
+//!   taken while its lock was busy).
 //!   The listener is in the stack's port map, which picks among listeners
 //!   on one port by address and family.
 //! * TCP connection: one smoltcp socket, with a flow-table entry from
-//!   `connect` (or `accept`) on. After every poll of its set, `track` turns
+//!   `connect` (or `accept`) on. After every poll of its set, [`track`] turns
 //!   smoltcp state transitions into socket-API events: `SynSent → Closed`
 //!   is ECONNREFUSED, a synchronized state → `Closed` is a reset
 //!   (ECONNRESET once, then EOF), 75 s in `SynSent` is ETIMEDOUT.
@@ -62,9 +68,8 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Duration;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
-use super::prof;
 use super::socket::{self as so, RecvInfo, SocketOps};
-use super::stack::{self, Owner, SetId, Stack};
+use super::stack::{self, Iface, Owner, SetId, SetRef, Slot, Stack};
 use crate::fs::file::{File, FileFlags, Notify, PollHook, PollList, alloc_ino, anon_stat};
 use crate::mm::heap;
 
@@ -87,7 +92,7 @@ const WRITE_SPACE: usize = TCP_TX_BUF / 4;
 const SIOCOUTQ: u32 = 0x5411;
 
 // ---------------------------------------------------------------------------
-// Per-socket state (in the stack).
+// Per-socket state (in its set's slot).
 
 pub struct Listener {
     ep: IpListenEndpoint,
@@ -171,8 +176,8 @@ impl Default for Opts {
 }
 
 pub struct Sock {
-    /// This socket's smoltcp socket set (`Stack::slots`).
-    pub set: SetId,
+    /// Owner id in the bind table (`Stack::ports`).
+    id: u64,
     family: u16,
     kind: Kind,
     /// Local binding (address `None`: wildcard).
@@ -346,9 +351,9 @@ fn family_ok(family: u16, v6only: bool, remote: IpAddr) -> bool {
 }
 
 impl Sock {
-    fn new(family: u16, kind: Kind, set: SetId) -> Sock {
+    fn new(id: u64, family: u16, kind: Kind) -> Sock {
         Sock {
-            set,
+            id,
             family,
             kind,
             bound: None,
@@ -477,12 +482,13 @@ fn accept_ready(st: tcp::State) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Stack-side bookkeeping (called with the stack lock held).
+// Bookkeeping under the socket's set lock (and the interface lock where it
+// touches shared state: the flow table, the port map, the bind table).
 
 impl Sock {
     /// Socket-level deadlines (ns) the set's `poll_delay` does not know:
     /// the connect timeout and the deferred keep-alive hand-off (`track`).
-    fn own_deadline(&self) -> Option<u64> {
+    pub fn own_deadline(&self) -> Option<u64> {
         let Kind::Tcp(Tcp::Conn(c)) = &self.kind else {
             return None;
         };
@@ -497,339 +503,302 @@ impl Sock {
     }
 }
 
-impl Stack {
-    /// Socket `id` and its socket set.
-    fn sock_set(&mut self, id: u64) -> Result<(&mut Sock, &mut SocketSet<'static>), Errno> {
-        let Stack { socks, slots, .. } = self;
-        let sock = socks.get_mut(&id).ok_or(Errno(EBADF))?;
-        let set = &mut slots[sock.set].set;
-        Ok((sock, set))
-    }
+/// Is `sock` a TCP listener (whose pool is refilled after every frame)?
+pub fn is_listener(sock: &Sock) -> bool {
+    matches!(sock.kind, Kind::Tcp(Tcp::Listen(_)))
+}
 
-    /// Listener `id`: move pool sockets that got a SYN to the accept queue
-    /// (with a flow-table entry pointing at the listener's set), drop or
-    /// recycle queued ones that were reset before completing, and keep the
-    /// pool full. Runs after every frame fed to the listener and whenever
-    /// its set is settled.
-    pub fn refill(&mut self, id: u64) {
-        let Stack {
-            socks,
-            slots,
-            flows,
-            ..
-        } = self;
-        let Some(sock) = socks.get_mut(&id) else {
-            return;
-        };
-        let si = sock.set;
-        let sockets = &mut slots[si].set;
-        let opts = &sock.opts;
-        let Kind::Tcp(Tcp::Listen(l)) = &mut sock.kind else {
-            return;
-        };
-        // Sockets that got a SYN join the accept queue.
-        let mut i = 0;
-        while i < l.listening.len() {
-            let h = l.listening[i];
-            let t = sockets.get::<tcp::Socket>(h);
-            if t.state() != tcp::State::Listen {
-                l.listening.swap_remove(i);
-                let f = flow_of(t);
-                if let Some(f) = f {
-                    flows.insert(f, si);
-                }
-                l.pending.push_back((h, f));
-            } else {
-                i += 1;
+/// Listener `sock` (set `si`, `sockets`): move pool sockets that got a SYN
+/// to the accept queue (with a flow-table entry pointing at the listener's
+/// set), drop or recycle queued ones that were reset before completing,
+/// and keep the pool full. Runs after every frame fed to the listener and
+/// whenever its set is polled (set and interface lock held).
+pub fn refill(
+    sock: &mut Sock,
+    sockets: &mut SocketSet<'static>,
+    si: SetId,
+    flows: &mut BTreeMap<Flow, SetId>,
+) {
+    let opts = &sock.opts;
+    let Kind::Tcp(Tcp::Listen(l)) = &mut sock.kind else {
+        return;
+    };
+    // Sockets that got a SYN join the accept queue.
+    let mut i = 0;
+    while i < l.listening.len() {
+        let h = l.listening[i];
+        let t = sockets.get::<tcp::Socket>(h);
+        if t.state() != tcp::State::Listen {
+            l.listening.swap_remove(i);
+            let f = flow_of(t);
+            if let Some(f) = f {
+                flows.insert(f, si);
             }
-        }
-        // Queued sockets that were reset before completing: back to the
-        // pool (smoltcp returns them to Listen) or dropped.
-        let mut i = 0;
-        while i < l.pending.len() {
-            let (h, f) = l.pending[i];
-            match sockets.get::<tcp::Socket>(h).state() {
-                tcp::State::Listen if l.listening.len() < LISTEN_POOL => {
-                    l.pending.remove(i);
-                    unflow(flows, f, si);
-                    l.listening.push(h);
-                }
-                tcp::State::Listen | tcp::State::Closed => {
-                    l.pending.remove(i);
-                    unflow(flows, f, si);
-                    remove_tcp(sockets, h);
-                }
-                _ => i += 1,
-            }
-        }
-        while l.listening.len() < LISTEN_POOL.min(l.backlog) && l.pending.len() < l.backlog {
-            // Out of memory: the pool stays short (SYNs find no listening
-            // socket) until the next refill.
-            let Ok(mut t) = new_tcp(opts) else {
-                break;
-            };
-            if t.listen(l.ep).is_err() {
-                discard_tcp(t);
-                break;
-            }
-            l.listening.push(sockets.add(t));
+            l.pending.push_back((h, f));
+        } else {
+            i += 1;
         }
     }
-
-    /// Settle socket `id` (set `i`): after its set was polled (`track`:
-    /// state transitions, the listener's pool), its readiness. Returns the
-    /// notification and the socket's own next deadline.
-    pub fn settle_sock(
-        &mut self,
-        id: u64,
-        i: SetId,
-        now_ns: u64,
-        track: bool,
-    ) -> (Notify, Option<u64>) {
-        let timing = self.prof;
-        if track {
-            let t = prof::start(timing);
-            self.track_sock(id, i, now_ns);
-            if t != 0 {
-                prof::TRACK.done(t);
-                prof::add(&prof::TRACK_SOCKS, 1);
+    // Queued sockets that were reset before completing: back to the
+    // pool (smoltcp returns them to Listen) or dropped.
+    let mut i = 0;
+    while i < l.pending.len() {
+        let (h, f) = l.pending[i];
+        match sockets.get::<tcp::Socket>(h).state() {
+            tcp::State::Listen if l.listening.len() < LISTEN_POOL => {
+                l.pending.remove(i);
+                unflow(flows, f, si);
+                l.listening.push(h);
             }
-            if self.slots[i].listen {
-                let t = prof::start(timing);
-                self.refill(id);
-                prof::REFILL.done(t);
+            tcp::State::Listen | tcp::State::Closed => {
+                l.pending.remove(i);
+                unflow(flows, f, si);
+                remove_tcp(sockets, h);
             }
+            _ => i += 1,
         }
-        let Stack { socks, slots, .. } = self;
-        let Some(sock) = socks.get_mut(&id) else {
-            return (Notify::NONE, None);
-        };
-        let t = prof::start(timing);
-        let n = sock.refresh(&slots[i].set);
-        if t != 0 {
-            prof::REFRESH.done(t);
-            prof::add(&prof::REFRESH_EVALS, 1);
-            prof::add(&prof::REFRESH_HOOKS, n.hooks() as u64);
-        }
-        (n, sock.own_deadline())
     }
-
-    /// After socket `id`'s set (`i`) was polled: connection state
-    /// transitions, the connect timeout, the deferred keep-alive, UDP peer
-    /// filtering.
-    fn track_sock(&mut self, id: u64, i: SetId, now_ns: u64) {
-        let Stack {
-            socks,
-            slots,
-            flows,
-            ..
-        } = self;
-        let Some(sock) = socks.get_mut(&id) else {
-            return;
+    while l.listening.len() < LISTEN_POOL.min(l.backlog) && l.pending.len() < l.backlog {
+        // Out of memory: the pool stays short (SYNs find no listening
+        // socket) until the next refill.
+        let Ok(mut t) = new_tcp(opts) else {
+            break;
         };
-        let sockets = &mut slots[i].set;
-        match &mut sock.kind {
-            Kind::Tcp(Tcp::Conn(c)) => {
-                let t = sockets.get_mut::<tcp::Socket>(c.h);
-                let st = t.state();
-                if c.connecting {
-                    if st == tcp::State::Closed {
-                        c.connecting = false;
-                        if sock.error == 0 {
-                            sock.error = ECONNREFUSED;
-                        }
-                    } else if st != tcp::State::SynSent {
-                        c.connecting = false;
-                        c.est = true;
-                        c.local = t.local_endpoint();
-                    } else if now_ns.saturating_sub(c.started) > CONNECT_TIMEOUT_NS {
-                        t.abort();
-                        c.connecting = false;
-                        sock.error = ETIMEDOUT;
-                    }
-                } else if st == tcp::State::Closed
-                    && c.est
-                    && !c.reset
-                    && matches!(
-                        c.last,
-                        tcp::State::SynReceived
-                            | tcp::State::Established
-                            | tcp::State::FinWait1
-                            | tcp::State::FinWait2
-                            | tcp::State::CloseWait
-                    )
-                {
-                    c.reset = true;
-                    sock.error = ECONNRESET;
-                }
-                if let Some(since) = c.ka_since {
-                    // Deferred keep-alive (apply_live_tcp_opts): idle
-                    // long enough, smoltcp probes from here on.
-                    match keep_alive(&sock.opts) {
-                        Some(d) if now_ns.saturating_sub(since) / 1000 >= d.total_micros() => {
-                            c.ka_since = None;
-                            t.set_keep_alive(Some(d));
-                        }
-                        Some(_) => {}
-                        None => c.ka_since = None,
-                    }
-                }
+        if t.listen(l.ep).is_err() {
+            discard_tcp(t);
+            break;
+        }
+        l.listening.push(sockets.add(t));
+    }
+}
+
+/// After socket `sock`'s set (`i`, `sockets`) was polled: connection state
+/// transitions, the connect timeout, the deferred keep-alive, UDP peer
+/// filtering (set and interface lock held).
+pub fn track(
+    sock: &mut Sock,
+    sockets: &mut SocketSet<'static>,
+    i: SetId,
+    flows: &mut BTreeMap<Flow, SetId>,
+    now_ns: u64,
+) {
+    match &mut sock.kind {
+        Kind::Tcp(Tcp::Conn(c)) => {
+            let t = sockets.get_mut::<tcp::Socket>(c.h);
+            let st = t.state();
+            if c.connecting {
                 if st == tcp::State::Closed {
-                    // No tuple any more: smoltcp accepts nothing for it.
-                    unflow(flows, c.flow.take(), i);
-                }
-                c.last = st;
-            }
-            Kind::Udp(u) => {
-                if let Some(peer) = u.peer {
-                    let s = sockets.get_mut::<udp::Socket>(u.h);
-                    while let Ok((_, m)) = s.peek() {
-                        if m.endpoint == peer {
-                            break;
-                        }
-                        let _ = s.recv();
+                    c.connecting = false;
+                    if sock.error == 0 {
+                        sock.error = ECONNREFUSED;
                     }
+                } else if st != tcp::State::SynSent {
+                    c.connecting = false;
+                    c.est = true;
+                    c.local = t.local_endpoint();
+                } else if now_ns.saturating_sub(c.started) > CONNECT_TIMEOUT_NS {
+                    t.abort();
+                    c.connecting = false;
+                    sock.error = ETIMEDOUT;
+                }
+            } else if st == tcp::State::Closed
+                && c.est
+                && !c.reset
+                && matches!(
+                    c.last,
+                    tcp::State::SynReceived
+                        | tcp::State::Established
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::CloseWait
+                )
+            {
+                c.reset = true;
+                sock.error = ECONNRESET;
+            }
+            if let Some(since) = c.ka_since {
+                // Deferred keep-alive (apply_live_tcp_opts): idle
+                // long enough, smoltcp probes from here on.
+                match keep_alive(&sock.opts) {
+                    Some(d) if now_ns.saturating_sub(since) / 1000 >= d.total_micros() => {
+                        c.ka_since = None;
+                        t.set_keep_alive(Some(d));
+                    }
+                    Some(_) => {}
+                    None => c.ka_since = None,
                 }
             }
-            _ => {}
+            if st == tcp::State::Closed {
+                // No tuple any more: smoltcp accepts nothing for it.
+                unflow(flows, c.flow.take(), i);
+            }
+            c.last = st;
         }
+        Kind::Udp(u) => {
+            if let Some(peer) = u.peer {
+                let s = sockets.get_mut::<udp::Socket>(u.h);
+                while let Ok((_, m)) = s.peek() {
+                    if m.endpoint == peer {
+                        break;
+                    }
+                    let _ = s.recv();
+                }
+            }
+        }
+        _ => {}
     }
+}
 
-    /// Settle zombie set `i`: `None` once it is gone (the set is freed),
-    /// else its own deadline (the linger give-up time).
-    pub fn reap(&mut self, i: SetId, now_ns: u64) -> Option<Option<u64>> {
-        let Owner::Zombie { h, until, flow } = self.slots[i].owner else {
-            return None;
-        };
-        let sockets = &mut self.slots[i].set;
-        let t = sockets.get_mut::<tcp::Socket>(h);
-        let st = t.state();
-        let gone = (st == tcp::State::Closed && t.remote_endpoint().is_none())
-            || st == tcp::State::TimeWait
-            || st == tcp::State::Listen;
-        if gone {
-            remove_tcp(sockets, h);
-            unflow(&mut self.flows, flow, i);
-            self.free_set(i);
-            return None;
-        }
-        if st != tcp::State::Closed && (t.recv_queue() > 0 || now_ns > until) {
-            // Data arrived for a closed socket, or it lingered too long:
-            // reset it (removed once the RST is out).
-            t.abort();
-        }
-        Some((now_ns <= until).then_some(until + 1))
+/// Settle zombie set `y` (set and interface lock held): `None` once it is
+/// gone (the set is unregistered), else its own deadline (the linger
+/// give-up time).
+pub fn reap(s: &mut Stack, y: &mut Slot, now_ns: u64) -> Option<Option<u64>> {
+    let Owner::Zombie { h, until, flow } = y.owner else {
+        return None;
+    };
+    let t = y.set.get_mut::<tcp::Socket>(h);
+    let st = t.state();
+    let gone = (st == tcp::State::Closed && t.remote_endpoint().is_none())
+        || st == tcp::State::TimeWait
+        || st == tcp::State::Listen;
+    if gone {
+        remove_tcp(&mut y.set, h);
+        unflow(&mut s.flows, flow, y.id);
+        s.unregister(y);
+        return None;
     }
+    if st != tcp::State::Closed && (t.recv_queue() > 0 || now_ns > until) {
+        // Data arrived for a closed socket, or it lingered too long:
+        // reset it (removed once the RST is out).
+        t.abort();
+    }
+    Some((now_ns <= until).then_some(until + 1))
+}
 
-    /// Move queued socket `h` (flow `f`) of listener set `from` into a
-    /// zombie set of its own and abort it.
-    fn zombify(&mut self, from: SetId, h: SocketHandle, f: Option<Flow>, until: u64) {
-        let sk = self.slots[from].set.remove(h);
-        let z = self.alloc_set(Owner::Free);
-        let nh = self.slots[z].set.add(sk);
-        self.slots[z].set.get_mut::<tcp::Socket>(nh).abort();
-        move_flow(&mut self.flows, f, from, z);
-        self.slots[z].owner = Owner::Zombie {
+/// Move queued socket `h` (flow `f`) of listener set `from` (`fi`) into a
+/// zombie set of its own and abort it (the listener's set lock and the
+/// interface lock held; the new set is registered with an immediate timer,
+/// so the net task sends the RST).
+fn zombify(
+    s: &mut Stack,
+    from: &mut SocketSet<'static>,
+    fi: SetId,
+    h: SocketHandle,
+    f: Option<Flow>,
+    until: u64,
+) {
+    let sk = from.remove(h);
+    let z = s.reserve_set();
+    let mut set = SocketSet::new(Vec::new());
+    let nh = set.add(sk);
+    set.get_mut::<tcp::Socket>(nh).abort();
+    move_flow(&mut s.flows, f, fi, z);
+    let _ = s.register(Slot {
+        id: z,
+        set,
+        owner: Owner::Zombie {
             h: nh,
             until,
             flow: f,
-        };
-        self.dirty.push(z);
-    }
+        },
+    });
+    s.mark_dirty(z);
+}
 
-    fn sock(&mut self, id: u64) -> Result<&mut Sock, Errno> {
-        self.socks.get_mut(&id).ok_or(Errno(EBADF))
-    }
-
-    /// Bind `id` (port 0: ephemeral) and record it; a UDP socket joins the
-    /// port map.
-    fn do_bind(&mut self, id: u64, ip: Option<IpAddr>, port: u16) -> Result<u16, Errno> {
-        let sock = self.socks.get(&id).ok_or(Errno(EBADF))?;
-        let proto = match sock.kind {
-            Kind::Tcp(_) => Proto::Tcp,
-            Kind::Udp(_) => Proto::Udp,
+/// Bind `sock` (set `si`) (port 0: ephemeral) and record it; a UDP socket
+/// joins the port map.
+fn do_bind(
+    s: &mut Stack,
+    sock: &mut Sock,
+    sockets: &mut SocketSet<'static>,
+    si: SetId,
+    ip: Option<IpAddr>,
+    port: u16,
+) -> Result<u16, Errno> {
+    let proto = match sock.kind {
+        Kind::Tcp(_) => Proto::Tcp,
+        Kind::Udp(_) => Proto::Udp,
+    };
+    let cover = Cover::of(sock.family, ip, sock.opts.v6only);
+    let reuse = sock.opts.reuse;
+    let port = s
+        .ports
+        .bind(sock.id, proto, port, cover, reuse)
+        .map_err(|e| match e {
+            BindError::InUse | BindError::NoPorts => Errno(EADDRINUSE),
+        })?;
+    sock.bound = Some((ip, port));
+    if let Kind::Udp(u) = &sock.kind {
+        let ep = IpListenEndpoint {
+            addr: ip.map(Into::into),
+            port,
         };
-        let cover = Cover::of(sock.family, ip, sock.opts.v6only);
-        let reuse = sock.opts.reuse;
-        let port = self
-            .ports
-            .bind(id, proto, port, cover, reuse)
-            .map_err(|e| match e {
-                BindError::InUse | BindError::NoPorts => Errno(EADDRINUSE),
-            })?;
-        let Stack {
-            socks,
-            slots,
-            bound,
-            ..
-        } = self;
-        let sock = socks.get_mut(&id).unwrap();
-        sock.bound = Some((ip, port));
-        if let Kind::Udp(u) = &sock.kind {
-            let ep = IpListenEndpoint {
-                addr: ip.map(Into::into),
-                port,
+        let _ = sockets.get_mut::<udp::Socket>(u.h).bind(ep);
+        s.bound.add(P_UDP, port, si, cover);
+    }
+    Ok(port)
+}
+
+fn autobind(
+    s: &mut Stack,
+    sock: &mut Sock,
+    sockets: &mut SocketSet<'static>,
+    si: SetId,
+) -> Result<(), Errno> {
+    if sock.bound.is_none() {
+        do_bind(s, sock, sockets, si, None, 0)?;
+    }
+    Ok(())
+}
+
+/// Drop the socket of set `y` (its file was released; set and interface
+/// lock held): UDP and idle / listening TCP sockets go at once, a TCP
+/// connection becomes a zombie in the same set.
+fn close_sock(s: &mut Stack, y: &mut Slot) {
+    let Owner::Sock(sock) = core::mem::replace(&mut y.owner, Owner::Free) else {
+        return;
+    };
+    s.nsocks -= 1;
+    s.ports.unbind(sock.id);
+    let si = y.id;
+    let deadline = crate::arch::timer::now_ns() + LINGER_NS;
+    match sock.kind {
+        Kind::Udp(u) => {
+            if let Some((_, port)) = sock.bound {
+                s.bound.remove(P_UDP, port, si);
+            }
+            y.set.remove(u.h);
+            heap::uncharge(UDP_BUFS);
+            s.unregister(y);
+        }
+        Kind::Tcp(Tcp::Idle) => s.unregister(y),
+        Kind::Tcp(Tcp::Listen(l)) => {
+            if let Some((_, port)) = sock.bound {
+                s.bound.remove(P_TCP, port, si);
+            }
+            for h in l.listening {
+                remove_tcp(&mut y.set, h);
+            }
+            for (h, f) in l.pending {
+                zombify(s, &mut y.set, si, h, f, deadline);
+            }
+            s.unregister(y);
+        }
+        Kind::Tcp(Tcp::Conn(c)) => {
+            let t = y.set.get_mut::<tcp::Socket>(c.h);
+            let hard = sock.opts.linger.l_onoff != 0 && sock.opts.linger.l_linger == 0;
+            if hard || t.recv_queue() > 0 {
+                t.abort();
+            } else {
+                t.close();
+            }
+            // The set stays (with its flow entry) until the shutdown
+            // finishes.
+            y.owner = Owner::Zombie {
+                h: c.h,
+                until: deadline,
+                flow: c.flow,
             };
-            let _ = slots[sock.set].set.get_mut::<udp::Socket>(u.h).bind(ep);
-            bound.add(P_UDP, port, sock.set, cover);
-        }
-        Ok(port)
-    }
-
-    fn autobind(&mut self, id: u64) -> Result<(), Errno> {
-        if self.sock(id)?.bound.is_none() {
-            self.do_bind(id, None, 0)?;
-        }
-        Ok(())
-    }
-
-    /// Drop socket `id` (its file was released).
-    fn close_sock(&mut self, id: u64) {
-        let Some(sock) = self.socks.remove(&id) else {
-            return;
-        };
-        self.ports.unbind(id);
-        let si = sock.set;
-        let deadline = crate::arch::timer::now_ns() + LINGER_NS;
-        match sock.kind {
-            Kind::Udp(u) => {
-                if let Some((_, port)) = sock.bound {
-                    self.bound.remove(P_UDP, port, si);
-                }
-                self.slots[si].set.remove(u.h);
-                heap::uncharge(UDP_BUFS);
-                self.free_set(si);
-            }
-            Kind::Tcp(Tcp::Idle) => self.free_set(si),
-            Kind::Tcp(Tcp::Listen(l)) => {
-                if let Some((_, port)) = sock.bound {
-                    self.bound.remove(P_TCP, port, si);
-                }
-                for h in l.listening {
-                    remove_tcp(&mut self.slots[si].set, h);
-                }
-                for (h, f) in l.pending {
-                    self.zombify(si, h, f, deadline);
-                }
-                self.free_set(si);
-            }
-            Kind::Tcp(Tcp::Conn(c)) => {
-                let t = self.slots[si].set.get_mut::<tcp::Socket>(c.h);
-                let hard = sock.opts.linger.l_onoff != 0 && sock.opts.linger.l_linger == 0;
-                if hard || t.recv_queue() > 0 {
-                    t.abort();
-                } else {
-                    t.close();
-                }
-                // The set stays (with its flow entry) until the shutdown
-                // finishes.
-                self.slots[si].owner = Owner::Zombie {
-                    h: c.h,
-                    until: deadline,
-                    flow: c.flow,
-                };
-                self.dirty.push(si);
-            }
         }
     }
 }
@@ -856,7 +825,8 @@ fn move_flow(flows: &mut BTreeMap<Flow, SetId>, f: Option<Flow>, from: SetId, to
 // The file.
 
 pub struct InetSocket {
-    id: u64,
+    /// This socket's set (its state is the set's `Owner::Sock`).
+    set: SetRef,
     family: u16,
     ty: u32,
     proto: i32,
@@ -891,12 +861,12 @@ pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Er
         crate::random::fill(&mut b);
         u64::from_ne_bytes(b)
     });
-    // No socket yet: id 0 names none (ids start at 1).
-    let id = stack::with(false, 0, |s| {
+    let set = {
+        let mut s = stack::lock_new();
         if let Some(seed) = seed {
             s.ports.reseed(seed);
         }
-        if s.socks.len() >= MAX_SOCKETS {
+        if s.nsocks >= MAX_SOCKETS {
             return Err(Errno(ENFILE));
         }
         let udp = if ty == SOCK_STREAM {
@@ -905,20 +875,25 @@ pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Er
             Some(new_udp()?)
         };
         let id = s.alloc_id();
-        let set = s.alloc_set(Owner::Sock(id));
+        let si = s.reserve_set();
+        let mut set = SocketSet::new(Vec::new());
         let kind = match udp {
             None => Kind::Tcp(Tcp::Idle),
             Some(u) => Kind::Udp(Udp {
-                h: s.set(set).add(u),
+                h: set.add(u),
                 peer: None,
                 local: None,
             }),
         };
-        s.socks.insert(id, Sock::new(family, kind, set));
-        Ok(id)
-    })?;
+        s.nsocks += 1;
+        s.register(Slot {
+            id: si,
+            set,
+            owner: Owner::Sock(Sock::new(id, family, kind)),
+        })
+    };
     Ok(Arc::new(InetSocket {
-        id,
+        set,
         family,
         ty,
         proto,
@@ -927,6 +902,36 @@ pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Er
 }
 
 impl InetSocket {
+    /// Run `f` on this socket under its set lock (`stack::sys`); then, if
+    /// `poll`, poll its set.
+    fn op<R>(
+        &self,
+        poll: bool,
+        f: impl FnOnce(&mut Sock, &mut SocketSet<'static>, SetId, &mut Iface) -> Result<R, Errno>,
+    ) -> Result<R, Errno> {
+        self.op_cond(|sock, set, si, ifc| (f(sock, set, si, ifc), poll))
+    }
+
+    /// [`InetSocket::op`], where `f` decides whether to poll (a `recv`
+    /// that read nothing changed nothing).
+    fn op_cond<R>(
+        &self,
+        f: impl FnOnce(
+            &mut Sock,
+            &mut SocketSet<'static>,
+            SetId,
+            &mut Iface,
+        ) -> (Result<R, Errno>, bool),
+    ) -> Result<R, Errno> {
+        stack::sys(&self.set, |y, ifc| {
+            let Slot { id, set, owner } = y;
+            match owner {
+                Owner::Sock(sock) => f(sock, set, *id, ifc),
+                _ => (Err(Errno(EBADF)), false),
+            }
+        })
+    }
+
     /// Decode a destination/bind address for this socket's family:
     /// (IP with `::ffff:` unmapped, port).
     fn inet_addr(
@@ -958,8 +963,12 @@ impl InetSocket {
         }
     }
 
-    fn tcp_send(&self, s: &mut Stack, data: &[u8]) -> Result<usize, Errno> {
-        let (sock, sockets) = s.sock_set(self.id)?;
+    fn tcp_send(
+        &self,
+        sock: &mut Sock,
+        sockets: &mut SocketSet<'static>,
+        data: &[u8],
+    ) -> Result<usize, Errno> {
         let (h, reset) = match &sock.kind {
             Kind::Tcp(Tcp::Conn(c)) => (c.h, c.reset),
             _ => return Err(Errno(ENOTCONN)),
@@ -989,8 +998,13 @@ impl InetSocket {
         }
     }
 
-    fn tcp_recv(&self, s: &mut Stack, buf: &mut [u8], peek: bool) -> Result<RecvInfo, Errno> {
-        let (sock, sockets) = s.sock_set(self.id)?;
+    fn tcp_recv(
+        &self,
+        sock: &mut Sock,
+        sockets: &mut SocketSet<'static>,
+        buf: &mut [u8],
+        peek: bool,
+    ) -> Result<RecvInfo, Errno> {
         let (h, reset, connecting, est) = match &sock.kind {
             Kind::Tcp(Tcp::Conn(c)) => (c.h, c.reset, c.connecting, c.est),
             _ => return Err(Errno(ENOTCONN)),
@@ -1034,20 +1048,25 @@ impl InetSocket {
         }
     }
 
-    fn udp_send(&self, s: &mut Stack, data: &[u8], to: Option<&SockAddr>) -> Result<usize, Errno> {
-        let (v6only, peer) = {
-            let sock = s.sock(self.id)?;
-            if let Some(e) = sock.take_error() {
-                return Err(e);
-            }
-            if sock.shut_wr {
-                return Err(Errno(EPIPE));
-            }
-            let Kind::Udp(u) = &sock.kind else {
-                return Err(Errno(EINVAL));
-            };
-            (sock.opts.v6only, u.peer)
+    fn udp_send(
+        &self,
+        sock: &mut Sock,
+        sockets: &mut SocketSet<'static>,
+        si: SetId,
+        ifc: &mut Iface,
+        data: &[u8],
+        to: Option<&SockAddr>,
+    ) -> Result<usize, Errno> {
+        if let Some(e) = sock.take_error() {
+            return Err(e);
+        }
+        if sock.shut_wr {
+            return Err(Errno(EPIPE));
+        }
+        let Kind::Udp(u) = &sock.kind else {
+            return Err(Errno(EINVAL));
         };
+        let (v6only, peer) = (sock.opts.v6only, u.peer);
         let ep = match to {
             Some(a) => {
                 let (ip, port) = self.inet_addr(a, v6only, ENETUNREACH)?;
@@ -1058,6 +1077,7 @@ impl InetSocket {
             }
             None => peer.ok_or(Errno(EDESTADDRREQ))?,
         };
+        let s = ifc.get();
         if !s.routable(ip_of(ep.addr)) {
             return Err(Errno(ENETUNREACH));
         }
@@ -1068,8 +1088,7 @@ impl InetSocket {
         if data.len() > max {
             return Err(Errno(EMSGSIZE));
         }
-        s.autobind(self.id)?;
-        let (sock, sockets) = s.sock_set(self.id)?;
+        autobind(s, sock, sockets, si)?;
         let Kind::Udp(u) = &sock.kind else {
             return Err(Errno(EINVAL));
         };
@@ -1081,8 +1100,13 @@ impl InetSocket {
         }
     }
 
-    fn udp_recv(&self, s: &mut Stack, buf: &mut [u8], flags: MsgFlags) -> Result<RecvInfo, Errno> {
-        let (sock, sockets) = s.sock_set(self.id)?;
+    fn udp_recv(
+        &self,
+        sock: &mut Sock,
+        sockets: &mut SocketSet<'static>,
+        buf: &mut [u8],
+        flags: MsgFlags,
+    ) -> Result<RecvInfo, Errno> {
         let Kind::Udp(u) = &sock.kind else {
             return Err(Errno(EINVAL));
         };
@@ -1196,8 +1220,7 @@ impl SocketOps for InetSocket {
     }
 
     fn bind(&self, addr: &SockAddr) -> Result<(), Errno> {
-        stack::with(false, self.id, |s| {
-            let sock = s.sock(self.id)?;
+        self.op(false, |sock, sockets, si, ifc| {
             if sock.bound.is_some() {
                 return Err(Errno(EINVAL));
             }
@@ -1206,6 +1229,7 @@ impl SocketOps for InetSocket {
                 Err(Errno(EAFNOSUPPORT)) if self.family == AF_INET6 => return Err(Errno(EINVAL)),
                 r => r?,
             };
+            let s = ifc.get();
             let ip = if ip.is_unspecified() {
                 None
             } else {
@@ -1214,13 +1238,12 @@ impl SocketOps for InetSocket {
                 }
                 Some(ip)
             };
-            s.do_bind(self.id, ip, port).map(|_| ())
+            do_bind(s, sock, sockets, si, ip, port).map(|_| ())
         })
     }
 
     fn listen(&self, backlog: i32) -> Result<(), Errno> {
-        stack::with(true, self.id, |s| {
-            let sock = s.sock(self.id)?;
+        self.op(true, |sock, sockets, si, ifc| {
             let backlog = backlog.clamp(1, MAX_BACKLOG as i32) as usize;
             match &mut sock.kind {
                 Kind::Udp(_) => return Err(Errno(EOPNOTSUPP)),
@@ -1231,8 +1254,8 @@ impl SocketOps for InetSocket {
                 }
                 Kind::Tcp(Tcp::Idle) => {}
             }
-            s.autobind(self.id)?;
-            let sock = s.sock(self.id)?;
+            let s = ifc.get();
+            autobind(s, sock, sockets, si)?;
             let (ip, port) = sock.bound.unwrap();
             sock.kind = Kind::Tcp(Tcp::Listen(Listener {
                 ep: IpListenEndpoint {
@@ -1244,103 +1267,115 @@ impl SocketOps for InetSocket {
                 pending: VecDeque::new(),
             }));
             let cover = Cover::of(sock.family, ip, sock.opts.v6only);
-            let set = sock.set;
-            s.ports.set_listening(self.id, true);
-            s.bound.add(P_TCP, port, set, cover);
-            s.slots[set].listen = true;
-            s.refill(self.id);
+            s.ports.set_listening(sock.id, true);
+            s.bound.add(P_TCP, port, si, cover);
+            refill(sock, sockets, si, &mut s.flows);
             Ok(())
         })
     }
 
     fn accept(&self) -> Result<(Arc<dyn File>, SockAddr), Errno> {
-        let (id, peer) = stack::with(true, self.id, |s| {
-            let full = s.socks.len() >= MAX_SOCKETS;
-            let linger = crate::arch::timer::now_ns() + LINGER_NS;
-            let (li, h, flow, peer, local, st, family, opts) = loop {
-                let Stack { socks, slots, .. } = &mut *s;
-                let sock = socks.get_mut(&self.id).ok_or(Errno(EBADF))?;
-                let li = sock.set;
+        let r = stack::sys(&self.set, |y, ifc| {
+            let r = (|| {
+                if !matches!(y.owner, Owner::Sock(_)) {
+                    return Err(Errno(EBADF));
+                }
+                let s = ifc.get();
+                // Frames queued for this set belong to its queued sockets:
+                // feed them before one moves out.
+                s.feed_backlog(y);
+                let Slot { id, set, owner } = y;
+                let li = *id;
+                let Owner::Sock(sock) = owner else {
+                    return Err(Errno(EBADF));
+                };
+                let full = s.nsocks >= MAX_SOCKETS;
+                let linger = crate::arch::timer::now_ns() + LINGER_NS;
                 let family = sock.family;
                 let v6only = sock.opts.v6only;
-                let Kind::Tcp(Tcp::Listen(l)) = &mut sock.kind else {
-                    return Err(Errno(EINVAL));
-                };
-                let sockets = &slots[li].set;
-                let Some(pos) = l
-                    .pending
-                    .iter()
-                    .position(|&(h, _)| accept_ready(tcp_sock(sockets, h).state()))
-                else {
-                    return Err(Errno(EAGAIN));
-                };
-                let (h, f) = l.pending[pos];
-                let t = tcp_sock(sockets, h);
-                let peer = t.remote_endpoint();
-                if peer.is_some_and(|p| !family_ok(family, v6only, ip_of(p.addr))) {
-                    // Not expected (the port map picks a listener of the
-                    // packet's family), but smoltcp's wildcard endpoints
-                    // match both families: refuse a connection of the
-                    // wrong family.
+                let (h, flow, peer, local, st) = loop {
+                    let Kind::Tcp(Tcp::Listen(l)) = &mut sock.kind else {
+                        return Err(Errno(EINVAL));
+                    };
+                    let Some(pos) = l
+                        .pending
+                        .iter()
+                        .position(|&(h, _)| accept_ready(tcp_sock(set, h).state()))
+                    else {
+                        return Err(Errno(EAGAIN));
+                    };
+                    let (h, f) = l.pending[pos];
+                    let t = tcp_sock(set, h);
+                    let peer = t.remote_endpoint();
+                    if peer.is_some_and(|p| !family_ok(family, v6only, ip_of(p.addr))) {
+                        // Not expected (the port map picks a listener of the
+                        // packet's family), but smoltcp's wildcard endpoints
+                        // match both families: refuse a connection of the
+                        // wrong family.
+                        l.pending.remove(pos);
+                        zombify(s, set, li, h, f, linger);
+                        continue;
+                    }
+                    if full {
+                        return Err(Errno(ENFILE));
+                    }
+                    let found = (
+                        h,
+                        f.or_else(|| flow_of(t)),
+                        peer,
+                        t.local_endpoint(),
+                        t.state(),
+                    );
                     l.pending.remove(pos);
-                    s.zombify(li, h, f, linger);
-                    continue;
+                    break found;
+                };
+                // The connection gets a set of its own.
+                let id = s.alloc_id();
+                let ni = s.reserve_set();
+                let mut nset = SocketSet::new(Vec::new());
+                let sk = set.remove(h);
+                let h = nset.add(sk);
+                if let Some(f) = flow {
+                    // Re-point the entry (refill made it point at the
+                    // listener's set).
+                    s.flows.insert(f, ni);
                 }
-                if full {
-                    return Err(Errno(ENFILE));
-                }
-                let found = (
-                    li,
-                    h,
-                    f.or_else(|| flow_of(t)),
-                    peer,
-                    t.local_endpoint(),
-                    t.state(),
+                let mut ns = Sock::new(
+                    id,
                     family,
-                    sock.opts.clone(),
+                    Kind::Tcp(Tcp::Conn(Conn {
+                        h,
+                        flow,
+                        connecting: false,
+                        started: 0,
+                        last: st,
+                        est: true,
+                        reset: false,
+                        peer,
+                        local,
+                        ka_since: None,
+                    })),
                 );
-                l.pending.remove(pos);
-                break found;
-            };
-            // The connection gets a set of its own.
-            let id = s.alloc_id();
-            let ni = s.alloc_set(Owner::Sock(id));
-            let sk = s.set(li).remove(h);
-            let h = s.set(ni).add(sk);
-            if let Some(f) = flow {
-                // Re-point the entry (refill made it point at the
-                // listener's set).
-                s.flow_insert(f, ni);
-            }
-            let mut ns = Sock::new(
-                family,
-                Kind::Tcp(Tcp::Conn(Conn {
-                    h,
-                    flow,
-                    connecting: false,
-                    started: 0,
-                    last: st,
-                    est: true,
-                    reset: false,
-                    peer,
-                    local,
-                    ka_since: None,
-                })),
-                ni,
-            );
-            ns.opts = opts;
-            ns.opts.misc.clear();
-            s.socks.insert(id, ns);
-            s.dirty.push(ni);
-            s.refill(self.id);
-            Ok((id, peer))
-        })?;
+                ns.opts = sock.opts.clone();
+                ns.opts.misc.clear();
+                s.nsocks += 1;
+                let nr = s.register(Slot {
+                    id: ni,
+                    set: nset,
+                    owner: Owner::Sock(ns),
+                });
+                refill(sock, set, li, &mut s.flows);
+                Ok((nr, peer))
+            })();
+            (r, true)
+        });
+        let (set, peer) = r?;
         let peer = match peer {
             Some(p) => self.view(ip_of(p.addr), p.port),
             None => self.view(self.wildcard(), 0),
         };
         let f: Arc<dyn File> = Arc::new(InetSocket {
-            id,
+            set,
             family: self.family,
             ty: self.ty,
             proto: self.proto,
@@ -1350,30 +1385,28 @@ impl SocketOps for InetSocket {
     }
 
     fn connect(&self, addr: &SockAddr) -> Result<(), Errno> {
-        stack::with(true, self.id, |s| {
-            let sock = s.sock(self.id)?;
+        self.op(true, |sock, sockets, si, ifc| {
             let v6only = sock.opts.v6only;
             match &mut sock.kind {
-                Kind::Udp(_) => {
+                Kind::Udp(u) => {
                     if *addr == SockAddr::Unspec {
-                        if let Kind::Udp(u) = &mut sock.kind {
-                            u.peer = None;
-                            u.local = None;
-                        }
+                        u.peer = None;
+                        u.local = None;
                         return Ok(());
                     }
                     let (ip, port) = self.inet_addr(addr, v6only, ENETUNREACH)?;
                     let ip = unspecified_to_loopback(ip);
+                    let s = ifc.get();
                     if !s.routable(ip) {
                         return Err(Errno(ENETUNREACH));
                     }
-                    s.autobind(self.id)?;
+                    autobind(s, sock, sockets, si)?;
                     let src = if ip.is_loopback() {
                         Some(ip)
                     } else {
                         s.iface.get_source_address(&ip.into()).map(ip_of)
                     };
-                    if let Kind::Udp(u) = &mut s.sock(self.id)?.kind {
+                    if let Kind::Udp(u) = &mut sock.kind {
                         u.peer = Some(IpEndpoint::new(ip.into(), port));
                         u.local = src;
                     }
@@ -1396,11 +1429,11 @@ impl SocketOps for InetSocket {
             if port == 0 {
                 return Err(Errno(ECONNREFUSED));
             }
+            let s = ifc.get();
             if !s.routable(ip) {
                 return Err(Errno(ENETUNREACH));
             }
-            s.autobind(self.id)?;
-            let sock = s.sock(self.id)?;
+            autobind(s, sock, sockets, si)?;
             let (lip, lport) = sock.bound.unwrap();
             if lip.is_some_and(|l| l.is_ipv4() != ip.is_ipv4()) {
                 return Err(Errno(ENETUNREACH));
@@ -1421,13 +1454,10 @@ impl SocketOps for InetSocket {
             let local = t.local_endpoint();
             // The tuple smoltcp will match replies on is fixed from here.
             let flow = flow_of(&t);
-            let (sock, set) = s.sock_set(self.id)?;
-            let si = sock.set;
-            let h = set.add(t);
+            let h = sockets.add(t);
             if let Some(f) = flow {
-                s.flow_insert(f, si);
+                s.flows.insert(f, si);
             }
-            let sock = s.sock(self.id)?;
             sock.kind = Kind::Tcp(Tcp::Conn(Conn {
                 h,
                 flow,
@@ -1445,14 +1475,14 @@ impl SocketOps for InetSocket {
     }
 
     fn connect_result(&self) -> Option<Result<(), Errno>> {
-        stack::with(false, self.id, |s| {
-            let sock = s.sock(self.id).ok()?;
-            match &sock.kind {
+        self.op(false, |sock, _, _, _| {
+            Ok(match &sock.kind {
                 Kind::Tcp(Tcp::Conn(c)) if c.connecting => None,
                 Kind::Tcp(Tcp::Conn(c)) if c.est && sock.error == 0 => Some(Ok(())),
                 _ => Some(Err(sock.take_error().unwrap_or(Errno(ECONNREFUSED)))),
-            }
+            })
         })
+        .unwrap_or(None)
     }
 
     fn send(
@@ -1465,13 +1495,13 @@ impl SocketOps for InetSocket {
         if flags.contains(MsgFlags::OOB) {
             return Err(Errno(EOPNOTSUPP));
         }
-        stack::with(true, self.id, |s| {
+        self.op(true, |sock, sockets, si, ifc| {
             if self.ty == SOCK_STREAM {
                 // Linux ignores the address on a connected stream socket
                 // (EISCONN only for some families).
-                self.tcp_send(s, data)
+                self.tcp_send(sock, sockets, data)
             } else {
-                self.udp_send(s, data, to)
+                self.udp_send(sock, sockets, si, ifc, data, to)
             }
         })
     }
@@ -1486,11 +1516,11 @@ impl SocketOps for InetSocket {
         let peek = flags.contains(MsgFlags::PEEK);
         // Polling after a read sends the window update. A read that took
         // nothing (EAGAIN, EOF, an error, MSG_PEEK) changed nothing.
-        stack::with_cond(self.id, |s| {
+        self.op_cond(|sock, sockets, _, _| {
             let r = if self.ty == SOCK_STREAM {
-                self.tcp_recv(s, buf, peek)
+                self.tcp_recv(sock, sockets, buf, peek)
             } else {
-                self.udp_recv(s, buf, flags)
+                self.udp_recv(sock, sockets, buf, flags)
             };
             let poll = !peek && matches!(&r, Ok(info) if info.len > 0);
             (r, poll)
@@ -1503,8 +1533,7 @@ impl SocketOps for InetSocket {
         }
         let rd = how != SHUT_WR;
         let wr = how != SHUT_RD;
-        stack::with(true, self.id, |s| {
-            let (sock, sockets) = s.sock_set(self.id)?;
+        self.op(true, |sock, sockets, _, _| {
             match &sock.kind {
                 Kind::Tcp(Tcp::Conn(c)) => {
                     if wr {
@@ -1522,8 +1551,7 @@ impl SocketOps for InetSocket {
     }
 
     fn local_addr(&self) -> Result<SockAddr, Errno> {
-        stack::with(false, self.id, |s| {
-            let (sock, sockets) = s.sock_set(self.id)?;
+        self.op(false, |sock, sockets, _, _| {
             if let Kind::Tcp(Tcp::Conn(c)) = &sock.kind {
                 let l = sockets.get::<tcp::Socket>(c.h).local_endpoint().or(c.local);
                 if let Some(l) = l {
@@ -1542,8 +1570,7 @@ impl SocketOps for InetSocket {
     }
 
     fn peer_addr(&self) -> Result<SockAddr, Errno> {
-        stack::with(false, self.id, |s| {
-            let sock = s.sock(self.id)?;
+        self.op(false, |sock, _, _, _| {
             let peer = match &sock.kind {
                 Kind::Tcp(Tcp::Conn(c)) if c.est && !c.reset => c.peer,
                 Kind::Udp(u) => u.peer,
@@ -1557,110 +1584,20 @@ impl SocketOps for InetSocket {
     }
 
     fn setsockopt(&self, level: i32, name: i32, val: &[u8]) -> Result<(), Errno> {
-        stack::with(false, self.id, |s| {
-            let Stack {
-                socks,
-                slots,
-                ports,
-                ..
-            } = s;
-            let sock = socks.get_mut(&self.id).ok_or(Errno(EBADF))?;
-            let sockets = &mut slots[sock.set].set;
-            let is_tcp = matches!(sock.kind, Kind::Tcp(_));
-            let o = &mut sock.opts;
-            match (level, name) {
-                (SOL_SOCKET, SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW) => {
-                    o.rcvtimeo = so::timeval_opt(val)?;
-                    return Ok(());
-                }
-                (SOL_SOCKET, SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW) => {
-                    o.sndtimeo = so::timeval_opt(val)?;
-                    return Ok(());
-                }
-                (SOL_SOCKET, SO_LINGER) => {
-                    if val.len() < 8 {
-                        return Err(Errno(EINVAL));
-                    }
-                    o.linger = Linger {
-                        l_onoff: so::int_opt(val)?,
-                        l_linger: so::int_opt(&val[4..])?,
-                    };
-                    return Ok(());
-                }
-                (SOL_SOCKET, SO_BINDTODEVICE) => {
-                    let n = val.iter().position(|&b| b == 0).unwrap_or(val.len());
-                    return match &val[..n] {
-                        b"" | b"lo" | b"eth0" => Ok(()),
-                        _ => Err(Errno(ENODEV)),
-                    };
-                }
-                _ => {}
-            }
-            let v = so::int_opt(val)?;
-            match (level, name) {
-                (SOL_SOCKET, SO_REUSEADDR) => {
-                    o.reuse.addr = v != 0;
-                    ports.set_reuse(self.id, o.reuse);
-                }
-                (SOL_SOCKET, SO_REUSEPORT) => {
-                    o.reuse.port = v != 0;
-                    ports.set_reuse(self.id, o.reuse);
-                }
-                (SOL_SOCKET, SO_KEEPALIVE) => o.keepalive = v != 0,
-                (SOL_SOCKET, SO_RCVBUF | SO_SNDBUF | SO_RCVBUFFORCE | SO_SNDBUFFORCE) => {}
-                (
-                    SOL_SOCKET,
-                    SO_BROADCAST | SO_OOBINLINE | SO_PRIORITY | SO_RCVLOWAT | SO_SNDLOWAT
-                    | SO_DONTROUTE | SO_NO_CHECK | SO_TIMESTAMP_OLD,
-                ) => {
-                    o.misc.insert((level, name), v);
-                }
-                (SOL_TCP, _) if !is_tcp => return Err(Errno(ENOPROTOOPT)),
-                (SOL_TCP, TCP_NODELAY) => o.nodelay = v != 0,
-                (SOL_TCP, TCP_KEEPIDLE | TCP_KEEPINTVL) if !(1..=32767).contains(&v) => {
-                    return Err(Errno(EINVAL));
-                }
-                (SOL_TCP, TCP_KEEPCNT) if !(1..=127).contains(&v) => return Err(Errno(EINVAL)),
-                (SOL_TCP, TCP_KEEPIDLE) => o.keepidle = v,
-                (SOL_TCP, TCP_KEEPINTVL) => o.keepintvl = v,
-                (SOL_TCP, TCP_KEEPCNT) => o.keepcnt = v,
-                (SOL_TCP, TCP_USER_TIMEOUT) if v < 0 => return Err(Errno(EINVAL)),
-                (SOL_TCP, TCP_USER_TIMEOUT) => o.user_timeout = v,
-                (SOL_TCP, TCP_MAXSEG | TCP_QUICKACK | TCP_CORK | TCP_FASTOPEN) => {
-                    o.misc.insert((level, name), v);
-                }
-                (SOL_IP, IP_TOS | IP_TTL | IP_RECVERR | IP_MTU_DISCOVER) => {
-                    o.misc.insert((level, name), v);
-                }
-                (SOL_IPV6, _) if self.family != AF_INET6 => return Err(Errno(ENOPROTOOPT)),
-                (SOL_IPV6, IPV6_V6ONLY) => {
-                    if sock.bound.is_some() {
-                        return Err(Errno(EINVAL));
-                    }
-                    o.v6only = v != 0;
-                }
-                (SOL_IPV6, IPV6_UNICAST_HOPS | IPV6_TCLASS | IPV6_RECVERR) => {
-                    o.misc.insert((level, name), v);
-                }
-                _ => return Err(Errno(ENOPROTOOPT)),
-            }
-            // Live TCP options reach the smoltcp socket.
-            if let Kind::Tcp(Tcp::Conn(c)) = &mut sock.kind {
-                let t = sockets.get_mut::<tcp::Socket>(c.h);
-                apply_live_tcp_opts(&sock.opts, c, t, crate::arch::timer::now_ns());
-            }
-            Ok(())
+        self.op_cond(|sock, sockets, _, ifc| {
+            let r = setsockopt_on(self, sock, sockets, ifc, level, name, val);
+            // Live TCP options may change the set's timers.
+            let poll = r.is_ok() && matches!(sock.kind, Kind::Tcp(Tcp::Conn(_)));
+            (r, poll)
         })
     }
 
     fn getsockopt(&self, level: i32, name: i32, out: &mut [u8]) -> Result<usize, Errno> {
-        stack::with(false, self.id, |s| {
-            let sock = s.socks.get_mut(&self.id).ok_or(Errno(EBADF))?;
+        self.op(false, |sock, _, _, _| {
             if (level, name) == (SOL_SOCKET, SO_ERROR) {
                 let e = core::mem::take(&mut sock.error);
                 return Ok(so::int_bytes(e, out));
             }
-            let sock = s.socks.get(&self.id).unwrap();
             let o = &sock.opts;
             let is_tcp = matches!(sock.kind, Kind::Tcp(_));
             let int = |v: i32, out: &mut [u8]| Ok(so::int_bytes(v, out));
@@ -1703,12 +1640,106 @@ impl SocketOps for InetSocket {
     }
 
     fn timeouts(&self) -> (Option<u64>, Option<u64>) {
-        stack::with(false, self.id, |s| {
-            s.socks
-                .get(&self.id)
-                .map_or((None, None), |x| (x.opts.rcvtimeo, x.opts.sndtimeo))
-        })
+        self.op(false, |sock, _, _, _| Ok((sock.opts.rcvtimeo, sock.opts.sndtimeo)))
+            .unwrap_or((None, None))
     }
+}
+
+/// `setsockopt` on `sock` (its set lock held; the interface lock taken
+/// for the bind table's reuse flags).
+fn setsockopt_on(
+    me: &InetSocket,
+    sock: &mut Sock,
+    sockets: &mut SocketSet<'static>,
+    ifc: &mut Iface,
+    level: i32,
+    name: i32,
+    val: &[u8],
+) -> Result<(), Errno> {
+    let is_tcp = matches!(sock.kind, Kind::Tcp(_));
+    let o = &mut sock.opts;
+    match (level, name) {
+        (SOL_SOCKET, SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW) => {
+            o.rcvtimeo = so::timeval_opt(val)?;
+            return Ok(());
+        }
+        (SOL_SOCKET, SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW) => {
+            o.sndtimeo = so::timeval_opt(val)?;
+            return Ok(());
+        }
+        (SOL_SOCKET, SO_LINGER) => {
+            if val.len() < 8 {
+                return Err(Errno(EINVAL));
+            }
+            o.linger = Linger {
+                l_onoff: so::int_opt(val)?,
+                l_linger: so::int_opt(&val[4..])?,
+            };
+            return Ok(());
+        }
+        (SOL_SOCKET, SO_BINDTODEVICE) => {
+            let n = val.iter().position(|&b| b == 0).unwrap_or(val.len());
+            return match &val[..n] {
+                b"" | b"lo" | b"eth0" => Ok(()),
+                _ => Err(Errno(ENODEV)),
+            };
+        }
+        _ => {}
+    }
+    let v = so::int_opt(val)?;
+    match (level, name) {
+        (SOL_SOCKET, SO_REUSEADDR) => {
+            o.reuse.addr = v != 0;
+            ifc.get().ports.set_reuse(sock.id, o.reuse);
+        }
+        (SOL_SOCKET, SO_REUSEPORT) => {
+            o.reuse.port = v != 0;
+            ifc.get().ports.set_reuse(sock.id, o.reuse);
+        }
+        (SOL_SOCKET, SO_KEEPALIVE) => o.keepalive = v != 0,
+        (SOL_SOCKET, SO_RCVBUF | SO_SNDBUF | SO_RCVBUFFORCE | SO_SNDBUFFORCE) => {}
+        (
+            SOL_SOCKET,
+            SO_BROADCAST | SO_OOBINLINE | SO_PRIORITY | SO_RCVLOWAT | SO_SNDLOWAT | SO_DONTROUTE
+            | SO_NO_CHECK | SO_TIMESTAMP_OLD,
+        ) => {
+            o.misc.insert((level, name), v);
+        }
+        (SOL_TCP, _) if !is_tcp => return Err(Errno(ENOPROTOOPT)),
+        (SOL_TCP, TCP_NODELAY) => o.nodelay = v != 0,
+        (SOL_TCP, TCP_KEEPIDLE | TCP_KEEPINTVL) if !(1..=32767).contains(&v) => {
+            return Err(Errno(EINVAL));
+        }
+        (SOL_TCP, TCP_KEEPCNT) if !(1..=127).contains(&v) => return Err(Errno(EINVAL)),
+        (SOL_TCP, TCP_KEEPIDLE) => o.keepidle = v,
+        (SOL_TCP, TCP_KEEPINTVL) => o.keepintvl = v,
+        (SOL_TCP, TCP_KEEPCNT) => o.keepcnt = v,
+        (SOL_TCP, TCP_USER_TIMEOUT) if v < 0 => return Err(Errno(EINVAL)),
+        (SOL_TCP, TCP_USER_TIMEOUT) => o.user_timeout = v,
+        (SOL_TCP, TCP_MAXSEG | TCP_QUICKACK | TCP_CORK | TCP_FASTOPEN) => {
+            o.misc.insert((level, name), v);
+        }
+        (SOL_IP, IP_TOS | IP_TTL | IP_RECVERR | IP_MTU_DISCOVER) => {
+            o.misc.insert((level, name), v);
+        }
+        (SOL_IPV6, _) if me.family != AF_INET6 => return Err(Errno(ENOPROTOOPT)),
+        (SOL_IPV6, IPV6_V6ONLY) => {
+            if sock.bound.is_some() {
+                return Err(Errno(EINVAL));
+            }
+            o.v6only = v != 0;
+        }
+        (SOL_IPV6, IPV6_UNICAST_HOPS | IPV6_TCLASS | IPV6_RECVERR) => {
+            o.misc.insert((level, name), v);
+        }
+        _ => return Err(Errno(ENOPROTOOPT)),
+    }
+    // Live TCP options reach the smoltcp socket.
+    if let Kind::Tcp(Tcp::Conn(c)) = &mut sock.kind {
+        let t = sockets.get_mut::<tcp::Socket>(c.h);
+        apply_live_tcp_opts(&sock.opts, c, t, crate::arch::timer::now_ns());
+    }
+    Ok(())
 }
 
 const IP_MTU_DISCOVER: i32 = 10;
@@ -1728,24 +1759,21 @@ impl File for InetSocket {
     }
 
     fn poll(&self, hook: Option<&Arc<dyn PollHook>>) -> EpollFlags {
-        let Some(lock) = stack::get() else {
-            return EpollFlags::ERR | EpollFlags::HUP;
-        };
-        let mut g = stack::lock_at(lock, super::prof::Site::FilePoll);
-        let s = &mut *g;
-        let Some(sock) = s.socks.get_mut(&self.id) else {
-            return EpollFlags::ERR | EpollFlags::HUP;
-        };
-        if let Some(h) = hook {
-            sock.hooks.add(h);
-        }
-        sock.ready(&s.slots[sock.set].set).0
+        stack::poll_file(&self.set, |y| {
+            let Slot { set, owner, .. } = y;
+            let Owner::Sock(sock) = owner else {
+                return EpollFlags::ERR | EpollFlags::HUP;
+            };
+            if let Some(h) = hook {
+                sock.hooks.add(h);
+            }
+            sock.ready(set).0
+        })
     }
 
     fn ioctl(&self, cmd: u32, arg: u64) -> Result<isize, Errno> {
         let n: i32 = match cmd {
-            FIONREAD | SIOCOUTQ => stack::with(false, self.id, |s| {
-                let (sock, sockets) = s.sock_set(self.id)?;
+            FIONREAD | SIOCOUTQ => self.op(false, |sock, sockets, _, _| {
                 Ok(match &sock.kind {
                     Kind::Tcp(Tcp::Conn(c)) => {
                         let t = sockets.get::<tcp::Socket>(c.h);
@@ -1782,9 +1810,14 @@ impl File for InetSocket {
     }
 
     fn release(&self) {
-        if stack::get().is_some() {
-            stack::with(true, self.id, |s| s.close_sock(self.id));
-        }
+        stack::sys(&self.set, |y, ifc| {
+            let s = ifc.get();
+            // A listener's queued frames go to its queued sockets before
+            // they are moved into zombie sets.
+            s.feed_backlog(y);
+            close_sock(s, y);
+            ((), true)
+        });
     }
 
     fn as_socket(&self) -> Option<&dyn SocketOps> {

@@ -103,6 +103,16 @@ impl<'a, T: ?Sized> SpinLockGuard<'a, T> {
         drop(self); // releases the lock; `irq` is None, so IRQs stay masked
         (lock, flags)
     }
+
+    /// Exchange the interrupt state this guard restores on drop with
+    /// `other`'s. Guards restore what they saved, so nested guards must be
+    /// dropped in reverse order of acquisition; after a swap the two may be
+    /// dropped in acquisition order instead (the network stack takes a
+    /// socket set's lock with `try_lock` while holding the interface lock,
+    /// then releases the interface lock first).
+    pub fn swap_irq_state<U: ?Sized>(&mut self, other: &mut SpinLockGuard<'_, U>) {
+        core::mem::swap(&mut self.irq, &mut other.irq);
+    }
 }
 
 impl<T: ?Sized> Deref for SpinLockGuard<'_, T> {
