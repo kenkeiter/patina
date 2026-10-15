@@ -628,8 +628,9 @@ fn fire(n: Notify, from_task: bool) {
 /// A socket syscall on set `l` (see the module docs): `f` does the
 /// operation under the set lock (taking the interface lock through the
 /// [`Iface`] if it needs to) and says whether the set must be polled
-/// (something to send, state changed). Then readiness is refreshed and
-/// fired, and if it polled, received frames are drained.
+/// (something to send, state changed). If it polls, the same interface
+/// lock hold goes on to drain received frames (the set lock is released
+/// first); readiness changes are fired once no lock is held.
 pub fn sys<R>(l: &SetLock, f: impl FnOnce(&mut Slot, &mut Iface) -> (R, bool)) -> R {
     let mut g = lock_set(l);
     let mut ifc = Iface::new();
@@ -641,8 +642,23 @@ pub fn sys<R>(l: &SetLock, f: impl FnOnce(&mut Slot, &mut Iface) -> (R, bool)) -
     let (r, poll) = f(&mut g, &mut ifc);
     prof::WITH_OP.done(t);
     if poll {
-        ifc.at(Site::SysPoll).run_set(&mut g, None, true);
-    } else if let Some(h) = ifc.h.as_mut() {
+        let mut h = match ifc.h.take() {
+            Some(h) => h,
+            None => lock_at(Site::SysPoll),
+        };
+        h.site = Site::SysPoll;
+        h.run_set(&mut g, None, true);
+        let n = refresh(&mut g);
+        // Let go of the set but keep the interface lock for the drain. No
+        // frame can have been queued on the set's backlog since `run_set`
+        // (that needs the interface lock), so nothing is left to serve.
+        g.serve = false;
+        g.g.swap_irq_state(&mut h.g);
+        drop(g);
+        drain(Site::Drain, SYS_BUDGET, Some(h), n);
+        return r;
+    }
+    if let Some(h) = ifc.h.as_mut() {
         // A backlog fed above may have queued replies.
         h.mux.flush();
     }
@@ -650,9 +666,6 @@ pub fn sys<R>(l: &SetLock, f: impl FnOnce(&mut Slot, &mut Iface) -> (R, bool)) -
     let n = refresh(&mut g);
     drop(g);
     fire(n, false);
-    if poll {
-        drain(Site::Drain, SYS_BUDGET);
-    }
     r
 }
 
@@ -692,92 +705,147 @@ fn poll_set(l: &SetLock, site: Site) {
     fire(n, site == Site::Task);
 }
 
+/// Frames fed per interface-lock hold in a drain: between holds the
+/// collected readiness changes are fired and others get the lock.
+const BATCH: usize = 16;
+
+/// A drain in progress.
+struct Drain {
+    budget: usize,
+    nic_n: usize,
+    lo_n: usize,
+    /// Readiness changes of the sets fed under the current hold.
+    notify: Notify,
+    /// Sets that got a frame on their backlog under the current hold.
+    serve: Vec<SetRef>,
+    /// Sets to poll (a rescan).
+    work: Vec<SetRef>,
+}
+
 /// Take received frames — the loopback queue first (up to `LO_BUDGET`),
 /// then at most `budget` from the NIC — and feed each to its set (see the
-/// module docs); then poll every set if a rescan was asked for, and take
-/// the frames that produced, for at most `MAX_ROUNDS` rounds.
-fn drain(site: Site, budget: usize) {
+/// module docs), `BATCH` frames per interface-lock hold (the first hold
+/// may be the caller's, `first`; `notify` is the caller's readiness change,
+/// fired with the first batch's); then poll every set if a rescan was
+/// asked for, and take the frames that produced, for at most `MAX_ROUNDS`
+/// rounds.
+fn drain(site: Site, budget: usize, first: Option<Held>, notify: Notify) {
     let mut buf = [0u8; MAX_FRAME];
-    let mut nic_n = 0;
-    let mut lo_n = 0;
-    let mut work: Vec<SetRef> = Vec::new();
+    let mut d = Drain {
+        budget,
+        nic_n: 0,
+        lo_n: 0,
+        notify,
+        serve: Vec::new(),
+        work: Vec::new(),
+    };
     let from_task = site == Site::Task;
+    let mut held = first;
     for _ in 0..MAX_ROUNDS {
         loop {
-            let mut s = lock_at(site);
-            let timing = s.prof;
-            let t = prof::start(timing);
-            let Some((len, nic)) = s.mux.next_frame(lo_n < LO_BUDGET, nic_n < budget, &mut buf)
-            else {
-                prof::INGRESS_NONE.done(t);
-                s.mux.flush();
-                s.nic_backlog = nic_n >= budget;
-                if s.nic_backlog || s.mux.lo_pending() {
-                    s.kick = true;
-                }
-                if s.rescan {
-                    s.rescan = false;
-                    if timing {
-                        prof::add(&prof::RESCANS, 1);
-                    }
-                    work.extend(s.entries.iter().filter_map(|e| e.set.clone()));
-                }
-                break;
+            let mut s = match held.take() {
+                Some(h) => h,
+                None => lock_at(site),
             };
-            if nic {
-                nic_n += 1;
-            } else {
-                lo_n += 1;
-            }
-            let f = &buf[..len];
-            let Some(id) = s.demux(f) else {
-                let now = now();
-                let Stack {
-                    iface, mux, empty, ..
-                } = &mut *s;
-                let _ = iface.poll_ingress_single(now, &mut mux.one_frame(f), empty);
-                prof::INGRESS.done(t);
-                if timing {
-                    prof::add(&prof::INGRESS_PKTS, 1);
-                }
-                continue;
-            };
-            let e = &mut s.entries[id];
-            let Some(r) = e.set.clone() else {
-                continue; // not expected: demux only names registered sets
-            };
-            if e.backlog.is_empty()
-                && let Some(mut g) = try_lock_set(&r)
-            {
-                s.run_set(&mut g, Some(f), false);
-                // Release the interface lock before the set's.
-                g.g.swap_irq_state(&mut s.g);
-                drop(s);
-                let n = refresh(&mut g);
-                drop(g);
-                fire(n, from_task);
-                continue;
-            }
-            if e.backlog.len() < MAX_BACKLOG {
-                e.backlog.push_back(Box::from(f));
-                r.pending.store(true, Ordering::Relaxed);
-                if timing {
-                    prof::add(&prof::BACKLOGGED, 1);
-                }
-            } else if timing {
-                prof::add(&prof::BACKLOG_DROPS, 1);
-            }
+            let done = drain_hold(&mut s, &mut d, &mut buf);
             drop(s);
-            fence(Ordering::SeqCst);
-            service(&r, site);
+            fire(core::mem::replace(&mut d.notify, Notify::NONE), from_task);
+            if !d.serve.is_empty() {
+                fence(Ordering::SeqCst);
+                for r in d.serve.drain(..) {
+                    service(&r, site);
+                }
+            }
+            if done {
+                break;
+            }
         }
-        if work.is_empty() {
+        if d.work.is_empty() {
             return;
         }
-        for r in work.drain(..) {
+        for r in core::mem::take(&mut d.work) {
             poll_set(&r, site);
         }
     }
+}
+
+/// One hold of a drain: feed up to `BATCH` frames. A frame for a set whose
+/// lock is free is fed right here (the set is locked with `try_lock` and
+/// released before the interface lock: nothing can reach its backlog
+/// meanwhile); otherwise it goes on the set's backlog and the set is
+/// served after the hold. Returns true when no frame is left (within the
+/// budgets).
+fn drain_hold(s: &mut Held, d: &mut Drain, buf: &mut [u8; MAX_FRAME]) -> bool {
+    let timing = s.prof;
+    for _ in 0..BATCH {
+        let t = prof::start(timing);
+        let Some((len, nic)) = s
+            .mux
+            .next_frame(d.lo_n < LO_BUDGET, d.nic_n < d.budget, buf)
+        else {
+            prof::INGRESS_NONE.done(t);
+            s.mux.flush();
+            s.nic_backlog = d.nic_n >= d.budget;
+            if s.nic_backlog || s.mux.lo_pending() {
+                s.kick = true;
+            }
+            if s.rescan {
+                s.rescan = false;
+                if timing {
+                    prof::add(&prof::RESCANS, 1);
+                }
+                d.work.extend(s.entries.iter().filter_map(|e| e.set.clone()));
+            }
+            return true;
+        };
+        if nic {
+            d.nic_n += 1;
+        } else {
+            d.lo_n += 1;
+        }
+        let f = &buf[..len];
+        let Some(id) = s.demux(f) else {
+            let now = now();
+            let Stack {
+                iface, mux, empty, ..
+            } = &mut **s;
+            let _ = iface.poll_ingress_single(now, &mut mux.one_frame(f), empty);
+            prof::INGRESS.done(t);
+            if timing {
+                prof::add(&prof::INGRESS_PKTS, 1);
+            }
+            continue;
+        };
+        let e = &mut s.entries[id];
+        let Some(r) = e.set.clone() else {
+            continue; // not expected: demux only names registered sets
+        };
+        if e.backlog.is_empty()
+            && let Some(mut g) = try_lock_set(&r)
+        {
+            g.serve = false;
+            s.run_set(&mut g, Some(f), false);
+            let n = refresh(&mut g);
+            drop(g);
+            d.notify = core::mem::replace(&mut d.notify, Notify::NONE).and(n);
+            continue;
+        }
+        if e.backlog.len() < MAX_BACKLOG {
+            e.backlog.push_back(Box::from(f));
+            r.pending.store(true, Ordering::Relaxed);
+            if timing {
+                prof::add(&prof::BACKLOGGED, 1);
+            }
+            if !d.serve.iter().any(|x| Arc::ptr_eq(x, &r)) {
+                d.serve.push(r);
+            }
+        } else if timing {
+            prof::add(&prof::BACKLOG_DROPS, 1);
+        }
+    }
+    // Ring the doorbells for this batch's replies.
+    s.mux.flush();
+    false
 }
 
 impl Stack {
@@ -932,12 +1000,10 @@ impl Stack {
             self.feed(y, f, now);
             fed = true;
         }
-        if egress || fed {
-            self.egress(y, now);
-        }
+        let sent = (egress || fed) && self.egress(y, now);
         let own = match y.owner {
             Owner::Free => None,
-            Owner::Sock(_) => self.track(y, now_ns),
+            Owner::Sock(_) => self.track(y, now_ns, fed, sent),
             Owner::Zombie { .. } => match inet::reap(self, y, now_ns) {
                 Some(d) => d,
                 None => {
@@ -1021,16 +1087,19 @@ impl Stack {
         }
     }
 
-    /// `poll_egress` on set `y` until it has nothing more to send.
-    fn egress(&mut self, y: &mut Slot, now: Instant) {
+    /// `poll_egress` on set `y` until it has nothing more to send. Returns
+    /// whether it sent anything.
+    fn egress(&mut self, y: &mut Slot, now: Instant) -> bool {
         let timing = self.prof;
+        let mut sent = false;
         loop {
             let t = prof::start(timing);
             let r = self.iface.poll_egress(now, &mut self.mux, &mut y.set);
             if r == PollResult::None {
                 prof::EGRESS_NONE.done(t);
-                break;
+                return sent;
             }
+            sent = true;
             prof::EGRESS.done(t);
             if timing {
                 prof::add(&prof::EGRESS_SOME, 1);
@@ -1039,15 +1108,16 @@ impl Stack {
     }
 
     /// Settle inet socket set `y` after a poll (`inet::track`, a
-    /// listener's refill); returns the socket's own next deadline.
-    fn track(&mut self, y: &mut Slot, now_ns: u64) -> Option<u64> {
+    /// listener's refill; `fed`/`sent`: the poll fed it frames / sent
+    /// something); returns the socket's own next deadline.
+    fn track(&mut self, y: &mut Slot, now_ns: u64, fed: bool, sent: bool) -> Option<u64> {
         let timing = self.prof;
         let Slot { id, set, owner } = y;
         let Owner::Sock(sock) = owner else {
             return None;
         };
         let t = prof::start(timing);
-        inet::track(sock, set, *id, &mut self.flows, now_ns);
+        inet::track(sock, set, *id, &mut self.flows, now_ns, (fed, sent));
         if t != 0 {
             prof::TRACK.done(t);
             prof::add(&prof::TRACK_SOCKS, 1);
@@ -1473,7 +1543,7 @@ fn round(site: Site, work: &mut Vec<SetRef>) -> bool {
     for r in work.drain(..) {
         poll_set(&r, site);
     }
-    drain(site, TASK_BUDGET);
+    drain(site, TASK_BUDGET, None, Notify::NONE);
     timing
 }
 

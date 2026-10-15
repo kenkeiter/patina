@@ -119,6 +119,9 @@ pub struct Conn {
     /// handed to smoltcp: the start (ns) of the idle period the first probe
     /// waits out (see [`apply_live_tcp_opts`]).
     ka_since: Option<u64>,
+    /// A lower bound of the receive window smoltcp last advertised (bytes;
+    /// see [`window_update_due`]).
+    adv: usize,
 }
 
 pub enum Tcp {
@@ -474,6 +477,23 @@ impl Sock {
     }
 }
 
+/// After a TCP read: would smoltcp send a window update now? It does when
+/// its receive window is at least twice the one it last advertised
+/// (`tcp::Socket::window_to_update`, private); [`Conn::adv`] is a lower
+/// bound of that, so this errs towards polling (16 bytes of slack cover
+/// the window-scale rounding). A read that needs no update leaves the
+/// interface lock alone.
+fn window_update_due(sock: &Sock, sockets: &SocketSet<'static>) -> bool {
+    match &sock.kind {
+        Kind::Tcp(Tcp::Conn(c)) => {
+            let t = tcp_sock(sockets, c.h);
+            let free = t.recv_capacity() - t.recv_queue();
+            free + 16 > 2 * c.adv
+        }
+        _ => false,
+    }
+}
+
 fn accept_ready(st: tcp::State) -> bool {
     !matches!(
         st,
@@ -581,11 +601,23 @@ pub fn track(
     i: SetId,
     flows: &mut BTreeMap<Flow, SetId>,
     now_ns: u64,
+    (fed, sent): (bool, bool),
 ) {
     match &mut sock.kind {
         Kind::Tcp(Tcp::Conn(c)) => {
             let t = sockets.get_mut::<tcp::Socket>(c.h);
             let st = t.state();
+            // Every segment advertises the free receive space at the time
+            // it is sent; within a poll that space only shrinks (frames
+            // are fed, nothing is read). A poll that sent something last
+            // advertised what is free now; segments sent while frames were
+            // fed advertised at least what is free now.
+            let free = t.recv_capacity() - t.recv_queue();
+            if sent {
+                c.adv = free;
+            } else if fed {
+                c.adv = c.adv.min(free);
+            }
             if c.connecting {
                 if st == tcp::State::Closed {
                     c.connecting = false;
@@ -1354,6 +1386,7 @@ impl SocketOps for InetSocket {
                         peer,
                         local,
                         ka_since: None,
+                        adv: 0,
                     })),
                 );
                 ns.opts = sock.opts.clone();
@@ -1469,6 +1502,7 @@ impl SocketOps for InetSocket {
                 peer: Some(remote),
                 local,
                 ka_since: None,
+                adv: 0,
             }));
             Err(Errno(EINPROGRESS))
         })
@@ -1514,15 +1548,18 @@ impl SocketOps for InetSocket {
             return Err(Errno(EAGAIN));
         }
         let peek = flags.contains(MsgFlags::PEEK);
-        // Polling after a read sends the window update. A read that took
-        // nothing (EAGAIN, EOF, an error, MSG_PEEK) changed nothing.
+        // Polling after a read sends the window update, when smoltcp would
+        // send one. A read that took nothing (EAGAIN, EOF, an error,
+        // MSG_PEEK) changed nothing; a UDP read has nothing to send.
         self.op_cond(|sock, sockets, _, _| {
             let r = if self.ty == SOCK_STREAM {
                 self.tcp_recv(sock, sockets, buf, peek)
             } else {
                 self.udp_recv(sock, sockets, buf, flags)
             };
-            let poll = !peek && matches!(&r, Ok(info) if info.len > 0);
+            let poll = !peek
+                && matches!(&r, Ok(info) if info.len > 0)
+                && window_update_due(sock, sockets);
             (r, poll)
         })
     }
