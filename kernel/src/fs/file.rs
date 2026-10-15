@@ -168,7 +168,12 @@ impl Notify {
     };
 
     /// Merge another pending notification into this one.
-    pub fn and(mut self, other: Notify) -> Notify {
+    pub fn and(mut self, mut other: Notify) -> Notify {
+        if self.hooks.is_empty() {
+            // Keep `other`'s list (no copy).
+            other.events |= self.events;
+            return other;
+        }
         self.events |= other.events;
         self.hooks.extend(other.hooks);
         self

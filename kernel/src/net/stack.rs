@@ -388,7 +388,7 @@ enum Want {
 }
 
 /// Panic if this CPU is about to wait for a lock out of order (see the
-/// module docs). A thread holding a spinlock cannot migrate (IRQs are
+/// module docs; called when the lock is busy). A thread holding a spinlock cannot migrate (IRQs are
 /// masked), so per-CPU flags describe what it holds.
 fn check_order(want: Want) {
     let f = irq::save_disable();
@@ -444,21 +444,21 @@ fn record(site: Site, t0: u64, spin: Option<u64>) {
     st.record_hold(prof::now().saturating_sub(t0));
 }
 
-/// Lock `l`, timing a contended acquisition when stats are on: (guard,
-/// hold start or 0, spin).
-fn timed_lock<T>(l: &SpinLock<T>) -> (SpinLockGuard<'_, T>, u64, Option<u64>) {
-    if !prof::on() {
-        return (l.lock(), 0, None);
-    }
+/// Lock `l` (`want` names it for the order check, which runs only when
+/// the lock is busy: a deadlock needs a wait), timing a contended
+/// acquisition when stats are on: (guard, hold start or 0, spin).
+fn timed_lock<T>(l: &SpinLock<T>, want: Want) -> (SpinLockGuard<'_, T>, u64, Option<u64>) {
+    let timing = prof::on();
     let (g, spin) = match l.try_lock() {
         Some(g) => (g, None),
         None => {
-            let t = prof::now();
+            check_order(want);
+            let t = prof::start(timing);
             let g = l.lock();
-            (g, Some(prof::now().saturating_sub(t)))
+            (g, timing.then(|| prof::now().saturating_sub(t)))
         }
     };
-    (g, prof::now(), spin)
+    (g, prof::start(timing), spin)
 }
 
 // -- The stack lock ---------------------------------------------------------
@@ -507,8 +507,7 @@ impl Drop for Held {
 /// snapshot goes through here).
 pub fn lock_at(site: Site) -> Held {
     let lock = get().expect("net: stack not initialised");
-    check_order(Want::Stack);
-    let (mut g, t0, spin) = timed_lock(lock);
+    let (mut g, t0, spin) = timed_lock(lock, Want::Stack);
     g.prof = t0 != 0;
     if t0 != 0 {
         if let Some(c) = prof::LOCK_CPU.get(crate::arch::cpu::id()) {
@@ -637,11 +636,10 @@ fn shard_cell(cpu: usize) -> &'static SpinLock<Shard> {
 /// Lock this CPU's shard (creating it on first use) with its addresses up
 /// to date.
 pub fn lock_shard() -> ShardGuard {
-    check_order(Want::Shard);
     let f = irq::save_disable();
     let cpu = crate::arch::cpu::id();
     let cell = shard_cell(cpu);
-    let (g, t0, spin) = timed_lock(cell);
+    let (g, t0, spin) = timed_lock(cell, Want::Shard);
     SHARD_HELD[cpu].store(true, Ordering::Relaxed);
     let mut sg = ShardGuard {
         g: ManuallyDrop::new(g),
@@ -714,6 +712,15 @@ impl Ctx {
         self.get().1
     }
 
+    /// The shard, taken out of the context (the stack lock is released).
+    fn take_shard(&mut self) -> ShardGuard {
+        self.st = None;
+        match self.sh.take() {
+            Some(sh) => sh,
+            None => lock_shard(),
+        }
+    }
+
     /// The shard alone (the stack lock is released).
     fn shard(&mut self) -> &mut ShardGuard {
         self.st = None;
@@ -783,8 +790,7 @@ fn set_guard<'a>(
 
 /// Lock set `l` (waiting).
 pub fn lock_set(l: &SetLock) -> SetGuard<'_> {
-    check_order(Want::Set);
-    let (g, t0, spin) = timed_lock(&l.slot);
+    let (g, t0, spin) = timed_lock(&l.slot, Want::Set);
     set_guard(l, g, t0, spin)
 }
 
@@ -808,7 +814,7 @@ fn service(l: &SetLock, site: Site) {
         g.serve = false;
         {
             let mut sh = lock_shard();
-            run_set(&mut sh, &mut g, None, false, site);
+            run_set(&mut sh, &mut g, None, false, false, site);
         }
         if let Some(o) = OUT.get() {
             o.flush();
@@ -861,7 +867,7 @@ fn fire(n: Notify, from_task: bool) {
 // -- Polling one set ----------------------------------------------------------
 
 /// Poll set `g` through shard `sh` (see the module docs): feed its backlog
-/// and `frame`, run its egress (if `egress` or a frame was fed) until it
+/// and `frame` (`pre_fed`: the caller fed it frames already), run its egress (if `egress` or a frame was fed) until it
 /// has nothing more to send, settle it, and file its next poll time if
 /// that is earlier than its timer. Takes the stack lock (for `site`) only
 /// for a backlog, flow-table changes, an earlier timer, or releasing the
@@ -870,6 +876,7 @@ pub fn run_set(
     sh: &mut Shard,
     g: &mut SetGuard<'_>,
     frame: Option<&[u8]>,
+    pre_fed: bool,
     egress: bool,
     site: Site,
 ) {
@@ -882,13 +889,13 @@ pub fn run_set(
     let t_all = prof::start(timing);
     let now_ns = crate::arch::timer::now_ns();
     let now = instant(now_ns);
-    let mut fed = false;
+    let mut fed = pre_fed;
     if l.pending.load(Ordering::Relaxed) {
         let q = lock_at(site).take_backlog(y.id);
         for f in &q {
             feed(sh, y, f, now);
         }
-        fed = !q.is_empty();
+        fed |= !q.is_empty();
     }
     if let Some(f) = frame {
         feed(sh, y, f, now);
@@ -1121,21 +1128,31 @@ pub fn sys<R>(l: &SetLock, f: impl FnOnce(&mut Slot, &mut Ctx) -> (R, bool)) -> 
     let backlog = l.pending.load(Ordering::Relaxed);
     if backlog {
         // Frames that arrived while the set was busy come first.
-        run_set(ctx.shard(), &mut g, None, false, Site::SysNoPoll);
+        run_set(ctx.shard(), &mut g, None, false, false, Site::SysNoPoll);
     }
     let t = prof::start(prof::on());
     let (r, poll) = f(&mut g, &mut ctx);
     prof::WITH_OP.done(t);
     if poll {
-        run_set(ctx.shard(), &mut g, None, true, Site::SysPoll);
+        let mut sh = ctx.take_shard();
+        run_set(&mut sh, &mut g, None, false, true, Site::SysPoll);
+        let n = refresh(&mut g);
+        // Let go of the set but keep the shard for the drain. No frame can
+        // reach the set's backlog unnoticed: `pending` is checked below.
+        g.serve = false;
+        g.g.swap_irq_flags(&mut sh.irq);
+        drop(g);
+        drop(ctx);
+        drain(Site::Drain, SYS_BUDGET, Some(sh), n);
+        fence(Ordering::SeqCst);
+        service(l, Site::Drain);
+        return r;
     }
     drop(ctx);
     let n = refresh(&mut g);
     drop(g);
     fire(n, false);
-    if poll {
-        drain(Site::Drain, SYS_BUDGET);
-    } else if backlog && let Some(o) = OUT.get() {
+    if backlog && let Some(o) = OUT.get() {
         // The backlog fed above may have queued replies.
         o.flush();
     }
@@ -1150,7 +1167,7 @@ pub fn poll_file<R>(l: &SetLock, f: impl FnOnce(&mut Slot) -> R) -> R {
     if l.pending.load(Ordering::Relaxed) {
         {
             let mut sh = lock_shard();
-            run_set(&mut sh, &mut g, None, false, Site::FilePoll);
+            run_set(&mut sh, &mut g, None, false, false, Site::FilePoll);
         }
         if let Some(o) = OUT.get() {
             o.flush();
@@ -1178,7 +1195,7 @@ fn poll_set(l: &SetLock, popped: Option<u64>, site: Site) {
     }
     {
         let mut sh = lock_shard();
-        run_set(&mut sh, &mut g, None, true, site);
+        run_set(&mut sh, &mut g, None, false, true, site);
     }
     let n = refresh(&mut g);
     drop(g);
@@ -1204,95 +1221,217 @@ fn feed_empty(f: &[u8], neighbor: bool, t: u64) {
     }
 }
 
+/// Frames taken per shard hold in a drain: between batches the collected
+/// readiness changes are fired and the shard is released.
+const BATCH: usize = 32;
+
+/// A drain in progress (see [`drain`]).
+struct Drain {
+    site: Site,
+    budget: usize,
+    nic_n: usize,
+    lo_n: usize,
+    /// Readiness changes collected under the current batch.
+    notify: Notify,
+    /// Sets that got frames on their backlog during the batch.
+    serve: Vec<SetRef>,
+    /// Neighbor frames to show the other shards after the batch.
+    neighbors: Vec<Box<[u8]>>,
+    /// Sets to poll (a rescan).
+    work: Vec<SetRef>,
+}
+
+/// The set a drain batch is feeding: its frames are fed as they come, its
+/// egress and settling run once, when the batch moves on ([`Drain::finish`]).
+struct Cur {
+    /// Declared before `r`: the guard borrows the lock `r` keeps alive.
+    g: SetGuard<'static>,
+    r: SetRef,
+}
+
+impl Cur {
+    /// Lock `r` if it is free.
+    fn try_new(r: SetRef) -> Option<Cur> {
+        // SAFETY: the guard borrows the `SetLock` inside `r`'s allocation,
+        // which `r` (dropped after the guard) keeps alive.
+        let l: &'static SetLock = unsafe { &*Arc::as_ptr(&r) };
+        let mut g = try_lock_set(l)?;
+        g.serve = false;
+        Some(Cur { g, r })
+    }
+}
+
+impl Drain {
+    /// Poll `c`'s set after its frames (egress, settling, timer), collect
+    /// its readiness change, release it; serve its backlog later if frames
+    /// went there meanwhile.
+    fn finish(&mut self, sh: &mut Shard, c: Option<Cur>) {
+        let Some(Cur { mut g, r }) = c else {
+            return;
+        };
+        run_set(sh, &mut g, None, true, false, self.site);
+        let n = refresh(&mut g);
+        self.notify = core::mem::replace(&mut self.notify, Notify::NONE).and(n);
+        drop(g);
+        fence(Ordering::SeqCst);
+        if r.pending.load(Ordering::Relaxed) && !self.serve.iter().any(|x| Arc::ptr_eq(x, &r)) {
+            self.serve.push(r);
+        }
+    }
+}
+
 /// Take received frames — the loopback queue first (up to `LO_BUDGET`),
 /// then at most `budget` from the NIC — and feed each to its set (see the
-/// module docs); then poll every set if a rescan was asked for, and take
-/// the frames that produced, for at most `MAX_ROUNDS` rounds.
-fn drain(site: Site, budget: usize) {
+/// module docs), `BATCH` per hold of this CPU's shard (the first hold may
+/// be the caller's, `first`; `notify` is the caller's readiness change,
+/// fired after the first batch); then poll every set
+/// if a rescan was asked for, and take the frames that produced, for at
+/// most `MAX_ROUNDS` rounds.
+fn drain(site: Site, budget: usize, first: Option<ShardGuard>, notify: Notify) {
     let mut buf = [0u8; MAX_FRAME];
-    let mut nic_n = 0;
-    let mut lo_n = 0;
-    let mut work: Vec<SetRef> = Vec::new();
+    let mut first = first;
+    let mut d = Drain {
+        site,
+        budget,
+        nic_n: 0,
+        lo_n: 0,
+        notify,
+        serve: Vec::new(),
+        neighbors: Vec::new(),
+        work: Vec::new(),
+    };
     let from_task = site == Site::Task;
     for _ in 0..MAX_ROUNDS {
         loop {
-            let mut s = lock_at(site);
-            let timing = s.prof;
-            let t = prof::start(timing);
-            let Some((len, nic)) = s
-                .out
-                .next_frame(lo_n < LO_BUDGET, nic_n < budget, &mut buf)
-            else {
-                prof::INGRESS_NONE.done(t);
-                s.nic_backlog = nic_n >= budget;
-                if s.nic_backlog || s.out.lo_pending() {
-                    s.kick = true;
+            let done = {
+                let mut sh = match first.take() {
+                    Some(sh) => sh,
+                    None => lock_shard(),
+                };
+                let done = drain_batch(&mut sh, &mut d, &mut buf);
+                drop(sh);
+                done
+            };
+            fire(core::mem::replace(&mut d.notify, Notify::NONE), from_task);
+            for f in core::mem::take(&mut d.neighbors) {
+                show_neighbor(&f);
+            }
+            if !d.serve.is_empty() {
+                fence(Ordering::SeqCst);
+                for r in core::mem::take(&mut d.serve) {
+                    service(&r, site);
                 }
-                if s.rescan {
-                    s.rescan = false;
-                    if timing {
-                        prof::add(&prof::RESCANS, 1);
-                    }
-                    work.extend(s.entries.iter().filter_map(|e| e.set.clone()));
-                }
-                let out = s.out;
-                drop(s);
-                out.flush();
+            }
+            if done {
                 break;
-            };
-            if nic {
-                nic_n += 1;
-            } else {
-                lo_n += 1;
             }
-            let f = &buf[..len];
-            let id = match s.demux(f) {
-                Demux::Set(id) => id,
-                Demux::Empty { neighbor } => {
-                    drop(s);
-                    feed_empty(f, neighbor, t);
-                    continue;
-                }
-            };
-            let e = &mut s.entries[id];
-            let Some(r) = e.set.clone() else {
-                continue; // not expected: demux only names registered sets
-            };
-            if e.backlog.is_empty()
-                && let Some(mut g) = try_lock_set(&r)
-            {
-                // Release the stack lock before the set's.
-                g.g.swap_irq_state(&mut s.g);
-                drop(s);
-                {
-                    let mut sh = lock_shard();
-                    run_set(&mut sh, &mut g, Some(f), false, site);
-                }
-                let n = refresh(&mut g);
-                drop(g);
-                fire(n, from_task);
-                continue;
-            }
-            if e.backlog.len() < MAX_BACKLOG {
-                e.backlog.push_back(Box::from(f));
-                r.pending.store(true, Ordering::Relaxed);
-                if timing {
-                    prof::add(&prof::BACKLOGGED, 1);
-                }
-            } else if timing {
-                prof::add(&prof::BACKLOG_DROPS, 1);
-            }
-            drop(s);
-            fence(Ordering::SeqCst);
-            service(&r, site);
         }
-        if work.is_empty() {
+        if d.work.is_empty() {
             return;
         }
-        for r in core::mem::take(&mut work) {
+        for r in core::mem::take(&mut d.work) {
             poll_set(&r, None, site);
         }
     }
+}
+
+/// One batch of a drain, holding this CPU's shard `sh` (see the module
+/// docs): take up to `BATCH` frames; a frame for a set whose lock is free
+/// (`try_lock`) is fed at once, and so are the frames after it for the
+/// same set, its egress and settling waiting until the batch moves on to
+/// another set; a frame for a busy set goes on its backlog. Returns true
+/// when no frame is left (within the budgets).
+fn drain_batch(sh: &mut Shard, d: &mut Drain, buf: &mut [u8; MAX_FRAME]) -> bool {
+    let mut cur: Option<Cur> = None;
+    let mut done = false;
+    for _ in 0..BATCH {
+        let mut s = lock_at(d.site);
+        let timing = s.prof;
+        let t = prof::start(timing);
+        let Some((len, nic)) = s
+            .out
+            .next_frame(d.lo_n < LO_BUDGET, d.nic_n < d.budget, buf)
+        else {
+            prof::INGRESS_NONE.done(t);
+            s.nic_backlog = d.nic_n >= d.budget;
+            if s.nic_backlog || s.out.lo_pending() {
+                s.kick = true;
+            }
+            if s.rescan {
+                s.rescan = false;
+                if timing {
+                    prof::add(&prof::RESCANS, 1);
+                }
+                d.work.extend(s.entries.iter().filter_map(|e| e.set.clone()));
+            }
+            done = true;
+            break;
+        };
+        if nic {
+            d.nic_n += 1;
+        } else {
+            d.lo_n += 1;
+        }
+        let f = &buf[..len];
+        let id = match s.demux(f) {
+            Demux::Set(id) => id,
+            Demux::Empty { neighbor } => {
+                drop(s);
+                let Shard {
+                    iface, tx, empty, ..
+                } = &mut *sh;
+                let _ = iface.poll_ingress_single(now(), &mut tx.one_frame(f, false), empty);
+                prof::INGRESS.done(t);
+                if timing {
+                    prof::add(&prof::INGRESS_PKTS, 1);
+                }
+                if neighbor {
+                    d.neighbors.push(Box::from(f));
+                }
+                continue;
+            }
+        };
+        let e = &mut s.entries[id];
+        let Some(r) = e.set.clone() else {
+            continue; // not expected: demux only names registered sets
+        };
+        if e.backlog.is_empty() {
+            if let Some(c) = cur.as_mut()
+                && Arc::ptr_eq(&c.r, &r)
+            {
+                drop(s);
+                feed(sh, &mut c.g, f, now());
+                continue;
+            }
+            if let Some(mut c) = Cur::try_new(r.clone()) {
+                // Every lock taken under the shard saved masked
+                // interrupts, so they may be released in any order.
+                drop(s);
+                d.finish(sh, cur.take());
+                feed(sh, &mut c.g, f, now());
+                cur = Some(c);
+                continue;
+            }
+        }
+        if e.backlog.len() < MAX_BACKLOG {
+            e.backlog.push_back(Box::from(f));
+            r.pending.store(true, Ordering::Relaxed);
+            if timing {
+                prof::add(&prof::BACKLOGGED, 1);
+            }
+        } else if timing {
+            prof::add(&prof::BACKLOG_DROPS, 1);
+        }
+        drop(s);
+        if !d.serve.iter().any(|x| Arc::ptr_eq(x, &r)) {
+            d.serve.push(r);
+        }
+    }
+    d.finish(sh, cur.take());
+    let out = sh.tx.out();
+    out.flush();
+    // The last set's egress may have looped frames back.
+    done && !(out.lo_pending() && d.lo_n < LO_BUDGET)
 }
 
 /// Where a received frame goes.
@@ -1788,7 +1927,7 @@ fn round(site: Site, work: &mut Vec<(SetRef, Option<u64>)>) -> bool {
     for (r, at) in work.drain(..) {
         poll_set(&r, at, site);
     }
-    drain(site, TASK_BUDGET);
+    drain(site, TASK_BUDGET, None, Notify::NONE);
     timing
 }
 

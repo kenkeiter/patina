@@ -113,6 +113,13 @@ impl<'a, T: ?Sized> SpinLockGuard<'a, T> {
     pub fn swap_irq_state<U: ?Sized>(&mut self, other: &mut SpinLockGuard<'_, U>) {
         core::mem::swap(&mut self.irq, &mut other.irq);
     }
+
+    /// The same with an interrupt state saved outside a guard (by a
+    /// caller of `irq::save_disable` that restores it after its own
+    /// guard).
+    pub fn swap_irq_flags(&mut self, other: &mut Option<irq::Flags>) {
+        core::mem::swap(&mut self.irq, other);
+    }
 }
 
 impl<T: ?Sized> Deref for SpinLockGuard<'_, T> {
