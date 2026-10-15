@@ -44,7 +44,8 @@
 //!   pending is kicked right away, so the device keeps draining a long
 //!   burst (a 4 MiB response) instead of waiting for the end of the pass
 //!   with its ring full.
-//! * `VIRTIO_F_EVENT_IDX` is negotiated when offered (VZ and QEMU do).
+//! * `VIRTIO_F_EVENT_IDX` is negotiated when offered (VZ and QEMU do;
+//!   `patina.net.event_idx=0` turns it off).
 //!   A pending kick then notifies only when the device's `avail_event`
 //!   was crossed (it went idle waiting for exactly these buffers);
 //!   without it the device's `VIRTQ_USED_F_NO_NOTIFY` is honoured
@@ -541,7 +542,8 @@ fn set_pairs(
 
 /// Claim and start the first virtio-net device, if any, and register it
 /// with `net::device`. `patina.net.queues=N` caps the queue pairs (1: do
-/// not negotiate multiqueue).
+/// not negotiate multiqueue); `patina.net.event_idx=0` leaves
+/// `VIRTIO_F_EVENT_IDX` off.
 pub fn init(cmdline: &patina_cmdline::Cmdline) {
     let Some(dev) = super::take(DEVICE_NET) else {
         return;
@@ -559,6 +561,16 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     }
     .min(MAX_PAIRS);
     let want_mq = ncpu > 1 && cap > 1;
+    // `patina.net.event_idx=0`: do not negotiate VIRTIO_F_EVENT_IDX (for
+    // comparisons, and for a device whose implementation of it misbehaves).
+    let want_ei = match cmdline.get("patina.net.event_idx") {
+        Some(Some("0")) => 0,
+        Some(Some("1")) | None => F_EVENT_IDX,
+        Some(v) => {
+            crate::kprintln!("[patina] virtio-net: ignoring patina.net.event_idx={:?}", v);
+            F_EVENT_IDX
+        }
+    };
     // The transport goes into DEV first, so the interrupt callbacks can be
     // attached (and acknowledge) before the device may interrupt.
     if DEV.set(dev.transport).is_err() {
@@ -567,7 +579,7 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     let t = transport();
     let feats = match negotiate_with(t, |offered| {
         let mq = F_MQ | F_CTRL_VQ;
-        F_MAC | F_STATUS | F_MTU | F_EVENT_IDX | if want_mq && offered & mq == mq { mq } else { 0 }
+        F_MAC | F_STATUS | F_MTU | want_ei | if want_mq && offered & mq == mq { mq } else { 0 }
     }) {
         Ok(f) => f,
         Err(e) => {
