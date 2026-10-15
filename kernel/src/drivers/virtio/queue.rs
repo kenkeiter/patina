@@ -145,6 +145,10 @@ pub struct VirtQueue {
     no_interrupt: bool,
     /// `avail_idx` at the last [`kick_prepare`](Self::kick_prepare).
     checked_idx: u16,
+    /// EVENT_IDX: `used_event` = `last_used` was written and the ring
+    /// re-checked empty after it, so the device interrupts for the next
+    /// completion. Cleared by every pop.
+    armed: bool,
 }
 
 // SAFETY: the ring memory is owned by the queue; all access goes through
@@ -183,6 +187,7 @@ impl VirtQueue {
             event_idx: false,
             no_interrupt: false,
             checked_idx: 0,
+            armed: true,
             mem,
         };
         // Free list: each descriptor's `next` points at the following one.
@@ -243,15 +248,12 @@ impl VirtQueue {
         self.write_used_event();
     }
 
-    pub fn event_idx(&self) -> bool {
-        self.event_idx
-    }
-
     /// Ask the device not to interrupt for used buffers on this queue
     /// (a hint; for queues the driver polls). With EVENT_IDX this moves
     /// `used_event` out of reach instead of setting the flag.
     pub fn set_no_interrupt(&mut self, on: bool) {
         self.no_interrupt = on;
+        self.armed = false;
         // SAFETY: the avail ring's flags word.
         unsafe {
             (self.avail_va(0) as *mut u16).write_volatile(if on { AVAIL_F_NO_INTERRUPT } else { 0 })
@@ -361,21 +363,32 @@ impl VirtQueue {
         self.used_idx() != self.last_used
     }
 
+    /// Whether the device will interrupt for the next completion: always
+    /// without EVENT_IDX (unless [`set_no_interrupt`](Self::set_no_interrupt)),
+    /// with it only once [`pop_used`](Self::pop_used) found the ring empty
+    /// after the last pop. Completions pending while this is false may
+    /// never interrupt: the owner must come back for them.
+    pub fn interrupt_armed(&self) -> bool {
+        !self.event_idx || self.armed
+    }
+
     /// Next completed chain: (head token, bytes written by the device).
     /// With EVENT_IDX, finding the ring empty re-arms the interrupt
     /// (`used_event` = `last_used`) and re-checks after a full fence, so a
     /// completion published concurrently is either returned or interrupts.
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
         if self.used_idx() == self.last_used {
-            if !self.event_idx {
+            if !self.event_idx || self.armed {
                 return None;
             }
             self.write_used_event();
             fence(Ordering::SeqCst);
             if self.used_idx() == self.last_used {
+                self.armed = true;
                 return None;
             }
         }
+        self.armed = false;
         let slot = (self.last_used % self.size) as usize;
         // SAFETY: a used-ring element (id u32, len u32) the device wrote
         // before publishing the index we observed (acquire above).

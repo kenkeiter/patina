@@ -392,7 +392,7 @@ impl Net {
         for p in &mut self.pairs[..self.active] {
             p.kick_rx();
             p.kick_tx();
-            left |= p.rx.event_idx() && p.rx.has_used();
+            left |= !p.rx.interrupt_armed() && p.rx.has_used();
         }
         if left {
             FLUSH_RX_LEFT.fetch_add(1, Ordering::Relaxed);
