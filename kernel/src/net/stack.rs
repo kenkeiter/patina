@@ -1739,6 +1739,8 @@ pub fn print_stats() {
     ph("with_op", &prof::WITH_OP);
     ph("nic_rx_kick", &prof::NIC_RX_KICK);
     ph("nic_tx_kick", &prof::NIC_TX_KICK);
+    ph("nic_send", &prof::NIC_SEND);
+    ph("nic_recv", &prof::NIC_RECV);
     ph("fire_task", &prof::FIRE_TASK);
     ph("fire_sys", &prof::FIRE_SYS);
     let (socks_now, set_now, flows_now, mux) = match lock.try_lock() {

@@ -230,6 +230,10 @@ pub const SET_SAMPLE: u64 = 64;
 /// (after reposting buffers) and transmit (per frame).
 pub static NIC_RX_KICK: Phase = Phase::new();
 pub static NIC_TX_KICK: Phase = Phase::new();
+/// `NetDevice::send` / a `NetDevice::recv` that returned a frame (the
+/// driver's lock, the copy, the descriptors; kicks included).
+pub static NIC_SEND: Phase = Phase::new();
+pub static NIC_RECV: Phase = Phase::new();
 
 /// Net task.
 pub static TASK_ROUNDS: Counter = Counter::new(0);

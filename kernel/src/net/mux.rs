@@ -268,7 +268,10 @@ impl MuxTx {
         }
         match nic.as_mut() {
             Some(n) => {
-                if n.send(f) {
+                let t = super::prof::start(super::prof::on());
+                let ok = n.send(f);
+                super::prof::NIC_SEND.done(t);
+                if ok {
                     stats.nic_tx += 1;
                 } else {
                     stats.nic_tx_drops += 1;
@@ -349,7 +352,9 @@ impl Mux {
         if !nic {
             return None;
         }
+        let t = super::prof::start(super::prof::on());
         let n = self.tx.nic.as_mut()?.recv(&mut buf[..])?;
+        super::prof::NIC_RECV.done(t);
         self.tx.stats.nic_rx += 1;
         Some((n, true))
     }
