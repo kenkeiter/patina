@@ -16,7 +16,7 @@
 //! `add`). Owners: [`Owner`].
 //!
 //! **Ingress demux.** Frames are taken one at a time (loopback queue
-//! first, then the NIC, at most `MAX_INGRESS` per round) and their
+//! first, then the NIC: at most `MAX_INGRESS` NIC frames per pass) and their
 //! transport tuple read (`patina_inet::demux::parse`). The tuple is looked
 //! up (a) exactly in [`Stack::flows`] — connections (from `connect` on,
 //! including zombies) and a listener's not-yet-accepted connections
@@ -190,6 +190,8 @@ pub struct Stack {
     /// Queue every live set in the next round (a neighbor may have been
     /// learned, or the addresses changed).
     rescan: bool,
+    /// The last pass stopped taking NIC frames at its budget.
+    nic_backlog: bool,
     round: u64,
     pass_no: u64,
     egress_q: Vec<SetId>,
@@ -444,7 +446,7 @@ impl Stack {
 
     /// When the stack wants to be polled next (ns; [`NEVER`]: no timer).
     pub fn earliest(&self) -> u64 {
-        if self.mux.lo_pending() || self.rescan || !self.dirty.is_empty() {
+        if self.mux.lo_pending() || self.rescan || self.nic_backlog || !self.dirty.is_empty() {
             return crate::arch::timer::now_ns();
         }
         self.timers.first().map_or(NEVER, |&(t, _)| t)
@@ -506,7 +508,7 @@ impl Stack {
         if self.rescan {
             self.rescan_all();
         }
-        for _ in 0..MAX_ROUNDS {
+        for round in 0..MAX_ROUNDS {
             let mut q = core::mem::take(&mut self.egress_q);
             self.round += 1;
             for &i in &q {
@@ -518,15 +520,23 @@ impl Stack {
             }
             q.clear();
             self.egress_q = q;
+            // NIC frames only in the first round (at most MAX_INGRESS per
+            // pass): later rounds only carry the loopback replies, so a
+            // steady stream from the NIC cannot keep one pass going.
+            let nic = round == 0;
             let mut n = 0;
             while n < MAX_INGRESS {
                 let t = prof::start(timing);
-                let Some(len) = self.mux.next_frame(true) else {
+                let Some(len) = self.mux.next_frame(nic) else {
                     prof::INGRESS_NONE.done(t);
                     break;
                 };
                 n += 1;
                 self.ingest(len, now, t);
+            }
+            if nic {
+                // Budget used up: frames may be left for the next pass.
+                self.nic_backlog = n == MAX_INGRESS;
             }
             if self.rescan {
                 self.rescan_all();
@@ -958,6 +968,7 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
         empty: SocketSet::new(Vec::new()),
         timers: BTreeSet::new(),
         rescan: false,
+        nic_backlog: false,
         round: 0,
         pass_no: 0,
         egress_q: Vec::new(),
