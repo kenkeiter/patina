@@ -100,6 +100,7 @@ PUT /actions                  {"action_type":"InstanceStart"}
 - Command-line length: Firecracker's buffer is 2048 bytes including what it appends, so the CLI refuses `boot_args` longer than 1792 bytes.
 - x86_64 ACPI: Firecracker ≥ 1.8 also describes each virtio-mmio device in the DSDT (`_HID` `LNRO0005`, Memory32Fixed + interrupt). It places the RSDP at 0xe0000 but does not set `hvm_start_info.rsdp_paddr` on PVH boot, so the kernel must scan 0xe0000–0xfffff for `RSD PTR `. Alternatively, the cmdline entries are enough to find the devices.
 - Power-off: on x86_64, an i8042 reset (write 0xfe to port 0x64) makes Firecracker exit with status 0. On aarch64, PSCI SYSTEM_OFF does the same.
+- Observed on Firecracker v1.17.0 x86_64 (`scripts/fc-remote.sh`): the API sequence works unchanged. Unlike the text above, linux-loader splits `boot_args` at ` -- `: with program arguments the ` pci=off virtio_mmio.device=...` tokens are inserted *before* our `--` (`... patina.epoch=N pci=off virtio_mmio.device=... -- -selftest`); only with no arguments do they follow the trailing `--`. The kernel takes raw `=` tokens as parameters in both places, so argv is right either way. Firecracker attaches the net device first whatever the PUT order: net at 0xc0001000 GSI 5, then vsock (GSI 6) and entropy (GSI 7). The RSDP is at 0xe0000 with `rsdp_paddr` 0 as described, the KVM in-kernel PIT is present, and the host tap stays DOWN until Firecracker opens it.
 
 ### Cloud Hypervisor
 

@@ -11,7 +11,8 @@ The per-phase checklist is in [doc/status.md](doc/status.md). Items are marked v
 | QEMU aarch64 (`virt`, HVF) | Verified: `scripts/test-net.sh` | Verified: 13 packages, 0 failures at 1, 4 and 8 vCPUs |
 | QEMU x86_64 (`microvm`/`q35`, TCG) | Verified: `scripts/test-net.sh` | Verified: 13 packages, 0 failures at 1 vCPU, 5 packages at 4 vCPUs |
 | Apple VZ (aarch64) | Verified: `scripts/test-vz.sh` (console on `hvc0`, vsock control channel, NAT networking, `AF_VSOCK` for the program) | Verified: `os` and `net` packages, 0 failures (`PATINA_VMM=vz scripts/test-gopkg.sh`) |
-| Firecracker (both arches) | Written to the spec, unverified (no KVM host). The CLI driver is tested only against fakes. | Not run |
+| Firecracker x86_64 | Verified on a remote KVM host (Firecracker v1.17.0) with `scripts/fc-remote.sh`: hello, httphello over a tap with `--ip`, `patina ctl stop`, 1/2/4 vCPUs. | Not run |
+| Firecracker aarch64 | Written to the spec, unverified (no arm64 KVM host). | Not run |
 | Cloud Hypervisor (both arches) | Written to the spec, unverified (no KVM host). The CLI driver is tested only against fakes. | Not run |
 
 Milestone B covers `runtime`, `os`, `net`, `os/signal`, `time`, `sync`, `syscall`, `io`, `bufio`, `context`, `net/http`, `runtime/pprof` and `os/user`, with `-test.short`. The skip lists in `testapps/skiplist/` hold 36 tests, all of which need `os/exec` or a `GODEBUG` re-exec.
