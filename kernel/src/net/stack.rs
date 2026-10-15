@@ -1348,6 +1348,7 @@ impl Stack {
             if let Some((ip, p)) = addr {
                 let _ = a.push(IpCidr::Ipv4(Ipv4Cidr::new(ip, p)));
             }
+            loopback_last(a);
         });
         self.sync_own_addrs();
         self.iface.routes_mut().remove_default_ipv4_route();
@@ -1418,8 +1419,23 @@ impl Stack {
             if !a.contains(&cidr) {
                 let _ = a.push(cidr);
             }
+            loopback_last(a);
         });
         self.sync_own_addrs();
+    }
+}
+
+/// Move 127.0.0.1/8 behind every other address. smoltcp picks an IPv4 source
+/// address for an off-subnet destination (through the gateway) by falling
+/// back to the *first* IPv4 address, so with loopback first, UDP and TCP to
+/// anything beyond the local subnet left eth0 from 127.0.0.1 (found on
+/// Firecracker with a tap + NAT; QEMU slirp's DNS and gateway are on-subnet).
+fn loopback_last(a: &mut [IpCidr]) {
+    if let Some(i) = a
+        .iter()
+        .position(|c| matches!(c, IpCidr::Ipv4(c) if c.address().is_loopback()))
+    {
+        a[i..].rotate_left(1);
     }
 }
 

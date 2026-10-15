@@ -298,7 +298,7 @@ for arch in "${arches[@]}"; do
   bgpids+=("$qpid")
   if ! wait_log "$log" '^httphello: listening' 90 "$qpid"; then
     fail "$arch pci" "no 'httphello: listening' line"; kill_ours
-  elif ! has "$log" '^\[patina\] net: virtio-net hwaddr .* 10\.0\.2\.15/24, gateway 10\.0\.2\.2'; then
+  elif ! has "$log" '^\[patina\] net: virtio-net hwaddr .* 10\.0\.2\.15/24.*, gateway 10\.0\.2\.2'; then
     fail "$arch pci" "no net boot line"; kill_ours
   elif ! has "$log" '^\[patina\] virtio-net: .* \(pci [0-9a-f:.]+, hdr 12 B\)'; then
     fail "$arch pci" "virtio-net is not on virtio-pci"; kill_ours
