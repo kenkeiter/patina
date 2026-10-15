@@ -3407,23 +3407,23 @@ Processing frames inline in the NIC IRQ handler: not needed at load (the
 net task does 0.03 rounds per request; syscalls drain), left open for the
 C=1 latency case.
 
-**Measured (final tree c9bc3cf, `scripts/bench-http.sh`, host idle,
-median of 3 × 10 s; doc/bench-http.md "After D89").** `GET /` req/s (p99
-ms) on VZ, N=1 / 2 / 4: C=1 13.3k (0.14) / 11.7k (0.14) / 9.6k (0.18) →
-14.2k (0.15) / 12.3k (0.14) / 9.1k (0.66); C=16 25.7k (1.27) / 46.8k
-(0.95) / 52.0k (0.68) → 43.2k (0.79) / 69.7k (0.58) / 65.3k (0.49); C=64
-20.7k (6.17) / 36.0k (6.55) / 42.6k (11.97) → 42.5k (3.09) / 117.6k
-(1.75) / 116.3k (1.27). QEMU/HVF (slirp): C=16 15.9k / 17.6k / 17.9k →
-36.5k / 55.2k / 53.0k; C=64 14.7k / 17.3k / 16.7k → 36.6k / 65.4k / 63.3k
-(bench-http.md's "slirp is the bottleneck" was wrong). `/big` MB/s, C=1 /
-C=8: VZ 361/360, 350/394, 349/429 → 403/583, 426/849, 407/917; QEMU 75/65
-→ 257/261 at N=1. C=64 is now ≥ C=16 on every target and vCPU count; VZ
-at N=2 C=64 is 85 % of native loopback (137.7k). That run still had the
-VZ N=4 C=1 p99 tail (0.66–0.77 ms in two of three runs); with the
-idle-ring kick (bf38609, five runs, host idle) N=4 gives C=1 9.7–9.9k
-req/s with p99 0.18–0.19 ms, C=16 65–68k (p99 0.43–0.60 ms), C=64
-122–124k (p99 1.08–1.17 ms), `/big` 413 MB/s at C=1 and ~970 MB/s at
-C=8. A ~1 s stall (smoltcp's minimum RTO: a lost segment or ACK between
+**Measured (final tree bf38609, `scripts/bench-http.sh --targets
+vz,qemu`, host idle, median of 3 × 10 s; doc/bench-http.md "After
+D89").** `GET /` req/s (p99 ms) on VZ, N=1 / 2 / 4: C=1 13.3k (0.14) /
+11.7k (0.14) / 9.6k (0.18) → 14.6k (0.14) / 12.3k (0.15) / 9.8k (0.18);
+C=16 25.7k (1.27) / 46.8k (0.95) / 52.0k (0.68) → 42.3k (0.81) / 69.8k
+(0.58) / 66.3k (0.46); C=64 20.7k (6.17) / 36.0k (6.55) / 42.6k (11.97)
+→ 42.1k (3.13) / 117.7k (1.80) / 121.8k (1.12). QEMU/HVF (slirp): C=16
+15.9k / 17.6k / 17.9k → 36.6k / 54.6k / 53.9k; C=64 14.7k / 17.3k / 16.7k
+→ 36.4k / 64.5k / 64.5k (bench-http.md's "slirp is the bottleneck" was
+wrong). `/big` MB/s, C=1 / C=8: VZ 361/360, 350/394, 349/429 → 416/578,
+431/849, 419/967; QEMU 75/65 → 244/246 at N=1. C=64 is now ≥ C=16 on
+every target and vCPU count; VZ at N=2 C=64 is 86 % of native loopback
+(137.7k); C=1 throughput and both latency percentiles are at or better
+than before at every N (the c9bc3cf run before the idle-ring kick had the
+N=4 C=1 p99 tail described above; five further runs of N=4 on bf38609
+gave C=1 p99 0.18–0.19 ms and C=64 122–124k). A ~1 s stall (smoltcp's
+minimum RTO: a lost segment or ACK between
 the guest and VZ's NAT) shows up in about one `/big` C=8 run in ten
 (p99 0.6–0.8 s, max 1.0–1.1 s in that run), on every kernel measured here
 including the pre-D89 ones (D85 saw the same stall); not chased. Loopback
