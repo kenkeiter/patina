@@ -6,10 +6,9 @@
 //! smoltcp sockets it owns in its own smoltcp `SocketSet`, so polling one
 //! socket never walks the others (D67) and operations on different sockets
 //! run in parallel. Every operation runs under the set lock
-//! (`stack::sys`); the CPU's interface shard and the stack lock are taken
-//! inside, only when the operation touches shared state (the bind table,
-//! the port map, the flow table, routes, `iface.context()`) or polls the
-//! set:
+//! (`stack::sys`); the interface lock is taken inside, only when the
+//! operation touches shared state (the bind table, the port map, the flow
+//! table, routes, `iface.context()`) or polls the set:
 //!
 //! * TCP, idle: an empty set until `connect` or `listen`.
 //! * TCP listener: smoltcp has one socket per connection, so a listener's
@@ -70,7 +69,7 @@ use smoltcp::time::Duration;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use super::socket::{self as so, RecvInfo, SocketOps};
-use super::stack::{self, Ctx, FlowOp, Owner, SetId, SetRef, Shard, Slot, Stack};
+use super::stack::{self, Iface, Owner, SetId, SetRef, Slot, Stack};
 use crate::fs::file::{File, FileFlags, Notify, PollHook, PollList, alloc_ino, anon_stat};
 use crate::mm::heap;
 
@@ -529,13 +528,17 @@ pub fn is_listener(sock: &Sock) -> bool {
     matches!(sock.kind, Kind::Tcp(Tcp::Listen(_)))
 }
 
-/// Listener `sock` (its set `sockets`): move pool sockets that got a SYN
+/// Listener `sock` (set `si`, `sockets`): move pool sockets that got a SYN
 /// to the accept queue (with a flow-table entry pointing at the listener's
-/// set: `ops`), drop or recycle queued ones that were reset before
-/// completing, and keep the pool full. Runs after every frame fed to the
-/// listener and whenever its set is polled (set lock held; `ops` are
-/// applied under the stack lock).
-pub fn refill(sock: &mut Sock, sockets: &mut SocketSet<'static>, ops: &mut Vec<FlowOp>) {
+/// set), drop or recycle queued ones that were reset before completing,
+/// and keep the pool full. Runs after every frame fed to the listener and
+/// whenever its set is polled (set and interface lock held).
+pub fn refill(
+    sock: &mut Sock,
+    sockets: &mut SocketSet<'static>,
+    si: SetId,
+    flows: &mut BTreeMap<Flow, SetId>,
+) {
     let opts = &sock.opts;
     let Kind::Tcp(Tcp::Listen(l)) = &mut sock.kind else {
         return;
@@ -549,7 +552,7 @@ pub fn refill(sock: &mut Sock, sockets: &mut SocketSet<'static>, ops: &mut Vec<F
             l.listening.swap_remove(i);
             let f = flow_of(t);
             if let Some(f) = f {
-                ops.push(FlowOp::Insert(f));
+                flows.insert(f, si);
             }
             l.pending.push_back((h, f));
         } else {
@@ -564,12 +567,12 @@ pub fn refill(sock: &mut Sock, sockets: &mut SocketSet<'static>, ops: &mut Vec<F
         match sockets.get::<tcp::Socket>(h).state() {
             tcp::State::Listen if l.listening.len() < LISTEN_POOL => {
                 l.pending.remove(i);
-                unflow(ops, f);
+                unflow(flows, f, si);
                 l.listening.push(h);
             }
             tcp::State::Listen | tcp::State::Closed => {
                 l.pending.remove(i);
-                unflow(ops, f);
+                unflow(flows, f, si);
                 remove_tcp(sockets, h);
             }
             _ => i += 1,
@@ -591,11 +594,12 @@ pub fn refill(sock: &mut Sock, sockets: &mut SocketSet<'static>, ops: &mut Vec<F
 
 /// After socket `sock`'s set (`i`, `sockets`) was polled: connection state
 /// transitions, the connect timeout, the deferred keep-alive, UDP peer
-/// filtering (set lock held; flow-table changes go to `ops`).
+/// filtering (set and interface lock held).
 pub fn track(
     sock: &mut Sock,
     sockets: &mut SocketSet<'static>,
-    ops: &mut Vec<FlowOp>,
+    i: SetId,
+    flows: &mut BTreeMap<Flow, SetId>,
     now_ns: u64,
     (fed, sent): (bool, bool),
 ) {
@@ -658,7 +662,7 @@ pub fn track(
             }
             if st == tcp::State::Closed {
                 // No tuple any more: smoltcp accepts nothing for it.
-                unflow(ops, c.flow.take());
+                unflow(flows, c.flow.take(), i);
             }
             c.last = st;
         }
@@ -677,19 +681,12 @@ pub fn track(
     }
 }
 
-/// What [`reap`] decided about a zombie.
-pub enum Reap {
-    /// Its socket is gone: unregister the set (its flow entry's removal is
-    /// in the slot's ops).
-    Gone,
-    /// Still finishing; its own deadline (the linger give-up time).
-    Keep(Option<u64>),
-}
-
-/// Settle zombie set `y` (set lock held).
-pub fn reap(y: &mut Slot, now_ns: u64) -> Reap {
+/// Settle zombie set `y` (set and interface lock held): `None` once it is
+/// gone (the set is unregistered), else its own deadline (the linger
+/// give-up time).
+pub fn reap(s: &mut Stack, y: &mut Slot, now_ns: u64) -> Option<Option<u64>> {
     let Owner::Zombie { h, until, flow } = y.owner else {
-        return Reap::Keep(None);
+        return None;
     };
     let t = y.set.get_mut::<tcp::Socket>(h);
     let st = t.state();
@@ -698,22 +695,23 @@ pub fn reap(y: &mut Slot, now_ns: u64) -> Reap {
         || st == tcp::State::Listen;
     if gone {
         remove_tcp(&mut y.set, h);
-        unflow(&mut y.ops, flow);
-        return Reap::Gone;
+        unflow(&mut s.flows, flow, y.id);
+        s.unregister(y);
+        return None;
     }
     if st != tcp::State::Closed && (t.recv_queue() > 0 || now_ns > until) {
         // Data arrived for a closed socket, or it lingered too long:
         // reset it (removed once the RST is out).
         t.abort();
     }
-    Reap::Keep((now_ns <= until).then_some(until + 1))
+    Some((now_ns <= until).then_some(until + 1))
 }
 
 /// Move queued socket `h` (flow `f`) of listener set `from` (`fi`) into a
-/// zombie set of its own and abort it (the listener's set lock, the shard
-/// and the stack lock held; the net task sends the RST).
+/// zombie set of its own and abort it (the listener's set lock and the
+/// interface lock held; the new set is registered with an immediate timer,
+/// so the net task sends the RST).
 fn zombify(
-    sh: &mut Shard,
     s: &mut Stack,
     from: &mut SocketSet<'static>,
     fi: SetId,
@@ -727,13 +725,15 @@ fn zombify(
     let nh = set.add(sk);
     set.get_mut::<tcp::Socket>(nh).abort();
     move_flow(&mut s.flows, f, fi, z);
-    let at = Stack::first_poll(sh, &set);
-    let owner = Owner::Zombie {
-        h: nh,
-        until,
-        flow: f,
-    };
-    let _ = s.register(Slot::new(z, set, owner), at);
+    let _ = s.register(Slot {
+        id: z,
+        set,
+        owner: Owner::Zombie {
+            h: nh,
+            until,
+            flow: f,
+        },
+    });
     s.mark_dirty(z);
 }
 
@@ -783,10 +783,10 @@ fn autobind(
     Ok(())
 }
 
-/// Drop the socket of set `y` (its file was released; set lock, shard and
-/// stack lock held): UDP and idle / listening TCP sockets go at once, a
-/// TCP connection becomes a zombie in the same set.
-fn close_sock(sh: &mut Shard, s: &mut Stack, y: &mut Slot) {
+/// Drop the socket of set `y` (its file was released; set and interface
+/// lock held): UDP and idle / listening TCP sockets go at once, a TCP
+/// connection becomes a zombie in the same set.
+fn close_sock(s: &mut Stack, y: &mut Slot) {
     let Owner::Sock(sock) = core::mem::replace(&mut y.owner, Owner::Free) else {
         return;
     };
@@ -812,7 +812,7 @@ fn close_sock(sh: &mut Shard, s: &mut Stack, y: &mut Slot) {
                 remove_tcp(&mut y.set, h);
             }
             for (h, f) in l.pending {
-                zombify(sh, s, &mut y.set, si, h, f, deadline);
+                zombify(s, &mut y.set, si, h, f, deadline);
             }
             s.unregister(y);
         }
@@ -835,10 +835,10 @@ fn close_sock(sh: &mut Shard, s: &mut Stack, y: &mut Slot) {
     }
 }
 
-/// Remove the flow-table entry `f` (if it still points at this set).
-fn unflow(ops: &mut Vec<FlowOp>, f: Option<Flow>) {
+/// Remove the flow-table entry `f` if it still points at set `i`.
+fn unflow(flows: &mut BTreeMap<Flow, SetId>, f: Option<Flow>, i: SetId) {
     if let Some(f) = f {
-        ops.push(FlowOp::Remove(f));
+        stack::flow_remove(flows, f, i);
     }
 }
 
@@ -918,7 +918,11 @@ pub fn create(family: u16, ty: u32, protocol: i32) -> Result<Arc<InetSocket>, Er
             }),
         };
         s.nsocks += 1;
-        s.register(Slot::new(si, set, Owner::Sock(Sock::new(id, family, kind))), stack::NEVER)
+        s.register(Slot {
+            id: si,
+            set,
+            owner: Owner::Sock(Sock::new(id, family, kind)),
+        })
     };
     Ok(Arc::new(InetSocket {
         set,
@@ -935,7 +939,7 @@ impl InetSocket {
     fn op<R>(
         &self,
         poll: bool,
-        f: impl FnOnce(&mut Sock, &mut SocketSet<'static>, SetId, &mut Ctx) -> Result<R, Errno>,
+        f: impl FnOnce(&mut Sock, &mut SocketSet<'static>, SetId, &mut Iface) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         self.op_cond(|sock, set, si, ifc| (f(sock, set, si, ifc), poll))
     }
@@ -948,11 +952,11 @@ impl InetSocket {
             &mut Sock,
             &mut SocketSet<'static>,
             SetId,
-            &mut Ctx,
+            &mut Iface,
         ) -> (Result<R, Errno>, bool),
     ) -> Result<R, Errno> {
         stack::sys(&self.set, |y, ifc| {
-            let Slot { id, set, owner, .. } = y;
+            let Slot { id, set, owner } = y;
             match owner {
                 Owner::Sock(sock) => f(sock, set, *id, ifc),
                 _ => (Err(Errno(EBADF)), false),
@@ -1081,7 +1085,7 @@ impl InetSocket {
         sock: &mut Sock,
         sockets: &mut SocketSet<'static>,
         si: SetId,
-        ifc: &mut Ctx,
+        ifc: &mut Iface,
         data: &[u8],
         to: Option<&SockAddr>,
     ) -> Result<usize, Errno> {
@@ -1105,7 +1109,7 @@ impl InetSocket {
             }
             None => peer.ok_or(Errno(EDESTADDRREQ))?,
         };
-        let s = ifc.stack();
+        let s = ifc.get();
         if !s.routable(ip_of(ep.addr)) {
             return Err(Errno(ENETUNREACH));
         }
@@ -1257,7 +1261,7 @@ impl SocketOps for InetSocket {
                 Err(Errno(EAFNOSUPPORT)) if self.family == AF_INET6 => return Err(Errno(EINVAL)),
                 r => r?,
             };
-            let s = ifc.stack();
+            let s = ifc.get();
             let ip = if ip.is_unspecified() {
                 None
             } else {
@@ -1282,7 +1286,7 @@ impl SocketOps for InetSocket {
                 }
                 Kind::Tcp(Tcp::Idle) => {}
             }
-            let s = ifc.stack();
+            let s = ifc.get();
             autobind(s, sock, sockets, si)?;
             let (ip, port) = sock.bound.unwrap();
             sock.kind = Kind::Tcp(Tcp::Listen(Listener {
@@ -1297,9 +1301,7 @@ impl SocketOps for InetSocket {
             let cover = Cover::of(sock.family, ip, sock.opts.v6only);
             s.ports.set_listening(sock.id, true);
             s.bound.add(P_TCP, port, si, cover);
-            let mut ops = Vec::new();
-            refill(sock, sockets, &mut ops);
-            s.apply_flow_ops(si, &mut ops);
+            refill(sock, sockets, si, &mut s.flows);
             Ok(())
         })
     }
@@ -1310,13 +1312,11 @@ impl SocketOps for InetSocket {
                 if !matches!(y.owner, Owner::Sock(_)) {
                     return Err(Errno(EBADF));
                 }
-                let (sh, s) = ifc.get();
+                let s = ifc.get();
                 // Frames queued for this set belong to its queued sockets:
                 // feed them before one moves out.
-                s.feed_backlog(sh, y);
-                let Slot {
-                    id, set, owner, ops, ..
-                } = y;
+                s.feed_backlog(y);
+                let Slot { id, set, owner } = y;
                 let li = *id;
                 let Owner::Sock(sock) = owner else {
                     return Err(Errno(EBADF));
@@ -1345,7 +1345,7 @@ impl SocketOps for InetSocket {
                         // match both families: refuse a connection of the
                         // wrong family.
                         l.pending.remove(pos);
-                        zombify(sh, s, set, li, h, f, linger);
+                        zombify(s, set, li, h, f, linger);
                         continue;
                     }
                     if full {
@@ -1392,10 +1392,12 @@ impl SocketOps for InetSocket {
                 ns.opts = sock.opts.clone();
                 ns.opts.misc.clear();
                 s.nsocks += 1;
-                let at = Stack::first_poll(sh, &nset);
-                let nr = s.register(Slot::new(ni, nset, Owner::Sock(ns)), at);
-                refill(sock, set, ops);
-                s.apply_flow_ops(li, ops);
+                let nr = s.register(Slot {
+                    id: ni,
+                    set: nset,
+                    owner: Owner::Sock(ns),
+                });
+                refill(sock, set, li, &mut s.flows);
                 Ok((nr, peer))
             })();
             (r, true)
@@ -1427,7 +1429,7 @@ impl SocketOps for InetSocket {
                     }
                     let (ip, port) = self.inet_addr(addr, v6only, ENETUNREACH)?;
                     let ip = unspecified_to_loopback(ip);
-                    let (sh, s) = ifc.get();
+                    let s = ifc.get();
                     if !s.routable(ip) {
                         return Err(Errno(ENETUNREACH));
                     }
@@ -1435,7 +1437,7 @@ impl SocketOps for InetSocket {
                     let src = if ip.is_loopback() {
                         Some(ip)
                     } else {
-                        sh.iface.get_source_address(&ip.into()).map(ip_of)
+                        s.iface.get_source_address(&ip.into()).map(ip_of)
                     };
                     if let Kind::Udp(u) = &mut sock.kind {
                         u.peer = Some(IpEndpoint::new(ip.into(), port));
@@ -1460,7 +1462,7 @@ impl SocketOps for InetSocket {
             if port == 0 {
                 return Err(Errno(ECONNREFUSED));
             }
-            let (sh, s) = ifc.get();
+            let s = ifc.get();
             if !s.routable(ip) {
                 return Err(Errno(ENETUNREACH));
             }
@@ -1475,7 +1477,7 @@ impl SocketOps for InetSocket {
                 addr: lip.map(Into::into),
                 port: lport,
             };
-            if let Err(e) = t.connect(sh.iface.context(), remote, local) {
+            if let Err(e) = t.connect(s.iface.context(), remote, local) {
                 discard_tcp(t);
                 return Err(match e {
                     tcp::ConnectError::InvalidState => Errno(EISCONN),
@@ -1686,7 +1688,7 @@ fn setsockopt_on(
     me: &InetSocket,
     sock: &mut Sock,
     sockets: &mut SocketSet<'static>,
-    ifc: &mut Ctx,
+    ifc: &mut Iface,
     level: i32,
     name: i32,
     val: &[u8],
@@ -1725,11 +1727,11 @@ fn setsockopt_on(
     match (level, name) {
         (SOL_SOCKET, SO_REUSEADDR) => {
             o.reuse.addr = v != 0;
-            ifc.stack().ports.set_reuse(sock.id, o.reuse);
+            ifc.get().ports.set_reuse(sock.id, o.reuse);
         }
         (SOL_SOCKET, SO_REUSEPORT) => {
             o.reuse.port = v != 0;
-            ifc.stack().ports.set_reuse(sock.id, o.reuse);
+            ifc.get().ports.set_reuse(sock.id, o.reuse);
         }
         (SOL_SOCKET, SO_KEEPALIVE) => o.keepalive = v != 0,
         (SOL_SOCKET, SO_RCVBUF | SO_SNDBUF | SO_RCVBUFFORCE | SO_SNDBUFFORCE) => {}
@@ -1846,11 +1848,11 @@ impl File for InetSocket {
 
     fn release(&self) {
         stack::sys(&self.set, |y, ifc| {
-            let (sh, s) = ifc.get();
+            let s = ifc.get();
             // A listener's queued frames go to its queued sockets before
             // they are moved into zombie sets.
-            s.feed_backlog(sh, y);
-            close_sock(sh, s, y);
+            s.feed_backlog(y);
+            close_sock(s, y);
             ((), true)
         });
     }
