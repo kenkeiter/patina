@@ -41,9 +41,10 @@ pub fn now() -> u64 {
     crate::arch::timer::now_ns()
 }
 
-/// Who took a stack lock. All but [`Site::SetLock`] are takers of the
-/// interface lock (`stack::Stack`); `SetLock` aggregates every socket-set
-/// lock acquisition (`stack::Slot`).
+/// Who took a stack lock. Sites below [`STACK_SITES`] are takers of the
+/// stack lock (the registry, `stack::Stack`); `Shard` aggregates the
+/// per-CPU interface shards and `SetLock` every socket-set lock
+/// acquisition (`stack::Slot`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Site {
     /// The net task: timer-due sets, its frame drain, rescans.
@@ -62,13 +63,16 @@ pub enum Site {
     /// budget) after its own poll, and the backlog service of a set whose
     /// lock was busy.
     Drain = 5,
+    /// The per-CPU interface shards (every site, aggregated; also a
+    /// shard's own stack-lock acquisition to apply new addresses).
+    Shard = 6,
     /// Socket-set locks (every site, aggregated).
-    SetLock = 6,
+    SetLock = 7,
 }
 
-pub const NSITES: usize = 7;
-/// Sites `0..IFACE_SITES` are interface-lock sites.
-pub const IFACE_SITES: usize = 6;
+pub const NSITES: usize = 8;
+/// Sites `0..STACK_SITES` are the stack lock's.
+pub const STACK_SITES: usize = 6;
 pub const SITE_NAMES: [&str; NSITES] = [
     "net-task",
     "sys-poll",
@@ -76,6 +80,7 @@ pub const SITE_NAMES: [&str; NSITES] = [
     "file-poll",
     "dhcp",
     "sys-drain",
+    "iface-shard",
     "set-lock",
 ];
 

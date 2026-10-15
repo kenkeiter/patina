@@ -127,13 +127,9 @@ fn snapshot() -> (Vec<Link<'static>>, Vec<IfAddr>) {
         return (links, addrs);
     };
     let s = lock.lock();
-    let has_nic = s.mux.has_nic();
+    let has_nic = s.out.has_nic();
     if has_nic {
-        let mac = match s.iface.hardware_addr() {
-            smoltcp::wire::HardwareAddress::Ethernet(e) => e.0,
-            #[allow(unreachable_patterns)]
-            _ => [0; 6],
-        };
+        let mac = s.out.mac;
         links.push(Link {
             index: 2,
             name: "eth0",
@@ -143,7 +139,7 @@ fn snapshot() -> (Vec<Link<'static>>, Vec<IfAddr>) {
             mac,
         });
     }
-    for c in s.iface.ip_addrs() {
+    for c in &s.addrs {
         let (addr, prefix) = match c {
             IpCidr::Ipv4(c) => (IpAddr::V4(c.address()), c.prefix_len()),
             IpCidr::Ipv6(c) => (IpAddr::V6(c.address()), c.prefix_len()),

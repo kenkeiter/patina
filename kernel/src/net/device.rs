@@ -8,8 +8,10 @@
 //!
 //! Contract:
 //!
-//! * `recv`/`send` never block and are called with the stack's lock held
-//!   (IRQs may be masked): they only touch the driver's own rings.
+//! * `recv`/`send`/`flush` never block and may be called from several
+//!   CPUs at once, with stack locks held (IRQs masked): the driver
+//!   serializes them with its own lock (a leaf) and only touches its own
+//!   rings.
 //! * The driver signals [`NetDevice::event`] from its interrupt handler
 //!   (and from anywhere else it learns of new receive completions or
 //!   freed transmit slots). The stack's task waits on that `Event` with a
@@ -27,7 +29,7 @@ use crate::sync::SpinLock;
 /// Largest Ethernet frame the stack hands a driver (MTU 1500 + 14).
 pub const MAX_FRAME: usize = 1514;
 
-pub trait NetDevice: Send {
+pub trait NetDevice: Send + Sync {
     /// Driver name for logs (`"virtio-net"`).
     fn name(&self) -> &'static str;
     /// The device's MAC address.
@@ -40,19 +42,19 @@ pub trait NetDevice: Send {
     /// when nothing is pending. A frame longer than `buf` is dropped (and
     /// the next one tried). Must also recycle the receive buffer to the
     /// device.
-    fn recv(&mut self, buf: &mut [u8]) -> Option<usize>;
+    fn recv(&self, buf: &mut [u8]) -> Option<usize>;
     /// Whether [`NetDevice::send`] would accept a frame right now.
-    fn can_send(&mut self) -> bool;
+    fn can_send(&self) -> bool;
     /// Queue `frame` for transmission; `false` when no transmit slot is free
     /// (the stack keeps the frame and retries after the next event).
-    fn send(&mut self, frame: &[u8]) -> bool;
+    fn send(&self, frame: &[u8]) -> bool;
     /// Signalled by the driver on receive completions and freed transmit
     /// slots (from IRQ context). The stack's task waits on it.
     fn event(&self) -> &'static Event;
     /// The stack is done with a batch of `recv`/`send` calls: issue any
     /// deferred device notifications (doorbells) now. A driver that
     /// notifies eagerly in `recv`/`send` leaves this a no-op.
-    fn flush(&mut self) {}
+    fn flush(&self) {}
 }
 
 static PENDING: SpinLock<Option<Box<dyn NetDevice>>> = SpinLock::new(None);

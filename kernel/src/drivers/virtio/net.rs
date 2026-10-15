@@ -442,15 +442,15 @@ impl NetDevice for VirtioNet {
         self.mac
     }
 
-    fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
+    fn recv(&self, buf: &mut [u8]) -> Option<usize> {
         NET.lock().as_mut()?.recv(buf)
     }
 
-    fn can_send(&mut self) -> bool {
+    fn can_send(&self) -> bool {
         NET.lock().as_mut().is_some_and(|n| n.can_send())
     }
 
-    fn send(&mut self, frame: &[u8]) -> bool {
+    fn send(&self, frame: &[u8]) -> bool {
         NET.lock().as_mut().is_some_and(|n| n.send(frame))
     }
 
@@ -458,7 +458,7 @@ impl NetDevice for VirtioNet {
         &EVENT
     }
 
-    fn flush(&mut self) {
+    fn flush(&self) {
         if let Some(n) = NET.lock().as_mut() {
             n.flush();
         }
