@@ -140,6 +140,13 @@ struct Pair {
     /// (or found not to need a kick).
     rx_pending: u16,
     tx_pending: u16,
+    /// The pending transmit batch started with an idle ring (nothing in
+    /// flight): kick it whatever `avail_event` says. Apple VZ otherwise
+    /// picks a frame whose kick was suppressed in that idle → busy
+    /// transition up late (a ~0.6 ms tail on single-connection
+    /// round trips); at load the ring is never idle and suppression
+    /// stands.
+    tx_idle_start: bool,
 }
 
 struct Net {
@@ -180,6 +187,9 @@ static DB_SUPPRESSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static DB_COALESCED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// `flush` found a receive queue with completions left (signalled EVENT).
 static FLUSH_RX_LEFT: AtomicU64 = AtomicU64::new(0);
+/// Transmit kicks issued for an idle ring although `avail_event` said none
+/// was needed (`Pair::tx_idle_start`).
+static DB_IDLE_KICKS: AtomicU64 = AtomicU64::new(0);
 
 fn irq() {
     IRQS.fetch_add(1, Ordering::Relaxed);
@@ -225,6 +235,7 @@ impl Pair {
             vector,
             rx_pending: 0,
             tx_pending: 0,
+            tx_idle_start: false,
         };
         for s in 0..p.rx.size() as usize {
             p.post_rx(s);
@@ -310,11 +321,16 @@ impl Pair {
             return;
         }
         self.tx_pending = 0;
-        if self.tx.kick_prepare() {
+        let need = self.tx.kick_prepare();
+        let idle_start = core::mem::take(&mut self.tx_idle_start);
+        if need || idle_start {
             let t = crate::net::prof::start(crate::net::prof::on());
             self.tx.kick(transport());
             crate::net::prof::NIC_TX_KICK.done(t);
             DB_ISSUED[1].fetch_add(1, Ordering::Relaxed);
+            if !need {
+                DB_IDLE_KICKS.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             DB_SUPPRESSED[1].fetch_add(1, Ordering::Relaxed);
         }
@@ -325,6 +341,9 @@ impl Pair {
     fn send(&mut self, hdr: usize, frame: &[u8]) -> bool {
         if !self.can_send() {
             return false;
+        }
+        if self.tx_pending == 0 && self.tx_free.count_ones() as usize == self.tx_slots {
+            self.tx_idle_start = true;
         }
         let slot = self.tx_free.trailing_zeros() as usize;
         let off = slot * BUF;
@@ -770,7 +789,7 @@ pub fn print_stats() {
         }
     }
     crate::console::panic_write_fmt(format_args!(
-        "[patina] stats net: virtio-net pairs {}, rx frames {}, tx frames {}, irqs per cpu {}, irq cpus {}, event-idx {}, doorbells issued/suppressed/coalesced rx {}/{}/{} tx {}/{}/{}, flush rx-left {}\n",
+        "[patina] stats net: virtio-net pairs {}, rx frames {}, tx frames {}, irqs per cpu {}, irq cpus {}, event-idx {}, doorbells issued/suppressed/coalesced rx {}/{}/{} tx {}/{}/{} (idle-ring kicks {}), flush rx-left {}\n",
         n,
         list(&RX_FRAMES[..n]),
         list(&TX_FRAMES[..n]),
@@ -787,6 +806,7 @@ pub fn print_stats() {
         DB_ISSUED[1].load(Ordering::Relaxed),
         DB_SUPPRESSED[1].load(Ordering::Relaxed),
         DB_COALESCED[1].load(Ordering::Relaxed),
+        DB_IDLE_KICKS.load(Ordering::Relaxed),
         FLUSH_RX_LEFT.load(Ordering::Relaxed),
     ));
 }
