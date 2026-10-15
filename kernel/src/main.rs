@@ -70,6 +70,7 @@ pub fn exit_with(code: i32, signal: Option<&str>, forced: bool) -> ! {
     if STATS.load(core::sync::atomic::Ordering::Relaxed) {
         task::sched::print_stats();
         drivers::virtio::net::print_stats();
+        net::stack::print_stats();
     }
     ctl::emit_exit(code, signal, forced);
     console::panic_write_fmt(format_args!("\n[patina] exit code {}\n", code));

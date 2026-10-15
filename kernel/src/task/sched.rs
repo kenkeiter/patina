@@ -361,6 +361,7 @@ fn place(t: &Thread) -> (usize, bool) {
 /// Enqueue a Runnable thread (not on any CPU) where [`place`] says.
 fn enqueue_placed(t: Arc<Thread>) {
     let (target, ipi) = place(&t);
+    crate::net::prof::on_enqueue(t.tid, cpu::id(), ipi);
     CPUS[target].push(t);
     if ipi {
         smp::send_ipi(target, IpiKind::Reschedule);

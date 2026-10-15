@@ -74,6 +74,8 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
 /// [`signal`](Event::signal)s, one kernel thread [`wait`](Event::wait)s.
 pub struct Event {
     inner: SpinLock<(bool, WaitQueue)>,
+    /// `patina.stats=1`: when the flag was last set (ns; 0: unknown).
+    since: core::sync::atomic::AtomicU64,
 }
 
 impl Default for Event {
@@ -86,12 +88,19 @@ impl Event {
     pub const fn new() -> Event {
         Event {
             inner: SpinLock::new((false, WaitQueue::new())),
+            since: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Set the flag and wake the waiter. Any context, IRQs masked or not.
     pub fn signal(&self) {
         let mut g = self.inner.lock();
+        if !g.0 && crate::STATS.load(core::sync::atomic::Ordering::Relaxed) {
+            self.since.store(
+                crate::arch::timer::now_ns(),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
         g.0 = true;
         g.1.wake_all();
     }
@@ -106,6 +115,12 @@ impl Event {
         }
         let _ = wait::block(g, |s| &mut s.1, 0, 0, deadline);
         self.take()
+    }
+
+    /// `patina.stats=1`: when the flag was set before the last wake-up
+    /// (ns; 0 if unknown). Clears it.
+    pub fn take_signalled_at(&self) -> u64 {
+        self.since.swap(0, core::sync::atomic::Ordering::Relaxed)
     }
 
     fn take(&self) -> bool {

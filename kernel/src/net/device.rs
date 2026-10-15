@@ -49,6 +49,10 @@ pub trait NetDevice: Send {
     /// Signalled by the driver on receive completions and freed transmit
     /// slots (from IRQ context). The stack's task waits on it.
     fn event(&self) -> &'static Event;
+    /// The stack is done with a batch of `recv`/`send` calls: issue any
+    /// deferred device notifications (doorbells) now. A driver that
+    /// notifies eagerly in `recv`/`send` leaves this a no-op.
+    fn flush(&mut self) {}
 }
 
 static PENDING: SpinLock<Option<Box<dyn NetDevice>>> = SpinLock::new(None);

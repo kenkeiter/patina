@@ -174,6 +174,11 @@ impl Notify {
         self
     }
 
+    /// Number of hooks to call.
+    pub fn hooks(&self) -> usize {
+        self.hooks.len()
+    }
+
     /// Call every hook. Must run with no file lock held.
     pub fn fire(self) {
         for h in self.hooks {

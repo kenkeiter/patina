@@ -13,6 +13,7 @@ pub mod device;
 pub mod inet;
 pub mod mux;
 pub mod netlink;
+pub mod prof;
 pub mod socket;
 pub mod stack;
 pub mod unix;

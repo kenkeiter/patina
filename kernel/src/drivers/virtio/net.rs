@@ -224,7 +224,9 @@ impl Pair {
             }
         }
         if reposted {
+            let t = crate::net::prof::start(crate::net::prof::on());
             self.rx.kick(transport());
+            crate::net::prof::NIC_RX_KICK.done(t);
         }
         out
     }
@@ -248,7 +250,9 @@ impl Pair {
         };
         self.tx_slot_of[h as usize] = slot as u8;
         self.tx_free &= !(1 << slot);
+        let t = crate::net::prof::start(crate::net::prof::on());
         self.tx.kick(transport());
+        crate::net::prof::NIC_TX_KICK.done(t);
         true
     }
 }

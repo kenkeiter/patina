@@ -157,6 +157,14 @@ impl Mux {
     pub fn nic_event(&self) -> Option<&'static crate::drivers::Event> {
         self.tx.nic.as_ref().map(|n| n.event())
     }
+
+    /// End of a poll: let the NIC issue deferred doorbells
+    /// ([`NetDevice::flush`]).
+    pub fn flush(&mut self) {
+        if let Some(n) = self.tx.nic.as_mut() {
+            n.flush();
+        }
+    }
 }
 
 impl MuxTx {

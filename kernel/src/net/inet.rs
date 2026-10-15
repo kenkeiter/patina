@@ -1523,7 +1523,7 @@ impl File for InetSocket {
         let Some(lock) = stack::get() else {
             return EpollFlags::ERR | EpollFlags::HUP;
         };
-        let mut g = lock.lock();
+        let mut g = stack::lock_at(lock, super::prof::Site::FilePoll);
         let s = &mut *g;
         let Some(sock) = s.socks.get_mut(&self.id) else {
             return EpollFlags::ERR | EpollFlags::HUP;

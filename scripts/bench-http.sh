@@ -4,7 +4,7 @@
 # the same host. Results: doc/bench-http.md (method and observations).
 #
 #   scripts/bench-http.sh [--quick] [--cpus N[,N...]] [--targets T[,T...]]
-#                         [--runs R] [--duration S] [--warmup S]
+#                         [--runs R] [--duration S] [--warmup S] [--profile]
 #
 #   --quick     a smoke-sized run: N=1, C in {1,64}, /big at C=1, 1 run of
 #               3 s after a 1 s warm-up
@@ -13,6 +13,12 @@
 #   --runs      repetitions per workload; tables show the median (default 3)
 #   --duration  seconds per measured run (default 10)
 #   --warmup    seconds of discarded load before each workload (default 3)
+#   --profile   one fresh server per (target, N, workload), booted with
+#               patina.stats=1 (PATINA_PARAMS); after its graceful stop the
+#               guest's `[patina] stats` lines (plus the wrk RESULT lines of
+#               the warm-up and the measured runs) go to
+#               out/bench-http/stats-<target>-n<N>-<path, / as _>-c<C>.txt
+#               and the net-stack lines are printed to stderr
 #
 # Per (N, target) one server is started, checked (GET / body, /info
 # GOMAXPROCS == N), loaded with every workload, then stopped and its exit
@@ -41,7 +47,7 @@ targets=(native vz qemu)
 runs=3 dur=10 warm=3
 root_conns=(1 16 64)
 big_conns=(1 8)
-quick=0
+quick=0 profile=0 tag= wrk_lines=
 while [[ $# -gt 0 ]]; do
   case $1 in
     --quick) quick=1; shift ;;
@@ -50,7 +56,8 @@ while [[ $# -gt 0 ]]; do
     --runs) runs=$2; shift 2 ;;
     --duration) dur=$2; shift 2 ;;
     --warmup) warm=$2; shift 2 ;;
-    *) echo "usage: $0 [--quick] [--cpus N,..] [--targets native,vz,qemu] [--runs R] [--duration S] [--warmup S]" >&2; exit 2 ;;
+    --profile) profile=1; shift ;;
+    *) echo "usage: $0 [--quick] [--cpus N,..] [--targets native,vz,qemu] [--runs R] [--duration S] [--warmup S] [--profile]" >&2; exit 2 ;;
   esac
 done
 if [[ $quick -eq 1 ]]; then
@@ -63,6 +70,7 @@ done
 
 mkdir -p "$out"
 rm -f "$out"/results.tsv "$out"/info.tsv "$out"/*.log "$out"/*.err
+[[ $profile -eq 0 ]] || { rm -f "$out"/stats-*.txt; export PATINA_PARAMS="patina.stats=1 ${PATINA_PARAMS:-}"; }
 state=$(mktemp -d /tmp/ptbh.XXXXXX)
 export XDG_RUNTIME_DIR=$state # private `patina ctl` namespace
 export PATINA_KERNEL_DIR=$root/out
@@ -116,7 +124,7 @@ trap 'exit 130' INT TERM
 # start <target> <N>: sets $url, $srv_pid, $log, $vm.
 start() {
   local t=$1 n=$2 i
-  log=$out/$t-n$n.log
+  log=$out/$t-n$n$tag.log
   vm=
   case $t in
     native)
@@ -172,7 +180,12 @@ stop() {
 load() {
   local t=$1 n=$2 path=$3 c=$4 th r line
   th=$((c < 4 ? c : 4))
-  wrk -t"$th" -c"$c" -d"${warm}s" --timeout 30s "$url$path" >/dev/null 2>&1 || true
+  if [[ $profile -eq 1 ]]; then
+    wrk_lines="warmup $( (wrk -t"$th" -c"$c" -d"${warm}s" --timeout 30s -s "$out/report.lua" "$url$path" 2>&1 || true) \
+      | sed -n 's/^RESULT //p')"$'\n'
+  else
+    wrk -t"$th" -c"$c" -d"${warm}s" --timeout 30s "$url$path" >/dev/null 2>&1 || true
+  fi
   for ((r = 1; r <= runs; r++)); do
     line=$(wrk -t"$th" -c"$c" -d"${dur}s" --timeout 30s -s "$out/report.lua" "$url$path" 2>&1 \
       | tee -a "$out/wrk.log" | sed -n 's/^RESULT //p')
@@ -180,24 +193,61 @@ load() {
       echo "bench-http: $t N=$n $path C=$c run $r: no result" >&2; failed=1; continue
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$t" "$n" "$path" "$c" "$r" "$line" | tr ' ' '\t' >>"$out/results.tsv"
+    [[ $profile -eq 0 ]] || wrk_lines+="run $r $line"$'\n'
     echo "bench-http: $t N=$n GET $path C=$c run $r/$runs: $line" >&2
     [[ ${line%% *} != 0 ]] || echo "bench-http: $t N=$n GET $path C=$c run $r: no response completed (counted as 0 req/s)" >&2
   done
 }
 
+# check_info <target> <N>: /info must report GOMAXPROCS=N.
+check_info() {
+  local t=$1 n=$2
+  info=$(curl -s -m 5 "$url/info")
+  echo "bench-http: $t N=$n: $url /info: $info" >&2
+  printf '%s\tN=%s\t%s\t%s\n' "$t" "$n" "$url" "$info" >>"$out/info.tsv"
+  if [[ $info != "GOMAXPROCS=$n "* ]]; then
+    echo "bench-http: $t N=$n: GOMAXPROCS mismatch" >&2; failed=1
+  fi
+}
+
+# profile_one <target> <N> <path> <C>: a fresh server for one workload;
+# its stats lines (and the wrk results) go to stats-*.txt.
+profile_one() {
+  local t=$1 n=$2 path=$3 c=$4 f
+  tag=-${path//\//_}-c$c
+  f=$out/stats-$t-n$n$tag.txt
+  echo "== $t N=$n GET $path C=$c (profile)" >&2
+  if ! start "$t" "$n"; then
+    echo "bench-http: $t N=$n: server not reachable (log $log)" >&2
+    tail -n 10 "$log" "$log.err" >&2; failed=1; kill_srv; return
+  fi
+  check_info "$t" "$n"
+  wrk_lines=
+  load "$t" "$n" "$path" "$c"
+  stop "$t"
+  {
+    echo "# $t N=$n GET $path C=$c warmup=${warm}s duration=${dur}s runs=$runs"
+    echo "# wrk: requests bytes duration_us errors p50_us p90_us p99_us max_us"
+    printf '%s' "$wrk_lines"
+    tr -d '\r' <"$log" | grep -o '\[patina\] stats.*' || true
+  } >"$f"
+  grep '\[patina\] stats net-stack' "$f" >&2 || echo "bench-http: $t N=$n: no net-stack stats in $log" >&2
+}
+
 for n in "${cpus_list[@]}"; do
   for t in "${targets[@]}"; do
+    if [[ $profile -eq 1 ]]; then
+      for c in "${root_conns[@]}"; do profile_one "$t" "$n" / "$c"; done
+      for c in "${big_conns[@]}"; do profile_one "$t" "$n" /big "$c"; done
+      tag=
+      continue
+    fi
     echo "== $t N=$n" >&2
     if ! start "$t" "$n"; then
       echo "bench-http: $t N=$n: server not reachable (log $log)" >&2
       tail -n 10 "$log" "$log.err" >&2; failed=1; kill_srv; continue
     fi
-    info=$(curl -s -m 5 "$url/info")
-    echo "bench-http: $t N=$n: $url /info: $info" >&2
-    printf '%s\tN=%s\t%s\t%s\n' "$t" "$n" "$url" "$info" >>"$out/info.tsv"
-    if [[ $info != "GOMAXPROCS=$n "* ]]; then
-      echo "bench-http: $t N=$n: GOMAXPROCS mismatch" >&2; failed=1
-    fi
+    check_info "$t" "$n"
     for c in "${root_conns[@]}"; do load "$t" "$n" / "$c"; done
     for c in "${big_conns[@]}"; do load "$t" "$n" /big "$c"; done
     stop "$t"
