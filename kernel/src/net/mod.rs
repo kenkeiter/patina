@@ -1,8 +1,10 @@
 //! Networking (design §9):
 //!
 //! * [`device`]: the driver/stack seam (`NetDevice`, `register`/`take`);
-//! * [`mux`]: the smoltcp `Device` (NIC + loopback queue);
-//! * [`stack`]: the interface, the socket set, the net task (D67);
+//! * [`mux`]: the smoltcp devices (NIC + loopback queue; one received
+//!   frame at a time);
+//! * [`stack`]: the interface, the per-socket socket sets, the flow table
+//!   and ingress demux, per-set poll timers, the net task (D67);
 //! * [`socket`]: the `SocketOps` seam the socket syscalls call;
 //! * [`inet`]: AF_INET/AF_INET6 TCP and UDP sockets (D68);
 //! * [`unix`]: AF_UNIX stream, datagram and seqpacket sockets (D71).

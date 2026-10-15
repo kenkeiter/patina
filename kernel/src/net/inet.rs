@@ -30,8 +30,10 @@
 //! bound to `::` gets a smoltcp endpoint without an address, which accepts
 //! both families; IPv4 peers are shown as `::ffff:a.b.c.d` and `::ffff:`
 //! destinations are sent as IPv4. Wildcard endpoints match both families
-//! in smoltcp, so the family filter (AF_INET sockets, V6ONLY sockets) is
-//! applied on accept and on UDP receive.
+//! in smoltcp, so the port map hands a packet only to a socket that covers
+//! its family (`patina_inet::Cover`: AF_INET sockets take IPv4 only,
+//! V6ONLY sockets IPv6 only), and the family filter is still applied on
+//! accept and on UDP receive.
 //!
 //! Closing: UDP sockets go at once; a TCP connection is `close()`d
 //! (graceful FIN after the queued data) and its set kept as a zombie
