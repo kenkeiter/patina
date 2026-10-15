@@ -2,7 +2,10 @@
 
 The same Go server (`testapps/httphello`) run three ways on one Apple
 Silicon Mac, loaded with `wrk` from the same host. Script:
-`scripts/bench-http.sh`. Run 2026-10-14.
+`scripts/bench-http.sh`. Run 2026-10-14 on kernel `fe0eb31` — the
+"before" measurements that motivated decision D89 (the network stack's
+scaling work). The re-run on the D89 kernel is in [After D89](#after-d89)
+below; the sections up to "Observations" describe the before run.
 
 ## Method
 
@@ -199,6 +202,173 @@ Measured ratios (patina ÷ native, same N, median req/s):
    same 10 cores; VZ's NAT and QEMU's main loop/vCPU threads also use host
    CPU. Native numbers at high C may be partly limited by wrk itself
    (not measured).
+
+## After D89
+
+The same script, same host and tools, re-run 2026-10-15 on kernel
+`c9bc3cf` (decision D89: one smoltcp socket set per socket with an exact
+ingress demux, deferred virtio doorbells with `EVENT_IDX` and a 128-slot
+transmit ring, per-socket locks with a short interface lock). The host
+was otherwise idle (no other VMs). `scripts/bench-http.sh --profile`
+(one fresh VM per workload with `patina.stats=1`) produced the profile
+that drove the design; its findings are in D89. Native is unchanged
+within noise (it is the same binary on the same macOS), so the tables
+show all three targets again.
+
+### GET / — requests/s
+
+| target | N | C=1 | C=16 | C=64 |
+|---|---|---|---|---|
+| native macOS (loopback) | 1 | 33851 (33329–33869) | 79285 (79160–80291) | 79573 (79236–79876) |
+| native macOS (loopback) | 2 | 31522 (30831–31714) | 125393 (124510–125455) | 137677 (137617–138062) |
+| native macOS (loopback) | 4 | 30791 (30492–31030) | 131627 (130603–131865) | 148382 (147847–148851) |
+| patina VZ (NAT, guest IP) | 1 | 14156 (13988–15109) | 43230 (43113–43443) | 42534 (42424–42585) |
+| patina VZ (NAT, guest IP) | 2 | 12338 (12066–12445) | 69696 (68859–70060) | 117565 (117328–118585) |
+| patina VZ (NAT, guest IP) | 4 | 9128 (9059–9583) | 65251 (63740–65365) | 116315 (109221–121299) |
+| patina QEMU/HVF (slirp, --publish) | 1 | 11062 (11048–11432) | 36489 (36313–36493) | 36617 (36347–36664) |
+| patina QEMU/HVF (slirp, --publish) | 2 | 10388 (10290–10490) | 55239 (54548–55845) | 65419 (62926–67406) |
+| patina QEMU/HVF (slirp, --publish) | 4 | 7772 (7645–8047) | 53045 (52156–53218) | 63322 (59896–64006) |
+
+### GET / — p50 latency (ms)
+
+| target | N | C=1 | C=16 | C=64 |
+|---|---|---|---|---|
+| native macOS (loopback) | 1 | 0.03 | 0.19 | 0.79 |
+| native macOS (loopback) | 2 | 0.03 | 0.11 | 0.45 |
+| native macOS (loopback) | 4 | 0.03 | 0.11 | 0.40 |
+| patina VZ (NAT, guest IP) | 1 | 0.07 | 0.35 | 1.51 |
+| patina VZ (NAT, guest IP) | 2 | 0.07 | 0.21 | 0.49 |
+| patina VZ (NAT, guest IP) | 4 | 0.10 | 0.23 | 0.51 |
+| patina QEMU/HVF (slirp, --publish) | 1 | 0.09 | 0.40 | 0.73 |
+| patina QEMU/HVF (slirp, --publish) | 2 | 0.09 | 0.25 | 0.34 |
+| patina QEMU/HVF (slirp, --publish) | 4 | 0.12 | 0.26 | 0.37 |
+
+### GET / — p99 latency (ms)
+
+| target | N | C=1 | C=16 | C=64 |
+|---|---|---|---|---|
+| native macOS (loopback) | 1 | 0.08 | 0.46 | 1.42 |
+| native macOS (loopback) | 2 | 0.06 | 0.29 | 0.94 |
+| native macOS (loopback) | 4 | 0.06 | 0.24 | 0.70 |
+| patina VZ (NAT, guest IP) | 1 | 0.15 | 0.79 | 3.09 |
+| patina VZ (NAT, guest IP) | 2 | 0.14 | 0.58 | 1.75 |
+| patina VZ (NAT, guest IP) | 4 | 0.66 | 0.49 | 1.27 |
+| patina QEMU/HVF (slirp, --publish) | 1 | 0.17 | 0.86 | 2.16 |
+| patina QEMU/HVF (slirp, --publish) | 2 | 0.18 | 0.64 | 1.01 |
+| patina QEMU/HVF (slirp, --publish) | 4 | 0.28 | 0.58 | 0.88 |
+
+VZ N=4 C=1: two of the three runs had a p99 of 0.66 and 0.77 ms, the
+third 0.19 ms (p50 0.10 ms in all three); see observation 5 below.
+
+### GET /big (4 MiB) — MB/s
+
+| target | N | C=1 | C=8 |
+|---|---|---|---|
+| native macOS (loopback) | 1 | 5420 (5315–5951) | 7740 (7655–7935) |
+| native macOS (loopback) | 2 | 6192 (6002–6258) | 7667 (7621–7942) |
+| native macOS (loopback) | 4 | 5469 (5062–5485) | 7819 (7487–8228) |
+| patina VZ (NAT, guest IP) | 1 | 403 (395–407) | 583 (580–592) |
+| patina VZ (NAT, guest IP) | 2 | 426 (396–427) | 849 (847–852) |
+| patina VZ (NAT, guest IP) | 4 | 407 (401–417) | 917 (895–930) |
+| patina QEMU/HVF (slirp, --publish) | 1 | 257 (256–261) | 261 (258–263) |
+| patina QEMU/HVF (slirp, --publish) | 2 | 234 (234–236) | 252 (248–254) |
+| patina QEMU/HVF (slirp, --publish) | 4 | 217 (201–224) | 231 (225–233) |
+
+p50 per 4 MiB response at C=1: VZ 9.8–10.3 ms, QEMU 15.8–18.9 ms; at
+C=8: VZ 56 / 39 / 36 ms, QEMU 126–144 ms.
+
+### Errors
+
+None for native and VZ in any run. QEMU `GET /` C=64: 110–120 socket read
+errors per (N, 3 runs), the same ~40 per 10 s run as before (slirp side,
+unchanged); one at N=1 C=16; none on `/big`.
+
+### Before → after
+
+Median req/s (p99 ms), `GET /`:
+
+| target | N | C=1 | C=16 | C=64 |
+|---|---|---|---|---|
+| VZ | 1 | 13.3k (0.14) → 14.2k (0.15) | 25.7k (1.27) → 43.2k (0.79) | 20.7k (6.17) → 42.5k (3.09) |
+| VZ | 2 | 11.7k (0.14) → 12.3k (0.14) | 46.8k (0.95) → 69.7k (0.58) | 36.0k (6.55) → 117.6k (1.75) |
+| VZ | 4 | 9.6k (0.18) → 9.1k (0.66) | 52.0k (0.68) → 65.3k (0.49) | 42.6k (11.97) → 116.3k (1.27) |
+| QEMU | 1 | 10.8k (0.18) → 11.1k (0.17) | 15.9k (2.06) → 36.5k (0.86) | 14.7k (5.49) → 36.6k (2.16) |
+| QEMU | 2 | 9.4k (0.20) → 10.4k (0.18) | 17.6k (3.01) → 55.2k (0.64) | 17.3k (6.30) → 65.4k (1.01) |
+| QEMU | 4 | 8.0k (0.20) → 7.8k (0.28) | 17.9k (3.49) → 53.0k (0.58) | 16.7k (8.95) → 63.3k (0.88) |
+
+`/big` MB/s, C=1 / C=8: VZ 361/360 → 403/583 (N=1), 350/394 → 426/849
+(N=2), 349/429 → 407/917 (N=4); QEMU 75/65 → 257/261, 69/66 → 234/252,
+73/54 → 217/231.
+
+Ratios patina ÷ native (same N, median req/s):
+
+| | C=1 | C=16 | C=64 |
+|---|---|---|---|
+| VZ, N=1 / 2 / 4 | 0.42 / 0.39 / 0.30 | 0.55 / 0.56 / 0.50 | 0.53 / 0.85 / 0.78 |
+| QEMU, N=1 / 2 / 4 | 0.33 / 0.33 / 0.25 | 0.46 / 0.44 / 0.40 | 0.46 / 0.48 / 0.43 |
+
+### Observations (after)
+
+1. **No collapse at C=64.** On every target and vCPU count C=64 now gives
+   at least as much as C=16 (VZ 42.5k / 117.6k / 116.3k vs 43.2k /
+   69.7k / 65.3k), where it was 15–20 % *lower* before. The p99 at VZ
+   N=4 C=64 went from 12.0 to 1.27 ms; at N=2 C=64 patina is 85 % of
+   native loopback. Profiled cause (D89): every poll of the one smoltcp
+   socket set walked every socket four times under one lock, and three
+   such polls per request made the lock 93 % busy at C=64.
+
+2. **VZ scales 1 → 2 vCPUs (2.8× at C=64) but not 2 → 4.** 117.6k and
+   116.3k req/s. At that point the 10-core host is ~92 % busy, 52 % of it
+   in the host kernel (VZ's NAT / vmnet and wrk's four threads), and the
+   guest's CPUs 1–3 are ~40 % idle; sharding the smoltcp interface per
+   CPU (tried in D89) cut the guest's remaining lock contention in half
+   and did not move throughput. This benchmark is host-bound at
+   ~120k req/s on this Mac; showing 2 → 4 scaling needs the load
+   generator on another machine. Native loopback at N=4 also gains only
+   8 % over N=2 at C=64 with the same wrk.
+
+3. **QEMU/HVF was not slirp-bound after all.** C=16/C=64 went from a flat
+   ~16–18k req/s to 36–65k and `/big` from 54–75 to 217–261 MB/s with
+   the guest-side changes alone; the earlier observation 5 ("the
+   bottleneck is host-side") was wrong. slirp's read errors at C=64
+   (about 40 per 10 s run) persist and are host-side.
+
+4. **`/big`.** VZ moved 350–360 MB/s on one connection before and
+   400–430 now (the doorbell per 1.45 KB frame is gone: 52–113 doorbells
+   per 4 MiB instead of ~3180), and 583 / 849 / 917 MB/s at C=8 (was
+   360–429): eight connections now use the vCPUs. One connection is
+   still bound by per-frame work in the guest (no TSO: 2886 segments per
+   response, each checksummed and queued) and by the device thread
+   (~2.4–3.2 µs per remaining doorbell).
+
+5. **C=1.** Throughput is within the earlier run-to-run band everywhere
+   (VZ 14.2k / 12.3k / 9.1k vs 13.3k / 11.7k / 9.6k; QEMU 11.1k / 10.4k /
+   7.8k vs 10.8k / 9.4k / 8.0k) and the p50 is unchanged. C=1 still gets
+   slower with more vCPUs (D79's cross-CPU wake-ups: at N=4 the profile
+   counts 3.8 NIC interrupts, 3.75 net-task rounds and 5.4 Reschedule IPIs
+   per request, each IPI waking a vCPU parked in WFI). The tables above
+   show a p99 of 0.66 ms at VZ N=4 C=1 (0.66 and 0.77 ms in two runs,
+   0.19 in the third; 0.18 before) at an unchanged p50: a transmit kick
+   suppressed by `EVENT_IDX` while the device was idle, which VZ honours
+   late (with `patina.net.event_idx=0` the p99 was 0.19–0.20 ms in all
+   three runs, but C=16/C=64 lost 10–25 %). Fixed after this run: a
+   transmit batch that starts with an idle ring is always kicked (D89,
+   kernel bf38609). Five runs of VZ N=4 on that kernel (host idle):
+   C=1 9.7–9.9k req/s, p50 0.10 ms, p99 0.18–0.19 ms; C=16 65–68k,
+   p99 0.43–0.60 ms; C=64 122–124k, p99 1.08–1.17 ms; `/big` 413 MB/s
+   (C=1) and ~970 MB/s (C=8). The other cells of the tables are the
+   c9bc3cf run, which the kick rule does not affect.
+
+7. **A ~1 s stall on `/big` at C=8, about one run in ten.** In that run
+   the p99 is 0.6–0.8 s and the max 1.0–1.1 s (smoltcp's minimum
+   retransmission timeout is 1 s: a segment or ACK lost between the guest
+   and VZ's NAT). Seen on every kernel measured here, before and after
+   D89 (D85 recorded the same stall on single transfers); the medians are
+   unaffected. Not chased.
+
+6. **Host CPU, again.** Everything above was measured with wrk, the VZ NAT
+   and the VM on the same ten cores; the VZ C=64 numbers at N ≥ 2 are a
+   property of this host as much as of the guest.
 
 ## Re-running
 

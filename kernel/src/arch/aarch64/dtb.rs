@@ -440,8 +440,10 @@ fn pci_from_fdt(fdt: &Fdt<'static>) -> Option<PciHostDesc> {
         }
     }
 
-    if let (Some(map), Some(mask)) = (n.property("interrupt-map"), n.property("interrupt-map-mask"))
-    {
+    if let (Some(map), Some(mask)) = (
+        n.property("interrupt-map"),
+        n.property("interrupt-map-mask"),
+    ) {
         let m = Cells(mask.value);
         let child_ic = cell_prop(&n, "#interrupt-cells").unwrap_or(1);
         if m.len() > 3 {

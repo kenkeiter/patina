@@ -1,7 +1,9 @@
 //! Memory syscalls: thin wrappers over `mm::vm::AddressSpace`.
 
 use patina_abi::errno::{EFAULT, EINVAL, ENOMEM, Errno};
-use patina_abi::mm::{MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT, MLOCK_ONFAULT, MS_ASYNC, MS_INVALIDATE, MS_SYNC};
+use patina_abi::mm::{
+    MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT, MLOCK_ONFAULT, MS_ASYNC, MS_INVALIDATE, MS_SYNC,
+};
 
 use super::{SysResult, with_space};
 use crate::mm::PAGE_SIZE;

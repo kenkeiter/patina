@@ -73,7 +73,12 @@ fn layouts_test(f0: usize) {
                 // SAFETY: non-zero size.
                 let p = unsafe { alloc::alloc::alloc(l) };
                 assert!(!p.is_null(), "selftest alloc: {:?} failed", l);
-                assert!((p as usize).is_multiple_of(align), "{:?} misaligned: {:p}", l, p);
+                assert!(
+                    (p as usize).is_multiple_of(align),
+                    "{:?} misaligned: {:p}",
+                    l,
+                    p
+                );
                 tag = tag.wrapping_add(1);
                 // SAFETY: freshly allocated, `size` bytes.
                 unsafe { core::ptr::write_bytes(p, tag, size) };
@@ -86,7 +91,11 @@ fn layouts_test(f0: usize) {
             if i % 3 != round % 3 {
                 continue;
             }
-            let new = if i % 2 == 0 { l.size() * 2 + 100 } else { l.size().div_ceil(3) };
+            let new = if i % 2 == 0 {
+                l.size() * 2 + 100
+            } else {
+                l.size().div_ceil(3)
+            };
             // SAFETY: `p`/`l` are live; `new` is non-zero.
             let q = unsafe { alloc::alloc::realloc(p, l, new) };
             assert!(!q.is_null());
@@ -125,7 +134,11 @@ fn layouts_test(f0: usize) {
         f,
         f0
     );
-    assert!(f0.saturating_sub(f) <= 64, "heap kept {} frames", f0.saturating_sub(f));
+    assert!(
+        f0.saturating_sub(f) <= 64,
+        "heap kept {} frames",
+        f0.saturating_sub(f)
+    );
 }
 
 fn alloc_test() {

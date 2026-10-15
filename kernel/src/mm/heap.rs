@@ -249,7 +249,10 @@ static CLASS_STATS: [ClassStats; NCLASSES] = [const {
 /// `a += d` for a counter only the class lock holder writes.
 #[inline]
 fn bump(a: &AtomicUsize, d: isize) {
-    a.store(a.load(Ordering::Relaxed).wrapping_add_signed(d), Ordering::Relaxed);
+    a.store(
+        a.load(Ordering::Relaxed).wrapping_add_signed(d),
+        Ordering::Relaxed,
+    );
 }
 
 /// Page-path allocations: frames held, bytes requested.
@@ -338,7 +341,8 @@ unsafe fn slab_free(p: *mut u8, c: usize, user: usize) {
             if l.empty >= KEEP_EMPTY {
                 bump(&CLASS_STATS[c].slabs, -1);
                 drop(l);
-                let pa = virt_to_phys(VirtAddr(s as usize)).expect("heap: slab outside the direct map");
+                let pa =
+                    virt_to_phys(VirtAddr(s as usize)).expect("heap: slab outside the direct map");
                 frame::free_frames(pa, 0);
             } else {
                 l.empty += 1;
@@ -398,7 +402,10 @@ unsafe impl GlobalAlloc for KernelHeap {
             // Same slot class: nothing moves.
             (Some(a), Some(b)) if a == b => {
                 let _l = CLASSES[a].lock();
-                bump(&CLASS_STATS[a].user, new_size as isize - layout.size() as isize);
+                bump(
+                    &CLASS_STATS[a].user,
+                    new_size as isize - layout.size() as isize,
+                );
                 return p;
             }
             // Page path, not growing: keep the head, free the tail.
@@ -438,7 +445,10 @@ static HEAP: KernelHeap = KernelHeap;
 /// Boot hook, after `mm::frame::init`. The heap takes frames on demand,
 /// so there is nothing to seed; this only checks the init order.
 pub fn init() {
-    assert!(frame::is_initialized(), "heap: frame allocator not initialised");
+    assert!(
+        frame::is_initialized(),
+        "heap: frame allocator not initialised"
+    );
 }
 
 /// `(user_bytes, allocated_bytes, total_bytes)` of the heap: bytes
@@ -447,7 +457,8 @@ pub fn init() {
 /// blocks).
 pub fn stats() -> (usize, usize, usize) {
     let large = LARGE_PAGES.load(Ordering::Relaxed);
-    let (mut user, mut actual, mut slabs) = (LARGE_USER.load(Ordering::Relaxed), large * PAGE_SIZE, 0);
+    let (mut user, mut actual, mut slabs) =
+        (LARGE_USER.load(Ordering::Relaxed), large * PAGE_SIZE, 0);
     for (c, st) in CLASS_STATS.iter().enumerate() {
         user += st.user.load(Ordering::Relaxed);
         actual += st.slots.load(Ordering::Relaxed) * CLASS_SIZE[c];
@@ -506,7 +517,8 @@ pub const fn alloc_size(n: usize) -> usize {
 /// slots in slab pages.
 fn available_bytes() -> usize {
     let (free, _) = frame::stats();
-    free.saturating_mul(PAGE_SIZE).saturating_add(slab_free_bytes())
+    free.saturating_mul(PAGE_SIZE)
+        .saturating_add(slab_free_bytes())
 }
 
 /// The low watermark: half of the D78 kernel reserve (RAM/32, 2–32 MiB).

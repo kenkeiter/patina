@@ -244,7 +244,9 @@ pub fn alloc_pages(npages: usize, align_order: usize) -> Option<PhysAddr> {
 pub fn free_pages(pa: PhysAddr, npages: usize) {
     let mut a = FRAMES.lock();
     assert!(
-        pa.is_page_aligned() && a.in_range(pa.0) && a.in_range(pa.0 + (npages.max(1) - 1) * PAGE_SIZE),
+        pa.is_page_aligned()
+            && a.in_range(pa.0)
+            && a.in_range(pa.0 + (npages.max(1) - 1) * PAGE_SIZE),
         "free_pages: bad range"
     );
     a.free_range(pa.0, pa.0 + npages * PAGE_SIZE);

@@ -1606,6 +1606,16 @@ Verified by `scripts/test-hello.sh --app sockets` and httphello `-selftest`
 on both arches (no NIC: loopback only), `scripts/test-smp.sh --app sockets
 --cpus "1 2 4"`.
 
+*Amended by D89:* the one `SocketSet` became one set per socket with an
+exact flow-table demux in front of smoltcp's ingress, the per-poll
+`refresh_all`/`track` over every socket became per-set settling with
+per-set poll timers, `Mux` is egress-only (frames enter through
+`mux::OneFrame`), the single stack lock became a per-socket set lock plus
+a short interface lock, and syscalls drain received frames in bounded
+batches. The loopback mux and its `::1` solicitation re-addressing, the
+boot line, DHCP, the inline poll on syscalls, the net task as the timer
+driver and the readiness semantics are as described here.
+
 ## D68: inet sockets and the socket syscalls: `SocketOps`, listen pools, dual stack
 *2026-10-14 · Phase 4*
 
@@ -3191,3 +3201,249 @@ without `mq=on`. With `-netdev user` the device can only offer one pair
 `queues=N` and a tap created `multi_queue` (QEMU fails on a persistent
 single-queue tap), so multi-queue is for hand-written VMM command lines and
 hosts that provide it (doc/cli-contract.md).
+
+*Amended by D89:* doorbells are deferred to `NetDevice::flush` and
+suppressed with `VIRTIO_F_EVENT_IDX`, the transmit ring has 128 slots per
+pair, and the `/big` measurements above are superseded by D89's.
+
+## D89: Scaling the network stack: per-socket smoltcp sets, exact ingress demux, deferred doorbells, per-socket locks
+*2026-10-14 · Phase 5*
+
+Amends D67 (the stack's structure and lock), D68 (where socket state
+lives), D88 (doorbells). `kernel/src/net/{stack,inet,mux,prof}.rs`,
+`crates/inet/src/demux.rs`, `kernel/src/drivers/virtio/{net,queue}.rs`,
+`kernel/src/sync.rs` (`SpinLockGuard::swap_irq_state`),
+`scripts/bench-http.sh --profile`. Motivation: doc/bench-http.md — on
+Apple VZ `GET /` scaled 25.7k → 52.0k req/s from 1 to 4 vCPUs at C=16
+connections but was *lower* at C=64 than at C=16 at every vCPU count, with
+a p99 of 12 ms at 4 vCPUs.
+
+**Profile first.** `patina.stats=1` now counts stack-lock acquisitions per
+site (net task / syscall with poll / syscall without / file poll),
+contended acquisitions and spin time, hold time with a histogram, time per
+phase under the lock (ingress, listener refill, egress, `track`,
+`refresh_all`, `poll_delay`), readiness evaluations, net-task wake-ups
+(signalled vs deadline, wake latency, CPU), Reschedule IPIs (and those that
+woke the net task) and virtio-net doorbells (`net/prof.rs`, printed at exit
+by `stack::print_stats`; `bench-http.sh --profile` runs one fresh VM per
+workload with the counters on and saves the lines). httphello under wrk on
+VZ, 4 vCPUs, kernel d9d3bc3 + counters, `GET /`: the one stack lock was
+held 88.6 % of the time at C=16 and 93.4 % at C=64; 94.5 % / 98.8 % of
+syscall acquisitions were contended; the other vCPUs spent 50 % / 62 % of
+their time spinning on it; req/s was 90 % / 94 % of 1/(hold per request).
+Per request: 2.99 polling holds (Go's read → write → read-EAGAIN, each a
+`with(true)`), 1.0 file-poll hold, 0.10 / 0.03 net-task rounds; held
+18.0 µs (C=16) → 24.0 µs (C=64). Of the +6.0 µs, +5.4 µs was the four
+passes over every socket that each poll made — smoltcp's final empty
+`poll_egress` (465 → 1338 ns per call), `poll_delay` in `next_deadline`
+(310 → 740 ns), `refresh_all` (256 → 583 ns), `track` (199 → 428 ns);
+readiness evaluations 52.6 → 193.6 per request. Ingress packet processing
+stayed flat (2.35 → 2.42 µs per frame, ~1.85 µs of it the rx doorbell).
+The largest fixed cost was virtio doorbells: one per received frame (after
+reposting its buffer) and one per sent frame, ~1.85 µs each (a VM exit),
+4 per request = 7.5 µs, all under the lock; 3179 per 4 MiB `/big`
+response, which bounded `/big` at ~350 MB/s. The C=64 p99 of 12 ms was
+the lock's tail (holds and spins up to 12 ms: the host descheduling a vCPU
+that holds the IRQ-masked lock while the others spin; the
+test-and-test-and-set lock is also unfair — the net task waited 103 µs per
+contended acquisition vs 20 µs for syscalls). Not significant at C ≥ 16:
+Reschedule IPIs (0.05 / 0.006 per request), net-task wake-ups, ingress
+dispatch. At C=1 the picture differs (4.7 IPIs and 2.85 net-task rounds per
+request, NIC IRQs all on CPU 0 over VZ's INTx), which is why C=1 gets
+slower with more vCPUs. N=1 showed the same +9 µs per request at C=64 as
+plain CPU time (24.2k → 20.0k req/s). So the collapse was O(sockets) work
+per poll under one lock, not IPIs or wake-ups, and the fix had to make
+polls O(1) first and only then spread them.
+
+**Per-socket socket sets, exact ingress demux (stack.rs, inet.rs, mux.rs,
+`patina_inet::demux`, host-tested).** smoltcp's `poll_egress` and
+`poll_delay` walk every socket of the set they are given and its TCP
+ingress scans the set with `accepts()`, so no `SocketSet` may hold more
+than what one poll concerns: every inet socket owns its own set (a `Slot`):
+a connection or UDP socket one smoltcp socket, a listener its
+`LISTEN_POOL` `Listen` sockets plus its accept queue, the DHCP client its
+own, a closed connection finishing its shutdown (a zombie) the set it had;
+`accept` moves the smoltcp socket into the new connection's set
+(`SocketSet::remove` + `add`; the handle changes). Received frames are
+taken one at a time (loopback ring first, then the NIC) and demultiplexed
+before smoltcp sees them: `demux::parse` reads the transport 4-tuple
+(Ethernet → IPv4 with options / IPv6 with at most one hop-by-hop header →
+TCP/UDP ports; ARP and ICMPv6 are "neighbor" frames, later fragments and
+other extension headers "other"); the tuple is looked up exactly in the
+flow table (connections from `connect` on, zombies, and a listener's
+not-yet-accepted connections, which point at the listener's set until
+`accept` re-points them), else by (proto, local port) in a port map of
+listeners and bound UDP sockets (an exact local address before a wildcard,
+only sockets covering the packet's family — so an IPv4 SYN no longer
+reaches a V6ONLY listener to be aborted at accept; UDP broadcast /
+multicast admits sockets bound to another address last; UDP 67 → 68 goes
+to the DHCP client), else to an always-empty set: smoltcp still answers
+ARP, ICMP echo and NDISC at the interface level, an unknown TCP segment
+gets a RST and an unknown UDP datagram an ICMP port unreachable, as
+before. The set gets the frame through a one-frame `Device`
+(`mux::OneFrame`); `Mux` itself is egress-only. The lookup must be exact
+— a frame fed to the wrong set makes smoltcp RST a live connection — so
+the flow-table invariant is: an entry exists for the tuple of every smoltcp
+TCP socket that has one and points at the set holding it; entries are
+added at `connect` (tuple known right after `t.connect`) and when a pool
+socket leaves `Listen` (`refill`, run after every frame fed to a listener),
+re-pointed at `accept` / `zombify`, removed when the socket loses its
+tuple or leaves the set, and removal only deletes an entry still pointing
+at the remover's set, so a newer socket with the same tuple keeps its entry
+(a SYN for a tuple still in `TimeWait` reaches that socket; a RST for an
+unknown flow gets no reply; the same ports on different local addresses
+are different keys). After a frame only its set is touched: `refill` for
+that listener, `track` and `refresh` for that socket. Each set has its own
+poll time (`poll_delay` of its set plus socket-level deadlines: connect
+timeout, deferred keep-alive, zombie linger) in a `BTreeSet<(deadline,
+set)>`; the net task sleeps until the earliest and polls only the due
+sets. ARP / NDISC frames and a DHCP address change make the next drain
+poll every set once (`rescan`: a set may be waiting on a neighbor). A
+`recv` that reads nothing no longer polls, and one that read data polls
+only when smoltcp would send a window update (`inet::window_update_due`
+mirrors the private `tcp::Socket::window_to_update` with a lower bound of
+the window last advertised, so it errs towards polling). Listener, zombie,
+keep-alive and readiness semantics (D68) are unchanged.
+
+**Deferred doorbells, `VIRTIO_F_EVENT_IDX`, 128 transmit slots (amends
+D88).** `recv` and `send` only mark a queue "kick pending";
+`NetDevice::flush`, which the stack calls at the end of every poll pass /
+drain batch under the same interface-lock hold, notifies each pending
+queue once (a queue with 32 reposted receive buffers or 8 queued frames
+is kicked at once so a long burst keeps the device busy); whoever drives
+`recv`/`send` must `flush` before it stops polling (the self-test does).
+`VIRTIO_F_EVENT_IDX` is negotiated when offered (VZ and QEMU both offer it;
+`patina.net.event_idx=0` disables it): a pending kick notifies only if the
+new available index crossed the device's `avail_event` (`vring_need_event`
+with `old` = the index at the previous check, after a full fence); without
+the feature `VIRTQ_USED_F_NO_NOTIFY` is honoured. Device-to-driver
+interrupts are not suppressed beyond the old behaviour: `used_event` is
+set to `last_used` whenever a queue is found empty and the ring re-checked,
+so the next completion interrupts; `flush` wakes the net task if a receive
+queue was left undrained with no interrupt armed; the polled control queue
+moves `used_event` out of reach instead of `VIRTQ_AVAIL_F_NO_INTERRUPT`
+(ignored with EVENT_IDX). One exception to the suppression: a transmit
+batch that started with an idle ring (nothing in flight) is kicked whatever
+`avail_event` says. Without it VZ N=4 C=1 had a p99 of 0.66–0.77 ms in two
+of three runs (0.18 ms before D89, p50 unchanged at 0.10 ms); with
+`patina.net.event_idx=0` the tail was gone but C=16/C=64 lost 10–25 %, and
+forcing every tx kick fixed the tail at the same cost at load — so Apple VZ
+honours a kick suppressed in the idle → busy transition late, while at
+load the ring is never idle and suppression stands (`stats net:` counts the
+`idle-ring kicks`). With the rule, five runs at N=4 give C=1 p99
+0.18–0.19 ms and C=64 122–124k req/s. The transmit ring has 128 slots
+per pair: 32 ran full at ~100k req/s, sockets waited for a transmit token
+and every poll kicked the net task (823k kicks per 1.26M requests; 6.6k
+after). On VZ
+(4 vCPUs) doorbells fell from 4.0 per `GET /` to 0.34 (C=16) / 0.52
+(C=64) — rx doorbells are essentially gone, the ring never runs dry — and
+from ~3180 per `/big` response to 52–113; each remaining doorbell costs
+2.4–3.2 µs (the ones left wake an idle device thread). On QEMU `/big` got
+1.5–3× faster than D88's "after" column (user aarch64 mmio 69/71/64 →
+21/20/22 ms at 1/2/4 vCPUs; tap aarch64 mmio 105/106/127 → 65/70/78 ms;
+x86 similar); with 4 tap pairs in Docker every pair still carries frames
+both ways (`netmq-tap` 12/12). A VMM that never writes `avail_event`
+would stall kicks until the index wraps; none seen (the counters show both
+issued and suppressed kicks on VZ and QEMU).
+
+**Per-socket locks, a short interface lock (stack.rs `SetLock`, `sys`,
+`drain`).** With O(1) polls the one lock was still 75 % busy at 4 vCPUs
+and C=64 (83 % of syscall acquisitions contended, 34 % of all vCPU time
+spinning), and 4 vCPUs gave no more than 2 (113k vs 112k req/s). Now each
+slot (the socket's `SocketSet` and all of its `inet::Sock` state: kind,
+options, error, readiness hooks) sits behind its own spinlock
+(`Arc<SetLock>`, held by the socket's `File`). The interface lock
+(`SpinLock<Stack>`) covers only what sockets share: the smoltcp
+`Interface`, the `Mux` (loopback ring, NIC handle), the empty set, the
+flow table, port map, bind table, timers, and a slot registry with a frame
+backlog per set. **Lock order: set lock → interface lock → virtio-net
+driver lock / heap.** Nobody waits for a set lock while holding the
+interface lock or another set lock (a `try_lock` of a set under the
+interface lock is allowed: it never waits); hooks fire with no lock held;
+the net task's `Event` is signalled after the interface lock is released;
+`check_order` panics on a contended acquisition out of order (it runs only
+when the wanted lock is busy, since a deadlock needs a wait). A syscall
+does its work (`send_slice`/`recv_slice`, readiness) under its set lock
+alone and takes the interface lock only for shared state (binds, flows,
+routes) or to poll its set (egress until nothing is left, `track`/refill,
+`poll_delay` → timer); it then releases the set (`swap_irq_state` lets the
+guards drop in acquisition order) but keeps the interface lock to drain
+received frames: every loopback frame and at most `SYS_BUDGET` = 64 NIC
+frames (the net task takes 1024), `BATCH` = 32 frames per hold, firing the
+collected readiness changes between holds. A frame is demuxed under the
+interface lock and, in the same hold, fed to its set if a `try_lock` of
+that set succeeds; consecutive frames for the same set are fed before its
+one egress and settle (a run of loopback segments gets one ACK, as one
+poll of the old shared set gave; feeding one frame per hold cost 15 % of
+loopback throughput). If the set is busy (a syscall on it, another CPU
+feeding it) the frame is copied onto that set's backlog (bounded,
+`MAX_BACKLOG` = 1024, under the interface lock) and `SetLock::pending` is
+set; the set's holder feeds the backlog before anything else the next time
+it takes the interface lock, and every release of a set lock re-checks
+`pending` after a `SeqCst` fence and services it with a `try_lock`, as does
+the taker that queued the frame — either the taker gets the lock or the
+releasing holder sees the flag, so no frame is stranded, and each set sees
+its frames in device order whatever CPU took them. Operations that move
+smoltcp sockets out of a set (`accept`, closing a listener) feed its
+backlog first; a freed set drops its backlog. Re-validating the demux after
+re-locking was rejected because two CPUs holding frames of one flow would
+feed them out of order. Interface-lock acquisitions fell from 4.0 to 1.15
+per request and the spin from 13.7 to 8.4 µs per request at 4 vCPUs /
+C=64; set locks are contended 0.16 % of the time. The net task remains the
+timer driver (due sets, zombie reaping, DHCP, rescans) and the drainer of
+last resort; the NIC IRQ handler still only signals its `Event`.
+
+**Rejected / tried.** (1) Per-CPU smoltcp `Interface` shards with the
+flow table steering each set to the shard of the CPU that created it
+(commits 018a5ae, d114f8a, reverted by ee47af3): they cut the interface
+lock from 67 % to 31 % busy but gave nothing on VZ (118k req/s), and cost
+0.3–0.4 µs of loopback round trip; worth revisiting on a host that is not
+the bottleneck. (2) A vendored smoltcp patch for a single-socket egress:
+unnecessary once every set holds one socket. (3) A softirq-style
+"whoever holds the big lock drains for everyone" pending flag: batches the
+O(n) work but 1 vCPU still pays O(n) per request. (4) Delayed ACKs for
+non-loopback peers: p99 11 ms at C=1 and fewer req/s; discarded. (5)
+Processing frames inline in the NIC IRQ handler: not needed at load (the
+net task does 0.03 rounds per request; syscalls drain), left open for the
+C=1 latency case.
+
+**Measured (final tree c9bc3cf, `scripts/bench-http.sh`, host idle,
+median of 3 × 10 s; doc/bench-http.md "After D89").** `GET /` req/s (p99
+ms) on VZ, N=1 / 2 / 4: C=1 13.3k (0.14) / 11.7k (0.14) / 9.6k (0.18) →
+14.2k (0.15) / 12.3k (0.14) / 9.1k (0.66); C=16 25.7k (1.27) / 46.8k
+(0.95) / 52.0k (0.68) → 43.2k (0.79) / 69.7k (0.58) / 65.3k (0.49); C=64
+20.7k (6.17) / 36.0k (6.55) / 42.6k (11.97) → 42.5k (3.09) / 117.6k
+(1.75) / 116.3k (1.27). QEMU/HVF (slirp): C=16 15.9k / 17.6k / 17.9k →
+36.5k / 55.2k / 53.0k; C=64 14.7k / 17.3k / 16.7k → 36.6k / 65.4k / 63.3k
+(bench-http.md's "slirp is the bottleneck" was wrong). `/big` MB/s, C=1 /
+C=8: VZ 361/360, 350/394, 349/429 → 403/583, 426/849, 407/917; QEMU 75/65
+→ 257/261 at N=1. C=64 is now ≥ C=16 on every target and vCPU count; VZ
+at N=2 C=64 is 85 % of native loopback (137.7k). That run still had the
+VZ N=4 C=1 p99 tail (0.66–0.77 ms in two of three runs); with the
+idle-ring kick (bf38609, five runs, host idle) N=4 gives C=1 9.7–9.9k
+req/s with p99 0.18–0.19 ms, C=16 65–68k (p99 0.43–0.60 ms), C=64
+122–124k (p99 1.08–1.17 ms), `/big` 413 MB/s at C=1 and ~970 MB/s at
+C=8. A ~1 s stall (smoltcp's minimum RTO: a lost segment or ACK between
+the guest and VZ's NAT) shows up in about one `/big` C=8 run in ten
+(p99 0.6–0.8 s, max 1.0–1.1 s in that run), on every kernel measured here
+including the pre-D89 ones (D85 saw the same stall); not chased. Loopback
+(`scripts/bench.sh aarch64 --cpus 1,2`): tcp-rtt 4.33 / 4.51 → 3.90 /
+3.97 µs, tcp-throughput 693 / 688 → 714 / 749 MB/s, unix-rtt and pipes
+unchanged. Correctness on the final tree: `test-gopkg net net/http --cpus
+4` 254/55(1)/0 and 612/9/0 (aarch64), `net` 254/55/0 (x86_64), test-net
+14/14, test-smp sockets 6/6, test-netmq user 12/12 and tap (Docker, 4
+pairs) 12/12, test-vz 13/13, test-ctl, test-runtime (1 and 4 cpus),
+test-sysfuzz 41/41, test-robust, host tests, clippy 0 warnings on both
+targets.
+
+**Where the ceiling is now.** At 4 vCPUs / C=64 on VZ the 10-core host is
+~92 % busy, 52 % of it in the host kernel (VZ NAT / vmnet plus wrk), and
+guest CPUs 1–3 are ~40 % idle: the VZ path is host-bound at ~120k req/s on
+this Mac, which is why the shards gained nothing and 4 vCPUs are no faster
+than 2 at C=64 (the guest's interface lock is 71 % busy there, with
+~2/3 of each hold inside smoltcp: egress-with-send 753 ns, of which the
+NIC send ~300 ns including doorbells, ingress 239 ns per frame). Left on
+the table: the doorbell and virtio send still happen under the interface
+lock; the net task wakes slowly (155 µs average, mostly on CPU 0) — only
+C=1 feels it; the lock is still unfair (no ticket lock) though with
+2–4 µs holds the tail is 1–2 ms at C=64 instead of 12.

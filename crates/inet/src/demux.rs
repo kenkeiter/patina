@@ -309,7 +309,10 @@ mod tests {
             }
             other => panic!("{:?}", other),
         }
-        assert_eq!(parse(&v6_packet(58, a, a, &[135, 0, 0, 0])), Parsed::Neighbor);
+        assert_eq!(
+            parse(&v6_packet(58, a, a, &[135, 0, 0, 0])),
+            Parsed::Neighbor
+        );
         // One hop-by-hop header (8 bytes) before UDP.
         let mut hbh = alloc::vec![17u8, 0, 0, 0, 0, 0, 0, 0];
         hbh.extend_from_slice(&ports);
@@ -337,7 +340,10 @@ mod tests {
         m.add(6, 80, 3, Cover::of(AF_INET, Some(IpAddr::V4(lo)), false));
         assert_eq!(m.pick(6, 80, IpAddr::V4(lo), false), Some(3));
         assert_eq!(m.pick(6, 80, v4([10, 0, 2, 15]), false), Some(2));
-        assert_eq!(m.pick(6, 80, IpAddr::V6(Ipv6Addr::LOCALHOST), false), Some(1));
+        assert_eq!(
+            m.pick(6, 80, IpAddr::V6(Ipv6Addr::LOCALHOST), false),
+            Some(1)
+        );
         assert_eq!(m.pick(17, 80, IpAddr::V4(lo), false), None);
         assert_eq!(m.pick(6, 81, IpAddr::V4(lo), false), None);
         m.remove(6, 80, 2);
@@ -355,7 +361,12 @@ mod tests {
         // A dual-stack wildcard takes IPv4; the first of equals wins.
         assert_eq!(m.pick(17, 53, v4([127, 0, 0, 1]), false), Some(7));
         let mut m: PortMap<u32> = PortMap::new();
-        m.add(17, 68, 1, Cover::of(AF_INET, Some(v4([10, 0, 0, 5])), false));
+        m.add(
+            17,
+            68,
+            1,
+            Cover::of(AF_INET, Some(v4([10, 0, 0, 5])), false),
+        );
         // A broadcast reaches a socket bound to another address only as a
         // broadcast.
         assert_eq!(m.pick(17, 68, v4([255, 255, 255, 255]), false), None);

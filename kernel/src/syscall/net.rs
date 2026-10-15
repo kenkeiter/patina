@@ -689,7 +689,10 @@ pub fn recvmsg(fd: i32, msg: usize, flags: u32) -> SysResult {
     }
     if m.msg_name != 0
         && m.msg_namelen > 0
-        && !writable(m.msg_name as usize, (m.msg_namelen as usize).min(SOCKADDR_MAX))
+        && !writable(
+            m.msg_name as usize,
+            (m.msg_namelen as usize).min(SOCKADDR_MAX),
+        )
     {
         return Err(Errno(EFAULT));
     }

@@ -16,13 +16,13 @@ mod exceptions;
 mod gic;
 pub mod irq;
 pub mod its;
-pub mod v2m;
 pub mod paging;
 pub mod power;
 pub mod sigframe;
 pub mod smp;
 pub mod timer;
 pub mod uspace;
+pub mod v2m;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 

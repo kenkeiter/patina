@@ -651,7 +651,10 @@ impl AddressSpace {
         }
         let len = page_len(addr, len).ok_or(Errno(EINVAL))?;
         // Punching a hole splits a VMA in two (Linux __split_vma).
-        if self.find(addr).is_some_and(|v| v.start < addr && v.end > addr + len) {
+        if self
+            .find(addr)
+            .is_some_and(|v| v.start < addr && v.end > addr + len)
+        {
             self.map_count_check(1)?;
         }
         self.remove_range(addr, addr + len, &mut Shootdown::new());
