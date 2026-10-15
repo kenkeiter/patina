@@ -98,7 +98,9 @@
 //! `IDLE`, `ONLINE`, `STOPPED`, `on_cpu`, `need_resched` are atomics.
 //! The console lock is a leaf and is taken from IRQ context (fine: every
 //! `SpinLock` masks IRQs). Nobody spins on `on_cpu` with a runqueue lock
-//! held.
+//! held. Network stack (`net::stack`): socket-set lock → interface lock →
+//! virtio-net driver lock / heap, never two set locks waited for at once,
+//! hooks fired with neither held.
 //!
 //! # Rules
 //! * [`schedule`] is called with no spinlock held (it masks IRQs itself);

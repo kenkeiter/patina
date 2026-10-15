@@ -48,11 +48,16 @@
 //! datagram an ICMP port unreachable. A set gets its frame through a
 //! one-frame device (`mux::OneFrame`).
 //!
-//! **Backlogs (frame order).** A frame bound for set Y is fed while the
-//! interface lock is still held from its demux: the taker `try_lock`s Y
-//! and, if that succeeds, feeds it, polls Y's egress, settles it, and only
-//! then drops the interface lock (`SpinLockGuard::swap_irq_state` lets it
-//! release the interface lock before Y's). If Y is busy (a syscall on Y,
+//! **Drains and backlogs (frame order).** A drainer holds the interface
+//! lock for a batch of up to `BATCH` frames (between batches it fires the
+//! readiness changes it collected and lets others in). A frame bound for
+//! set Y is fed while the interface lock is still held from its demux: the
+//! taker `try_lock`s Y and, if that succeeds, feeds it, and so the frames
+//! after it while they are for Y too; Y's egress and settling run once,
+//! when the batch moves on to another set or ends (`Drain::finish`; a run
+//! of loopback segments is answered by one ACK). Y is released before the
+//! interface lock (nothing can be queued for it meanwhile: that needs the
+//! interface lock). If Y is busy (a syscall on Y,
 //! another CPU feeding it), the frame is copied onto Y's backlog (in its
 //! registry entry, under the interface lock) and `SetLock::pending` set.
 //! Whoever holds Y feeds the backlog before anything else the next time it
@@ -96,8 +101,11 @@
 //! * every **socket syscall** ([`sys`]): lock its set (feed a pending
 //!   backlog first), do the operation (taking the interface lock inside
 //!   when it needs shared state), poll the set if the operation changed
-//!   something, release, fire; then **drain** received frames (loopback
-//!   first, every one of them, then at most `SYS_BUDGET` NIC frames). So a
+//!   something (a read only when smoltcp would send a window update:
+//!   `inet::window_update_due`), release the set and, keeping the
+//!   interface lock (`SpinLockGuard::swap_irq_state` lets it release the
+//!   set first), **drain** received frames (loopback first, every one of
+//!   them, then at most `SYS_BUDGET` NIC frames); fire. So a
 //!   write is in the peer's receive buffer (over loopback) before the
 //!   syscall returns — or on its backlog while another CPU holds the peer,
 //!   to be fed before that holder lets go — and the peer's ACK is

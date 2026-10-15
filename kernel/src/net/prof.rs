@@ -48,7 +48,8 @@ pub fn now() -> u64 {
 pub enum Site {
     /// The net task: timer-due sets, its frame drain, rescans.
     Task = 0,
-    /// A socket syscall polling its own set (egress, `poll_delay`).
+    /// A socket syscall polling its own set (egress, `poll_delay`), and the
+    /// first batch of its drain, which keeps that hold.
     SysPoll = 1,
     /// A socket syscall that needs the interface without polling (bind,
     /// socket creation, a set's backlog found at lock time).
