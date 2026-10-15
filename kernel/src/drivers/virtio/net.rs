@@ -25,13 +25,40 @@
 //! * Receive: per pair up to 128 posted 2 KiB device-writable buffers, one
 //!   descriptor each (header + frame). [`NetDevice::recv`] takes one used
 //!   buffer from the pairs in turn (round robin, so one busy queue cannot
-//!   starve the others), copies the frame out, re-posts the buffer and
-//!   kicks that queue. All pairs feed the one smoltcp interface (D67).
+//!   starve the others), copies the frame out and re-posts the buffer.
+//!   All pairs feed the one smoltcp interface (D67).
 //! * Transmit: per pair up to 32 slots of 2 KiB (header + frame, one
 //!   device-readable descriptor). [`NetDevice::send`] uses the pair of the
 //!   current CPU (`cpu % P`), or the next pair with a free slot when that
 //!   one is full; `can_send` is false only when every pair is full, which
 //!   keeps D85's "no transmit token while the NIC cannot take a frame".
+//! * Doorbells (queue notifies, a VM exit each) are deferred: `recv` and
+//!   `send` only mark the queue "kick pending", and [`NetDevice::flush`]
+//!   kicks every pending queue of every pair once. The stack calls `flush`
+//!   at the end of every poll pass, under the same lock hold as the
+//!   `recv`/`send` calls, so a frame is notified microseconds after it was
+//!   queued. Contract: whoever calls `recv`/`send` must call `flush` before
+//!   it stops polling (the self-test's `send_wait`/`collect_replies` do;
+//!   `can_send` only reclaims and never leaves anything pending). Bounded
+//!   batches: a queue with [`RX_BATCH`] reposts or [`TX_BATCH`] frames
+//!   pending is kicked right away, so the device keeps draining a long
+//!   burst (a 4 MiB response) instead of waiting for the end of the pass
+//!   with its ring full.
+//! * `VIRTIO_F_EVENT_IDX` is negotiated when offered (VZ and QEMU do).
+//!   A pending kick then notifies only when the device's `avail_event`
+//!   was crossed (it went idle waiting for exactly these buffers);
+//!   without it the device's `VIRTQ_USED_F_NO_NOTIFY` is honoured
+//!   (`queue::VirtQueue::kick_prepare`). Interrupts are not suppressed
+//!   beyond what the plain mode does: `used_event` is re-armed to
+//!   `last_used` whenever a queue is found empty, so the next completion
+//!   after the driver caught up interrupts. A queue the stack stopped
+//!   draining early (its ingress budget ran out) would get no further
+//!   interrupt, so `flush` signals [`EVENT`] when a receive queue still
+//!   holds completions. The control queue, polled, gets `used_event`
+//!   moved out of reach instead of `VIRTQ_AVAIL_F_NO_INTERRUPT`, which an
+//!   EVENT_IDX device ignores. Counters (`patina.stats`): doorbells
+//!   issued, suppressed by the device, and coalesced (marks folded into an
+//!   already pending kick), per direction.
 //! * Interrupts: the callback only reads+acknowledges the interrupt status
 //!   and signals [`EVENT`] (D59); it never takes the driver lock, so a CPU
 //!   holding that lock with IRQs masked cannot deadlock against it. On
@@ -52,9 +79,9 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use super::queue::{Buf, DmaBuf, VirtQueue};
+use super::queue::{Buf, DmaBuf, F_EVENT_IDX, VirtQueue};
 use super::{DEVICE_NET, F_VERSION_1, Transport, attach_irq, driver_ok, negotiate_with};
 use crate::drivers::Event;
 use crate::net::device::{MAX_FRAME, NetDevice};
@@ -88,6 +115,10 @@ const IRQ_CPUS: usize = 16;
 const BUF: usize = 2048;
 const RX_WANT: u16 = 128;
 const TX_WANT: u16 = 32;
+/// Pending receive reposts / transmit frames after which a queue is
+/// kicked without waiting for `flush`.
+pub const RX_BATCH: u16 = 32;
+pub const TX_BATCH: u16 = 8;
 
 /// One receive/transmit queue pair.
 struct Pair {
@@ -104,6 +135,10 @@ struct Pair {
     tx_slots: usize,
     /// MSI-X vector of both queues (0: the shared interrupt).
     vector: u16,
+    /// Buffers re-posted / frames queued since the queue was last kicked
+    /// (or found not to need a kick).
+    rx_pending: u16,
+    tx_pending: u16,
 }
 
 struct Net {
@@ -133,6 +168,17 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static RX_FRAMES: [AtomicU64; MAX_PAIRS] = [const { AtomicU64::new(0) }; MAX_PAIRS];
 static TX_FRAMES: [AtomicU64; MAX_PAIRS] = [const { AtomicU64::new(0) }; MAX_PAIRS];
 static IRQ_CPU: [AtomicU32; IRQ_CPUS] = [const { AtomicU32::new(0) }; IRQ_CPUS];
+/// `VIRTIO_F_EVENT_IDX` negotiated.
+static EVENT_IDX: AtomicBool = AtomicBool::new(false);
+/// Doorbells per direction: [`DB_ISSUED`] notifies, [`DB_SUPPRESSED`]
+/// pending kicks the device said it did not need, [`DB_COALESCED`]
+/// marks (reposts, frames) folded into an already pending kick.
+/// Index 0 receive, 1 transmit.
+static DB_ISSUED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static DB_SUPPRESSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static DB_COALESCED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// `flush` found a receive queue with completions left (signalled EVENT).
+static FLUSH_RX_LEFT: AtomicU64 = AtomicU64::new(0);
 
 fn irq() {
     IRQS.fetch_add(1, Ordering::Relaxed);
@@ -152,13 +198,15 @@ fn transport() -> &'static dyn Transport {
 impl Pair {
     /// Set up pair `k` (queues 2k, 2k+1) on `vector` and post every
     /// receive buffer.
-    fn new(t: &dyn Transport, k: u16, vector: u16) -> Option<Pair> {
+    fn new(t: &dyn Transport, k: u16, vector: u16, event_idx: bool) -> Option<Pair> {
         if vector != 0 {
             t.set_queue_vector(2 * k, vector);
             t.set_queue_vector(2 * k + 1, vector);
         }
-        let rx = VirtQueue::new(t, 2 * k, RX_WANT)?;
-        let tx = VirtQueue::new(t, 2 * k + 1, TX_WANT)?;
+        let mut rx = VirtQueue::new(t, 2 * k, RX_WANT)?;
+        let mut tx = VirtQueue::new(t, 2 * k + 1, TX_WANT)?;
+        rx.set_event_idx(event_idx);
+        tx.set_event_idx(event_idx);
         let tx_slots = (tx.size() as usize).min(TX_WANT as usize);
         let mut p = Pair {
             rx_buf: DmaBuf::new(rx.size() as usize * BUF)?,
@@ -170,6 +218,8 @@ impl Pair {
             tx_free: ((1u64 << tx_slots) - 1) as u32,
             tx_slots,
             vector,
+            rx_pending: 0,
+            tx_pending: 0,
         };
         for s in 0..p.rx.size() as usize {
             p.post_rx(s);
@@ -207,7 +257,6 @@ impl Pair {
     }
 
     fn recv(&mut self, hdr: usize, buf: &mut [u8]) -> Option<usize> {
-        let mut reposted = false;
         let mut out = None;
         while let Some((h, len)) = self.rx.pop_used() {
             let slot = self.rx_slot_of[h as usize] as usize;
@@ -218,20 +267,56 @@ impl Pair {
                 self.rx_buf.read(slot * BUF + hdr, &mut buf[..n]);
                 out = Some(n);
             }
-            reposted |= self.post_rx(slot);
+            if self.post_rx(slot) {
+                self.rx_pending += 1;
+                if self.rx_pending > 1 {
+                    DB_COALESCED[0].fetch_add(1, Ordering::Relaxed);
+                }
+            }
             if ok {
                 break;
             }
         }
-        if reposted {
-            let t = crate::net::prof::start(crate::net::prof::on());
-            self.rx.kick(transport());
-            crate::net::prof::NIC_RX_KICK.done(t);
+        if self.rx_pending >= RX_BATCH {
+            self.kick_rx();
         }
         out
     }
 
-    /// Stage and kick `frame`; false when no slot is free.
+    /// Issue the receive queue's pending doorbell, if the device needs it.
+    fn kick_rx(&mut self) {
+        if self.rx_pending == 0 {
+            return;
+        }
+        self.rx_pending = 0;
+        if self.rx.kick_prepare() {
+            let t = crate::net::prof::start(crate::net::prof::on());
+            self.rx.kick(transport());
+            crate::net::prof::NIC_RX_KICK.done(t);
+            DB_ISSUED[0].fetch_add(1, Ordering::Relaxed);
+        } else {
+            DB_SUPPRESSED[0].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Issue the transmit queue's pending doorbell, if the device needs it.
+    fn kick_tx(&mut self) {
+        if self.tx_pending == 0 {
+            return;
+        }
+        self.tx_pending = 0;
+        if self.tx.kick_prepare() {
+            let t = crate::net::prof::start(crate::net::prof::on());
+            self.tx.kick(transport());
+            crate::net::prof::NIC_TX_KICK.done(t);
+            DB_ISSUED[1].fetch_add(1, Ordering::Relaxed);
+        } else {
+            DB_SUPPRESSED[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Stage `frame` (its doorbell is deferred to `flush`, or issued now
+    /// once [`TX_BATCH`] frames are pending); false when no slot is free.
     fn send(&mut self, hdr: usize, frame: &[u8]) -> bool {
         if !self.can_send() {
             return false;
@@ -250,9 +335,13 @@ impl Pair {
         };
         self.tx_slot_of[h as usize] = slot as u8;
         self.tx_free &= !(1 << slot);
-        let t = crate::net::prof::start(crate::net::prof::on());
-        self.tx.kick(transport());
-        crate::net::prof::NIC_TX_KICK.done(t);
+        self.tx_pending += 1;
+        if self.tx_pending > 1 {
+            DB_COALESCED[1].fetch_add(1, Ordering::Relaxed);
+        }
+        if self.tx_pending >= TX_BATCH {
+            self.kick_tx();
+        }
         true
     }
 }
@@ -292,6 +381,23 @@ impl Net {
             }
         }
         false
+    }
+
+    /// Issue every pending doorbell. Then, with EVENT_IDX, make sure no
+    /// receive completion is stranded: a queue not drained to empty (the
+    /// caller stopped calling `recv`) has no interrupt armed, so wake the
+    /// stack's task to come back for it.
+    fn flush(&mut self) {
+        let mut left = false;
+        for p in &mut self.pairs[..self.active] {
+            p.kick_rx();
+            p.kick_tx();
+            left |= p.rx.event_idx() && p.rx.has_used();
+        }
+        if left {
+            FLUSH_RX_LEFT.fetch_add(1, Ordering::Relaxed);
+            EVENT.signal();
+        }
     }
 
     /// Move pair k's vector to CPU k for every such CPU that is online by
@@ -346,6 +452,12 @@ impl NetDevice for VirtioNet {
     fn event(&self) -> &'static Event {
         &EVENT
     }
+
+    fn flush(&mut self) {
+        if let Some(n) = NET.lock().as_mut() {
+            n.flush();
+        }
+    }
 }
 
 /// A locally administered unicast MAC (02:xx:xx:xx:xx:xx).
@@ -382,6 +494,7 @@ fn set_pairs(
     let Some(mut cq) = VirtQueue::new(t, q, 8) else {
         return (None, Err("no control queue"));
     };
+    cq.set_event_idx(EVENT_IDX.load(Ordering::Relaxed));
     // Header (class, command) at 0, data (le16 pairs) at 16, ack at 32.
     buf.write(0, &[CTRL_MQ, CTRL_MQ_VQ_PAIRS_SET]);
     buf.write(16, &pairs.to_le_bytes());
@@ -454,7 +567,7 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     let t = transport();
     let feats = match negotiate_with(t, |offered| {
         let mq = F_MQ | F_CTRL_VQ;
-        F_MAC | F_STATUS | F_MTU | if want_mq && offered & mq == mq { mq } else { 0 }
+        F_MAC | F_STATUS | F_MTU | F_EVENT_IDX | if want_mq && offered & mq == mq { mq } else { 0 }
     }) {
         Ok(f) => f,
         Err(e) => {
@@ -463,6 +576,8 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
         }
     };
     let hdr = if feats & F_VERSION_1 != 0 { 12 } else { 10 };
+    let event_idx = feats & F_EVENT_IDX != 0;
+    EVENT_IDX.store(event_idx, Ordering::Relaxed);
     let mac = if feats & F_MAC != 0 {
         core::array::from_fn(|i| t.config_read8(i))
     } else {
@@ -510,7 +625,7 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     let mut pairs = Vec::with_capacity(npairs);
     for k in 0..npairs {
         let v = vectors.get(k).map_or(0, |v| v.0);
-        match Pair::new(t, k as u16, v) {
+        match Pair::new(t, k as u16, v, event_idx) {
             Some(p) => pairs.push(p),
             None => break,
         }
@@ -552,7 +667,10 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
     let (nrx, ntx) = (pairs[0].rx.size(), pairs[0].tx_slots);
     let mut loc = String::new();
     let _ = t.describe(&mut loc);
-    for p in &pairs[..active] {
+    for p in &mut pairs[..active] {
+        // The initial buffers: notify unconditionally (and start
+        // `kick_prepare`'s window here).
+        let _ = p.rx.kick_prepare();
         p.rx.kick(t);
     }
     let affinity_pending = if per_pair && active > 1 {
@@ -572,7 +690,7 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
         _ctrl: ctrl,
     });
     crate::kprintln!(
-        "[patina] virtio-net: mac {}, queues rx {} / tx {}, pairs {}{}{}, link {}{} ({}, hdr {} B{})",
+        "[patina] virtio-net: mac {}, queues rx {} / tx {}, pairs {}{}{}{}, link {}{} ({}, hdr {} B{})",
         fmt_mac(&mac),
         nrx,
         ntx,
@@ -587,6 +705,7 @@ pub fn init(cmdline: &patina_cmdline::Cmdline) {
         } else {
             ""
         },
+        if event_idx { ", event-idx" } else { "" },
         if link_up { "up" } else { "down" },
         mtu.map_or(String::new(), |m| alloc::format!(", mtu {}", m)),
         loc,
@@ -635,12 +754,24 @@ pub fn print_stats() {
         }
     }
     crate::console::panic_write_fmt(format_args!(
-        "[patina] stats net: virtio-net pairs {}, rx frames {}, tx frames {}, irqs per cpu {}, irq cpus {}\n",
+        "[patina] stats net: virtio-net pairs {}, rx frames {}, tx frames {}, irqs per cpu {}, irq cpus {}, event-idx {}, doorbells issued/suppressed/coalesced rx {}/{}/{} tx {}/{}/{}, flush rx-left {}\n",
         n,
         list(&RX_FRAMES[..n]),
         list(&TX_FRAMES[..n]),
         per_cpu,
         if cpus.is_empty() { "-" } else { &cpus },
+        if EVENT_IDX.load(Ordering::Relaxed) {
+            "on"
+        } else {
+            "off"
+        },
+        DB_ISSUED[0].load(Ordering::Relaxed),
+        DB_SUPPRESSED[0].load(Ordering::Relaxed),
+        DB_COALESCED[0].load(Ordering::Relaxed),
+        DB_ISSUED[1].load(Ordering::Relaxed),
+        DB_SUPPRESSED[1].load(Ordering::Relaxed),
+        DB_COALESCED[1].load(Ordering::Relaxed),
+        FLUSH_RX_LEFT.load(Ordering::Relaxed),
     ));
 }
 
@@ -692,7 +823,11 @@ fn collect_replies(mac: [u8; 6], n: usize, ns: u64) -> (usize, Option<[u8; 6]>) 
     let mut f = [0u8; MAX_FRAME];
     let t0 = now();
     while got < n && now() - t0 < ns {
-        let r = NET.lock().as_mut().and_then(|d| d.recv(&mut f));
+        let r = NET.lock().as_mut().and_then(|d| {
+            let r = d.recv(&mut f);
+            d.flush(); // the re-posted buffer's doorbell
+            r
+        });
         match r {
             Some(len) => {
                 if let Some(m) = arp_reply(&f[..len], mac) {
@@ -709,7 +844,11 @@ fn collect_replies(mac: [u8; 6], n: usize, ns: u64) -> (usize, Option<[u8; 6]>) 
 fn send_wait(frame: &[u8], ns: u64) -> bool {
     let t0 = now();
     loop {
-        if NET.lock().as_mut().is_some_and(|d| d.send(frame)) {
+        if NET.lock().as_mut().is_some_and(|d| {
+            let ok = d.send(frame);
+            d.flush(); // this frame's doorbell
+            ok
+        }) {
             return true;
         }
         if now() - t0 >= ns {

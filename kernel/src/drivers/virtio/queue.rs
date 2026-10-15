@@ -10,6 +10,20 @@
 //! A `VirtQueue` is not locked itself: its owner keeps it in a `SpinLock`
 //! (or owns it exclusively). It never blocks; completion is observed with
 //! [`VirtQueue::pop_used`] (from an IRQ-woken thread or by polling).
+//!
+//! Notification suppression (§2.7.7, §2.7.10). [`VirtQueue::kick`]
+//! always notifies. [`VirtQueue::kick_prepare`] says whether a notify is
+//! needed for the buffers added since its previous call: with
+//! `VIRTIO_F_EVENT_IDX` (opted into per queue with
+//! [`VirtQueue::set_event_idx`], only by drivers that negotiated it) it
+//! applies `vring_need_event(avail_event, new, old)`; without it, it
+//! honours the device's `VIRTQ_USED_F_NO_NOTIFY`. Interrupts: without
+//! EVENT_IDX the driver only ever sets `VIRTQ_AVAIL_F_NO_INTERRUPT` (per
+//! [`VirtQueue::set_no_interrupt`]); with it, `used_event` is written as
+//! `last_used` whenever [`VirtQueue::pop_used`] finds the ring empty (then
+//! re-checked after a full fence), so the next completion after the
+//! driver caught up interrupts, or as `last_used - 1` (65535 completions
+//! away) for a queue that asked for no interrupts.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -99,6 +113,16 @@ pub struct Buf {
 const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
 const AVAIL_F_NO_INTERRUPT: u16 = 1;
+const USED_F_NO_NOTIFY: u16 = 1;
+
+/// VIRTIO_F_EVENT_IDX (virtio 1.2 §6): `used_event` / `avail_event`.
+pub const F_EVENT_IDX: u64 = 1 << 29;
+
+/// `vring_need_event` (virtio 1.2 §2.7.10): whether moving an index from
+/// `old` to `new` crossed `event` (i.e. `event` is in `[old, new)`).
+pub fn need_event(event: u16, new: u16, old: u16) -> bool {
+    new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
+}
 
 /// Largest queue this driver sets up (keeps the ring within 8 KiB).
 pub const MAX_QUEUE_SIZE: u16 = 128;
@@ -115,6 +139,12 @@ pub struct VirtQueue {
     chain: Vec<u16>,
     avail_idx: u16,
     last_used: u16,
+    /// `VIRTIO_F_EVENT_IDX` was negotiated for this queue's device.
+    event_idx: bool,
+    /// The driver asked for no interrupts ([`set_no_interrupt`](Self::set_no_interrupt)).
+    no_interrupt: bool,
+    /// `avail_idx` at the last [`kick_prepare`](Self::kick_prepare).
+    checked_idx: u16,
 }
 
 // SAFETY: the ring memory is owned by the queue; all access goes through
@@ -150,6 +180,9 @@ impl VirtQueue {
             chain: vec![0; n],
             avail_idx: 0,
             last_used: 0,
+            event_idx: false,
+            no_interrupt: false,
+            checked_idx: 0,
             mem,
         };
         // Free list: each descriptor's `next` points at the following one.
@@ -202,13 +235,45 @@ impl VirtQueue {
         self.mem.va(self.used_off + off)
     }
 
+    /// The device negotiated `VIRTIO_F_EVENT_IDX` (call right after
+    /// [`new`](Self::new), before the queue is used; every queue of such a
+    /// device must be told, since the device then ignores the flags words).
+    pub fn set_event_idx(&mut self, on: bool) {
+        self.event_idx = on;
+        self.write_used_event();
+    }
+
+    pub fn event_idx(&self) -> bool {
+        self.event_idx
+    }
+
     /// Ask the device not to interrupt for used buffers on this queue
-    /// (a hint; for queues the driver polls).
+    /// (a hint; for queues the driver polls). With EVENT_IDX this moves
+    /// `used_event` out of reach instead of setting the flag.
     pub fn set_no_interrupt(&mut self, on: bool) {
+        self.no_interrupt = on;
         // SAFETY: the avail ring's flags word.
         unsafe {
             (self.avail_va(0) as *mut u16).write_volatile(if on { AVAIL_F_NO_INTERRUPT } else { 0 })
         };
+        self.write_used_event();
+    }
+
+    /// `used_event` (the u16 after the avail ring): interrupt once the
+    /// used index passes `last_used`, or (no interrupts wanted) only after
+    /// 65535 more completions.
+    fn write_used_event(&self) {
+        if !self.event_idx {
+            return;
+        }
+        let v = if self.no_interrupt {
+            self.last_used.wrapping_sub(1)
+        } else {
+            self.last_used
+        };
+        // SAFETY: the avail ring's `used_event` word (inside the ring
+        // memory: `avail_bytes` counts it).
+        unsafe { (self.avail_va(4 + 2 * self.size as usize) as *mut u16).write_volatile(v) };
     }
 
     /// Make the chain `bufs` available; returns its head (the token
@@ -250,10 +315,38 @@ impl VirtQueue {
         Some(head)
     }
 
-    /// Notify the device that buffers are available.
+    /// Notify the device that buffers are available (unconditionally).
     pub fn kick(&self, t: &dyn Transport) {
         crate::arch::cpu::io_barrier();
         t.notify(self.index);
+    }
+
+    /// Whether the buffers added since the previous call need a notify
+    /// ([`kick`](Self::kick)): false when none were added or the device
+    /// said it does not need one (EVENT_IDX: `avail_event` was not
+    /// crossed; otherwise `VIRTQ_USED_F_NO_NOTIFY`). The caller must
+    /// kick when this returns true.
+    pub fn kick_prepare(&mut self) -> bool {
+        let (new, old) = (self.avail_idx, self.checked_idx);
+        if new == old {
+            return false;
+        }
+        self.checked_idx = new;
+        // The spec's "mb": the avail index store (made in `add`) must be
+        // visible before the device's suppression state is read, or a
+        // device going idle could miss both the index and the notify.
+        fence(Ordering::SeqCst);
+        if self.event_idx {
+            // SAFETY: the used ring's `avail_event` word (inside the ring
+            // memory: `used_bytes` counts it), written by the device.
+            let ev =
+                unsafe { (self.used_va(4 + 8 * self.size as usize) as *const u16).read_volatile() };
+            need_event(ev, new, old)
+        } else {
+            // SAFETY: the used ring's flags word, written by the device.
+            let flags = unsafe { (self.used_va(0) as *const u16).read_volatile() };
+            flags & USED_F_NO_NOTIFY == 0
+        }
     }
 
     fn used_idx(&self) -> u16 {
@@ -269,9 +362,19 @@ impl VirtQueue {
     }
 
     /// Next completed chain: (head token, bytes written by the device).
+    /// With EVENT_IDX, finding the ring empty re-arms the interrupt
+    /// (`used_event` = `last_used`) and re-checks after a full fence, so a
+    /// completion published concurrently is either returned or interrupts.
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
         if self.used_idx() == self.last_used {
-            return None;
+            if !self.event_idx {
+                return None;
+            }
+            self.write_used_event();
+            fence(Ordering::SeqCst);
+            if self.used_idx() == self.last_used {
+                return None;
+            }
         }
         let slot = (self.last_used % self.size) as usize;
         // SAFETY: a used-ring element (id u32, len u32) the device wrote
