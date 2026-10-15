@@ -1,6 +1,7 @@
 //! `patina.stats=1` counters for the TCP/IP stack: who takes the stack
 //! lock and for how long, where the time under it goes (ingress, listener
-//! refills, egress, `track`, `refresh_all`, `poll_delay`), how the net task
+//! refills, egress, `track`, readiness refresh, `poll_delay`; all per
+//! socket set since D67's per-socket sets), the ingress demux, how the net task
 //! wakes up, and the scheduler IPIs / wake-ups that reach it. Printed at
 //! exit by [`super::stack::print_stats`].
 //!
@@ -143,40 +144,55 @@ pub fn start(timing: bool) -> u64 {
     if timing { now() } else { 0 }
 }
 
-/// Whole `Stack::poll_all` calls.
+/// Whole poll passes (`Stack::pass`; printed as `poll_all`).
 pub static POLL_ALL: Phase = Phase::new();
 /// `poll_maintenance`.
 pub static MAINT: Phase = Phase::new();
-/// `poll_ingress_single` calls that processed a packet.
+/// Received frames: demux + `poll_ingress_single` into the frame's set.
 pub static INGRESS: Phase = Phase::new();
-/// `poll_ingress_single` calls that found nothing (one per round).
+/// Looking for a frame and finding none (one per round).
 pub static INGRESS_NONE: Phase = Phase::new();
 /// Packets processed by ingress (calls that did not return None).
 pub static INGRESS_PKTS: Counter = Counter::new(0);
 pub static REFILL: Phase = Phase::new();
 /// `poll_egress` calls that emitted something.
 pub static EGRESS: Phase = Phase::new();
-/// The final `poll_egress` call of each drain loop (nothing to send: a scan
-/// of every socket).
+/// The final `poll_egress` call on a set (nothing more to send).
 pub static EGRESS_NONE: Phase = Phase::new();
 /// poll_egress calls that returned something other than None.
 pub static EGRESS_SOME: Counter = Counter::new(0);
 pub static DHCP_EV: Phase = Phase::new();
 pub static TRACK: Phase = Phase::new();
-/// Sum of `socks.len()` over `track` calls.
+/// Sockets tracked (one per `track` call).
 pub static TRACK_SOCKS: Counter = Counter::new(0);
 pub static REFRESH: Phase = Phase::new();
-/// Socket readiness evaluations (sum of `socks.len()` per `refresh_all`).
+/// Socket readiness evaluations (one per `Sock::refresh`; printed as
+/// `refresh_all`).
 pub static REFRESH_EVALS: Counter = Counter::new(0);
-/// Hooks collected by `refresh_all` (one per hook per notification).
+/// Hooks collected by readiness refreshes (one per hook per notification).
 pub static REFRESH_HOOKS: Counter = Counter::new(0);
+/// `poll_delay` of one set (printed as `next_deadline`).
 pub static DEADLINE: Phase = Phase::new();
+/// Received frames by where the demux sent them: an exact flow-table hit
+/// (a connection or a listener's pending one), a listener / bound UDP
+/// socket / the DHCP client by local port, no socket (the empty set:
+/// unknown TCP tuple → RST, UDP → port unreachable), or not TCP/UDP at all
+/// (ARP, ICMP, NDISC, fragments).
+pub static DEMUX_EXACT: Counter = Counter::new(0);
+pub static DEMUX_PORT: Counter = Counter::new(0);
+pub static DEMUX_MISS: Counter = Counter::new(0);
+pub static DEMUX_OTHER: Counter = Counter::new(0);
+/// Passes that queued every set (a neighbor may have been learned, or the
+/// addresses changed).
+pub static RESCANS: Counter = Counter::new(0);
+/// Socket sets egressed (one `poll_egress` loop each).
+pub static SETS_EGRESSED: Counter = Counter::new(0);
 /// The closure passed to `stack::with` (the syscall's own work).
 pub static WITH_OP: Phase = Phase::new();
 pub static MAX_SOCKS: Counter = Counter::new(0);
 pub static MAX_SET: Counter = Counter::new(0);
-/// Sampled `SocketSet` sizes (every [`SET_SAMPLE`]th poll_all): sum and
-/// number of samples.
+/// Sampled numbers of live socket sets and of sockets (every
+/// [`SET_SAMPLE`]th pass): sums and number of samples.
 pub static SET_SUM: Counter = Counter::new(0);
 pub static SET_SAMPLES: Counter = Counter::new(0);
 pub static SOCKS_SUM: Counter = Counter::new(0);

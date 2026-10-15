@@ -10,6 +10,8 @@
 //! * [`unix`]: AF_UNIX pieces — the stream buffer that carries passed fds
 //!   with their bytes, and the `cmsg` codec.
 //!
+//! * [`demux`]: received-frame demultiplexing for the per-socket smoltcp
+//!   socket sets (the transport tuple of a frame, listeners by port).
 //! * [`netlink`]: `NETLINK_ROUTE` request parsing and the link/address
 //!   dump replies (`net.Interfaces`).
 //! * [`vsock`]: AF_VSOCK stream sockets — the virtio-vsock header codec,
@@ -22,6 +24,7 @@
 
 extern crate alloc;
 
+pub mod demux;
 pub mod netlink;
 pub mod unix;
 pub mod vsock;

@@ -1,13 +1,20 @@
-//! The stack's one smoltcp `Device` (design §9, D67): the NIC (if any)
-//! plus an in-memory loopback queue.
+//! The stack's smoltcp devices (design §9, D67): the NIC (if any) plus an
+//! in-memory loopback queue.
 //!
-//! smoltcp has no "deliver to self" path, so every transmitted Ethernet
-//! frame is classified here: frames for one of our own addresses (or
-//! 127/8, `::1`), ARP requests and neighbor solicitations for them, and
+//! Transmit: smoltcp has no "deliver to self" path, so every transmitted
+//! Ethernet frame is classified here: frames for one of our own addresses
+//! (or 127/8, `::1`), ARP requests and neighbor solicitations for them, and
 //! anything addressed to our own MAC go to the loopback queue and are
-//! received on the next poll (smoltcp answers its own ARP and learns the
-//! neighbor, as in its `examples/loopback.rs`). Everything else goes to the
-//! NIC, or is counted and dropped without one.
+//! received by whoever polls next (smoltcp answers its own ARP and learns
+//! the neighbor, as in its `examples/loopback.rs`). Everything else goes to
+//! the NIC, or is counted and dropped without one. [`Mux`] is the device
+//! `poll_egress` sends through (it never receives).
+//!
+//! Receive: the stack takes one frame at a time ([`Mux::next_frame`]:
+//! loopback first, then the NIC) into [`Mux`]'s receive buffer, reads its
+//! transport tuple to pick the socket set it belongs to (`stack`), and
+//! feeds it to smoltcp through [`OneFrame`], a device that yields exactly
+//! that frame once and transmits replies through the same classification.
 //!
 //! The one wrinkle: smoltcp never answers a neighbor solicitation for
 //! `::1` (its solicited-node check skips the loopback address), so a
@@ -295,45 +302,117 @@ impl phy::TxToken for TxToken<'_> {
     }
 }
 
+impl MuxTx {
+    /// Whether a transmit token may be handed out now. Not while the
+    /// loopback queue is full, nor while the NIC's transmit ring is full:
+    /// a token would make `route` drop the frame, which costs TCP a
+    /// retransmission timeout (smoltcp's minimum RTO is 1 s; a 4 MiB send
+    /// over VZ NAT stalled for 1 s in about half the runs). Without a token
+    /// smoltcp keeps the data; the driver's transmit-completion interrupt
+    /// wakes the net task to poll again.
+    fn can_transmit(&mut self) -> bool {
+        if self.lo.is_full() {
+            return false;
+        }
+        if let Some(n) = self.nic.as_mut()
+            && !n.can_send()
+        {
+            return false;
+        }
+        true
+    }
+}
+
+fn caps(mtu: usize) -> DeviceCapabilities {
+    let mut caps = DeviceCapabilities::default();
+    caps.medium = Medium::Ethernet;
+    // For Ethernet smoltcp counts the 14-byte header in the MTU.
+    caps.max_transmission_unit = mtu + ETH_HDR;
+    caps
+}
+
+impl Mux {
+    /// Take the next received frame into the receive buffer: the loopback
+    /// queue first, then (if `nic`) the NIC. Returns its length.
+    pub fn next_frame(&mut self, nic: bool) -> Option<usize> {
+        if let Some(n) = self.tx.lo.pop_into(&mut self.rx) {
+            return Some(n);
+        }
+        if !nic {
+            return None;
+        }
+        let n = self.tx.nic.as_mut()?.recv(&mut self.rx[..])?;
+        self.tx.stats.nic_rx += 1;
+        Some(n)
+    }
+
+    /// The frame [`Mux::next_frame`] returned.
+    pub fn frame(&self, n: usize) -> &[u8] {
+        &self.rx[..n]
+    }
+
+    /// A device that yields that frame once (and transmits replies).
+    pub fn one_frame(&mut self, n: usize) -> OneFrame<'_> {
+        OneFrame {
+            frame: Some(&self.rx[..n]),
+            tx: &mut self.tx,
+            mtu: self.mtu,
+        }
+    }
+}
+
+/// One received frame as a smoltcp device (see the module docs).
+pub struct OneFrame<'a> {
+    frame: Option<&'a [u8]>,
+    tx: &'a mut MuxTx,
+    mtu: usize,
+}
+
+impl Device for OneFrame<'_> {
+    type RxToken<'a>
+        = RxToken<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = TxToken<'a>
+    where
+        Self: 'a;
+
+    fn receive(&mut self, _now: Instant) -> Option<(RxToken<'_>, TxToken<'_>)> {
+        let f = self.frame.take()?;
+        Some((RxToken(f), TxToken(self.tx)))
+    }
+
+    fn transmit(&mut self, _now: Instant) -> Option<TxToken<'_>> {
+        if !self.tx.can_transmit() {
+            return None;
+        }
+        Some(TxToken(self.tx))
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        caps(self.mtu)
+    }
+}
+
 impl Device for Mux {
     type RxToken<'a> = RxToken<'a>;
     type TxToken<'a> = TxToken<'a>;
 
+    /// Egress only: frames are received through [`Mux::next_frame`] and
+    /// [`OneFrame`].
     fn receive(&mut self, _now: Instant) -> Option<(RxToken<'_>, TxToken<'_>)> {
-        let n = match self.tx.lo.pop_into(&mut self.rx) {
-            Some(n) => n,
-            None => {
-                let n = self.tx.nic.as_mut()?.recv(&mut self.rx[..])?;
-                self.tx.stats.nic_rx += 1;
-                n
-            }
-        };
-        Some((RxToken(&self.rx[..n]), TxToken(&mut self.tx)))
+        None
     }
 
     fn transmit(&mut self, _now: Instant) -> Option<TxToken<'_>> {
-        if self.tx.lo.is_full() {
-            return None;
-        }
-        // Likewise while the NIC's transmit ring is full: a token would
-        // make `route` drop the frame, which costs TCP a retransmission
-        // timeout (smoltcp's minimum RTO is 1 s; a 4 MiB send over VZ NAT
-        // stalled for 1 s in about half the runs). Without a token smoltcp
-        // keeps the data; the driver's transmit-completion interrupt wakes
-        // the net task to poll again.
-        if let Some(n) = self.tx.nic.as_mut()
-            && !n.can_send()
-        {
+        if !self.tx.can_transmit() {
             return None;
         }
         Some(TxToken(&mut self.tx))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ethernet;
-        // For Ethernet smoltcp counts the 14-byte header in the MTU.
-        caps.max_transmission_unit = self.mtu + ETH_HDR;
-        caps
+        caps(self.mtu)
     }
 }
